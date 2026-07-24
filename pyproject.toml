@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yakiflow"
+version = "0.1.0"
+description = "Recoverable media transcription, translation, and subtitle alignment pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "platformdirs>=4.2",
+  "textual>=0.70",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23"]
+whisperx-cpu = [
+  "whisperx>=3.8.4,<3.9",
+  "torch~=2.8.0",
+  "torchaudio~=2.8.0",
+  "torchvision~=0.23.0",
+  "torchcodec>=0.6,<0.8; (sys_platform == 'linux' and platform_machine == 'x86_64') or sys_platform == 'darwin' or sys_platform == 'win32'",
+]
+whisperx-cuda = [
+  "whisperx>=3.8.4,<3.9",
+  "torch~=2.8.0",
+  "torchaudio~=2.8.0",
+  "torchvision~=0.23.0",
+  "torchcodec>=0.6,<0.8; (sys_platform == 'linux' and platform_machine == 'x86_64') or sys_platform == 'darwin' or sys_platform == 'win32'",
+  "triton>=3.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "whisperx-cpu" },
+    { extra = "whisperx-cuda" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "whisperx-cpu" },
+  { index = "pytorch-cu128", extra = "whisperx-cuda" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", extra = "whisperx-cpu" },
+  { index = "pytorch-cu128", extra = "whisperx-cuda" },
+]
+torchvision = [
+  { index = "pytorch-cpu", extra = "whisperx-cpu" },
+  { index = "pytorch-cu128", extra = "whisperx-cuda" },
+]
+torchcodec = [
+  { index = "pytorch-cpu", extra = "whisperx-cpu" },
+  { index = "pytorch-cu128", extra = "whisperx-cuda" },
+]
+triton = [
+  { index = "pytorch-cu128", extra = "whisperx-cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[project.scripts]
+yakiflow = "yakiflow.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["whisperx_smoke: opt-in test using a local audio file and real WhisperX model"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yakiflow"]

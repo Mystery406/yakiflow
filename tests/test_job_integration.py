@@ -1,0 +1,1030 @@
+import asyncio
+import json
+import os
+import stat
+import wave
+from pathlib import Path
+
+import pytest
+
+import yakiflow.job as job_module
+from yakiflow.alignment import AlignmentResult
+from yakiflow.config import Settings
+from yakiflow.job import YakiFlowJob
+from yakiflow.media import MediaArtifact, MediaSource
+from yakiflow.memory import MemoryDestinationConflict
+from yakiflow.models import AgentTraceEvent, Cue, TranscriptEvent
+from yakiflow.process import ProcessResult
+from yakiflow.translation import AgentBackend
+
+
+class RecordingAwaitable:
+    def __init__(self, values: list, value: object) -> None:
+        self.values = values
+        self.value = value
+
+    def __await__(self):
+        self.values.append(self.value)
+        if False:
+            yield
+        return None
+
+
+class PipelineRunner:
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    async def run(self, args, *, on_line=None, **kwargs):
+        args = [str(value) for value in args]
+        self.calls.append(args)
+        if args[0] == "ffmpeg":
+            Path(args[-1]).write_bytes(b"RIFF-fake")
+            return ProcessResult(tuple(args), 0, "", "")
+        if args[0] == "whisper-cli":
+            prefix = Path(args[args.index("--output-file") + 1])
+            prefix.with_suffix(".json").write_text(json.dumps({
+                "transcription": [
+                    {"timestamps": {"from": "00:00:00,200", "to": "00:00:01,500"}, "text": "hello"},
+                    {"timestamps": {"from": "00:00:01,500", "to": "00:00:02,800"}, "text": "world"},
+                ]
+            }))
+            if on_line:
+                for percent in (5, 50, 100):
+                    value = on_line(
+                        "stderr",
+                        f"whisper_print_progress_callback: progress = {percent:3d}%",
+                    )
+                    if asyncio.iscoroutine(value):
+                        await value
+                for line in (
+                    "[00:00:00.200 --> 00:00:01.500] hello",
+                    "[00:00:01.500 --> 00:00:02.800] world",
+                ):
+                    value = on_line("stdout", line)
+                    if asyncio.iscoroutine(value):
+                        await value
+            return ProcessResult(tuple(args), 0, "", "")
+        raise AssertionError(args)
+
+
+class PipelineBackend(AgentBackend):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+        self.prompts.append(prompt)
+        payload = json.loads(prompt.split("INPUT:\n", 1)[1])
+        return {
+            "cues": [
+                {"id": cue["id"], "source": cue["source"], "translated": cue.get("translated") or f"T:{cue['source']}"}
+                for cue in payload["cues"]
+            ],
+        }
+
+
+def test_context_files_are_snapshotted_and_restored_on_resume(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = first_dir / "chat.xml"
+    second = second_dir / "chat.xml"
+    first.write_text("first version", encoding="utf-8")
+    second.write_text("second version", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            translation_backend="codex",
+            context_files=(first, second),
+            work_dir=work_dir,
+            memory=tmp_path / "memory.md",
+        ),
+        backend=PipelineBackend(),
+    )
+
+    assert job.context_files == (
+        work_dir / "context" / "chat.xml",
+        work_dir / "context" / "chat-2.xml",
+    )
+    assert [path.read_text(encoding="utf-8") for path in job.context_files] == [
+        "first version",
+        "second version",
+    ]
+    first.write_text("changed after job creation", encoding="utf-8")
+    job.close()
+
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+    assert resumed.context_files == (
+        work_dir / "context" / "chat-2.xml",
+        work_dir / "context" / "chat.xml",
+    )
+    assert {
+        path.name: path.read_text(encoding="utf-8")
+        for path in resumed.context_files
+    } == {"chat.xml": "first version", "chat-2.xml": "second version"}
+    resumed.close()
+
+
+def test_forced_alignment_replaces_timeline_then_translation_only_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = []
+
+    async def listener(event) -> None:
+        events.append(event)
+
+    class SourceChangingBackend(AgentBackend):
+        name = "source-changing"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+            self.prompts.append(prompt)
+            payload = json.loads(prompt.split("INPUT:\n", 1)[1])
+            return {
+                "cues": [
+                    {
+                        "id": cue["id"],
+                        "source": "must be ignored",
+                        "translated": f"T:{cue['source']}",
+                    }
+                    for cue in payload["cues"]
+                ]
+            }
+
+    class SplitAligner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def align(self, audio, cues, **kwargs):
+            self.calls += 1
+            await kwargs["on_progress"](1, 2)
+            await kwargs["on_progress"](2, 2)
+            return AlignmentResult(
+                [
+                    Cue("1", 0.1, 0.8, "first sentence", None, metadata={"parent_id": "old"}),
+                    Cue("2", 0.8, 1.5, "second sentence", None, metadata={"parent_id": "old"}),
+                ],
+                "whisperx",
+            )
+
+    work_dir = tmp_path / "work"
+    backend = SourceChangingBackend()
+    aligner = SplitAligner()
+    monkeypatch.setattr(job_module, "make_alignment_backend", lambda *args, **kwargs: aligner)
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            translation_backend="codex",
+            whisper_model=tmp_path / "model.bin",
+            work_dir=work_dir,
+        ),
+        backend=backend,
+        listener=listener,
+    )
+    job.db.upsert_cues([Cue("old", 0, 2, "parent", "父译文")])
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), tmp_path / "audio.wav", None, True)
+
+    aligned = asyncio.run(job._alignment_stage(artifact, job.db.list_cues()))
+    translated = asyncio.run(job._post_alignment_translation_stage(artifact, aligned))
+    restored = asyncio.run(job._alignment_stage(artifact, translated))
+
+    assert aligner.calls == 1
+    assert job.db.get_checkpoint("alignment_complete") is True
+    assert [cue.id for cue in restored] == ["1", "2"]
+    assert [cue.source for cue in restored] == ["first sentence", "second sentence"]
+    assert [cue.translated for cue in restored] == [
+        "T:first sentence",
+        "T:second sentence",
+    ]
+    assert "do not modify, correct, merge, or split" in backend.prompts[0]
+    assert "timeline-replaced" in [event.kind for event in events]
+    assert [
+        event.message
+        for event in events
+        if event.kind == "progress" and event.stage == "align"
+    ] == [
+        "forced alignment · 1/2 cues",
+        "forced alignment · 2/2 cues",
+        "alignment complete",
+    ]
+    job.close()
+
+
+@pytest.mark.parametrize(
+    ("configured_backend", "result_backend"),
+    [("whisperx", "whisperx"), ("vad", "whisper-vad"), ("vad", "unaligned")],
+)
+def test_alignment_stage_always_applies_volume_start_refinement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_backend: str,
+    result_backend: str,
+) -> None:
+    class PassThroughAligner:
+        async def align(self, _audio, cues, **_kwargs):
+            return AlignmentResult(list(cues), result_backend)
+
+    refine_calls = 0
+
+    async def refine(_self, _audio, cues, **_kwargs):
+        nonlocal refine_calls
+        refine_calls += 1
+        return [cue.with_timing(cue.start + 0.25, cue.end) for cue in cues]
+
+    monkeypatch.setattr(
+        job_module, "make_alignment_backend", lambda *args, **kwargs: PassThroughAligner()
+    )
+    monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", refine)
+    work_dir = tmp_path / f"{configured_backend}-{result_backend}"
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            alignment_backend=configured_backend,
+            translation_backend="codex",
+            whisper_model=tmp_path / "model.bin",
+            work_dir=work_dir,
+        ),
+        backend=PipelineBackend(),
+    )
+    job.db.upsert_cues([Cue("1", 0.1, 1.0, "source", "translation")])
+    artifact = MediaArtifact(
+        MediaSource.parse("input.mp4"), tmp_path / "audio.wav", None, True
+    )
+
+    aligned = asyncio.run(job._alignment_stage(artifact, job.db.list_cues()))
+
+    assert refine_calls == 1
+    assert aligned[0].start == pytest.approx(0.35)
+    job.close()
+
+
+def test_alignment_stage_adjusts_long_vad_silence_before_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received_cues: list[Cue] = []
+
+    class CapturingAligner:
+        async def align(self, _audio, cues, **kwargs):
+            received_cues.extend(cues)
+            assert kwargs["vad_intervals"] == [[0, 2], [20, 25]]
+            return AlignmentResult(list(cues), "whisperx")
+
+    async def keep_starts(_self, _audio, cues, **_kwargs):
+        return list(cues)
+
+    monkeypatch.setattr(
+        job_module, "make_alignment_backend", lambda *args, **kwargs: CapturingAligner()
+    )
+    monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", keep_starts)
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            alignment_backend="whisperx",
+            translation_backend="codex",
+            whisper_model=tmp_path / "model.bin",
+            work_dir=tmp_path / "pre-align-vad",
+        ),
+        backend=PipelineBackend(),
+    )
+    job.db.upsert_cues([Cue("1", 1, 25, "source", "translation")])
+    job.db.checkpoint("whisper_vad_intervals", [(0, 2), (20, 25)])
+    artifact = MediaArtifact(
+        MediaSource.parse("input.mp4"), tmp_path / "audio.wav", None, True
+    )
+
+    aligned = asyncio.run(job._alignment_stage(artifact, job.db.list_cues()))
+
+    assert received_cues[0].start == 17
+    assert aligned[0].start == 17
+    job.close()
+
+
+class BlockingBackend(AgentBackend):
+    name = "blocking"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class InterruptedWhisperRunner:
+    async def run(self, args, *, on_line=None, **kwargs):
+        args = [str(value) for value in args]
+        assert args[0] == "whisper-cli"
+        assert on_line is not None
+        for line in (
+            "[00:00:00.200 --> 00:00:01.500] hello",
+            "[00:00:01.500 --> 00:00:02.800] world",
+        ):
+            await on_line("stdout", line)
+        raise asyncio.CancelledError
+
+
+class ResumedWhisperRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def run(self, args, *, on_line=None, **kwargs):
+        args = [str(value) for value in args]
+        self.calls.append(args)
+        if args[0] == "ffmpeg":
+            Path(args[-1]).write_bytes(b"RIFF-resume")
+            return ProcessResult(tuple(args), 0, "", "")
+        assert args[0] == "whisper-cli"
+        prefix = Path(args[args.index("--output-file") + 1])
+        prefix.with_suffix(".json").write_text(json.dumps({
+            "transcription": [
+                {
+                    "timestamps": {
+                        "from": "00:00:00,200",
+                        "to": "00:00:01,200",
+                    },
+                    "text": "again",
+                },
+            ]
+        }))
+        if on_line:
+            await on_line("stdout", "[00:00:00.200 --> 00:00:01.200] again")
+        return ProcessResult(tuple(args), 0, "", "")
+
+
+def test_temporary_workdirs_use_a_private_per_user_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_root = tmp_path / "yakiflow"
+    monkeypatch.setattr(
+        job_module, "user_runtime_path", lambda *_args, **_kwargs: expected_root
+    )
+
+    work_dir = job_module._temporary_workdir()
+
+    assert work_dir.parent == expected_root
+    assert stat.S_IMODE(expected_root.stat().st_mode) == 0o700
+    assert expected_root.stat().st_uid == os.getuid()
+
+
+def test_temporary_workdir_does_not_require_getuid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_root = tmp_path / "windows-runtime" / "yakiflow"
+    monkeypatch.setattr(
+        job_module, "user_runtime_path", lambda *_args, **_kwargs: expected_root
+    )
+    monkeypatch.delattr(job_module.os, "getuid")
+
+    work_dir = job_module._temporary_workdir()
+
+    assert work_dir.parent == expected_root
+
+
+def test_temporary_workdir_rejects_an_insecure_existing_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "yakiflow"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    monkeypatch.setattr(
+        job_module, "user_runtime_path", lambda *_args, **_kwargs: root
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe temporary repository"):
+        job_module._temporary_workdir()
+
+
+@pytest.mark.parametrize("persisted_status", [True, False])
+def test_resume_preserves_temporary_workdir_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persisted_status: bool,
+) -> None:
+    runtime_root = tmp_path / "yakiflow"
+    monkeypatch.setattr(
+        job_module, "user_runtime_path", lambda *_args, **_kwargs: runtime_root
+    )
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(translation_backend="codex"),
+        backend=PipelineBackend(),
+    )
+    work_dir = job.work_dir
+    assert job.temporary_workdir
+    assert job.db.get_checkpoint("temporary_workdir") is True
+    if not persisted_status:
+        # Exercise the runtime-path fallback for jobs created before the
+        # temporary-workdir checkpoint was introduced.
+        with job.db.connection:
+            job.db.connection.execute(
+                "DELETE FROM checkpoints WHERE name='temporary_workdir'"
+            )
+    job.close()
+
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+
+    assert resumed.temporary_workdir
+    resumed.close(cleanup=True)
+    assert not work_dir.exists()
+
+
+def test_local_input_is_canonicalized_before_journaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+    media = launch_dir / "movie.mp4"
+    media.write_bytes(b"media")
+    work_dir = tmp_path / "work"
+    monkeypatch.chdir(launch_dir)
+
+    job = YakiFlowJob(
+        "movie.mp4",
+        Settings(
+            translation_backend="codex",
+            memory=tmp_path / "memory.md",
+            work_dir=work_dir,
+        ),
+        backend=PipelineBackend(),
+    )
+    assert job.input_value == str(media.resolve())
+    assert job.db.job()["input"] == str(media.resolve())
+    job.close()
+
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    monkeypatch.chdir(other_dir)
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+    assert resumed.input_value == str(media.resolve())
+    assert not resumed.temporary_workdir
+    resumed.close()
+
+
+def test_new_job_rejects_populated_workdir_and_resume_keeps_one_job_row(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    settings = Settings(
+        translation_backend="codex",
+        memory=tmp_path / "memory.md",
+        work_dir=work_dir,
+    )
+    job = YakiFlowJob("first.mp4", settings, backend=PipelineBackend())
+    assert job.db.connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+    job.close()
+
+    with pytest.raises(ValueError, match="yakiflow resume"):
+        YakiFlowJob("second.mp4", settings, backend=PipelineBackend())
+
+    for _ in range(2):
+        resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+        assert resumed.input_value == str((Path.cwd() / "first.mp4").resolve())
+        assert (
+            resumed.db.connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            == 1
+        )
+        resumed.close()
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "keep.txt").write_text("existing")
+    with pytest.raises(ValueError, match="work directory is not empty"):
+        YakiFlowJob(
+            "third.mp4",
+            Settings(
+                translation_backend="codex",
+                memory=tmp_path / "memory.md",
+                work_dir=unrelated,
+            ),
+            backend=PipelineBackend(),
+        )
+
+
+def test_agent_summary_counts_real_concurrent_operations(tmp_path: Path) -> None:
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=tmp_path / "model.bin",
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+    )
+    events = []
+
+    def listener(event) -> RecordingAwaitable:
+        return RecordingAwaitable(events, event)
+
+    job = YakiFlowJob(
+        "input.mp4", settings, backend=PipelineBackend(), listener=listener
+    )
+
+    async def exercise() -> None:
+        await job.agent_event(AgentTraceEvent(
+            "one", "lifecycle", "first", state="running"
+        ))
+        await job.agent_event(AgentTraceEvent(
+            "two", "lifecycle", "second", state="running"
+        ))
+        await job.agent_event(AgentTraceEvent(
+            "one", "lifecycle", "first", state="completed"
+        ))
+        await job.agent_event(AgentTraceEvent(
+            "two", "lifecycle", "second", state="completed"
+        ))
+
+    asyncio.run(exercise())
+    summaries = [event.message for event in events if event.kind == "agent"]
+    assert summaries[1].endswith("2 active")
+    assert summaries[-1] == "Agent · Idle"
+    job.close()
+
+
+def test_local_job_runs_full_pipeline_with_fake_processes(tmp_path: Path) -> None:
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(b"media")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    settings = Settings(
+        source_language="auto", target_language="zh-CN", translation_backend="codex", whisper_model=model,
+        memory=tmp_path / "memory.md", output_dir=tmp_path / "out", work_dir=tmp_path / "work",
+        output_mode="all", draft_model="draft", final_model="final",
+    )
+    runner = PipelineRunner()
+    events = []
+    transcript_snapshots: list[str] = []
+
+    async def listener(event):
+        events.append(event)
+        if event.kind == "transcript":
+            partial = tmp_path / "out" / "movie.draft.incomplete.srt"
+            assert partial.is_file()
+            transcript_snapshots.append(partial.read_text(encoding="utf-8"))
+
+    job = YakiFlowJob(
+        str(media), settings, runner=runner, backend=PipelineBackend(), listener=listener
+    )
+    outputs = asyncio.run(job.run())
+    assert len(outputs) == 3 and all(path.exists() for path in outputs)
+    bilingual = next(path for path in outputs if path.name.endswith("auto-zh-cn.srt")).read_text()
+    assert "T:hello\nhello" in bilingual
+    assert job.db.get_checkpoint("transcribed") is True
+    whisper_calls = [call for call in runner.calls if call[0] == "whisper-cli"]
+    assert len(whisper_calls) == 1
+    assert whisper_calls[0][whisper_calls[0].index("-mc") + 1] == "0"
+    assert "--print-progress" in whisper_calls[0]
+    assert whisper_calls[0][whisper_calls[0].index("--language") + 1] == "auto"
+    partial = tmp_path / "out" / "movie.draft.incomplete.srt"
+    assert partial.exists()
+    assert "hello" in transcript_snapshots[0]
+    assert "world" in transcript_snapshots[-1]
+    assert not (tmp_path / "work" / "draft.incomplete.srt").exists()
+    processed = [event.cue for event in events if event.kind == "subtitle"]
+    assert processed and all(cue and cue.translated for cue in processed)
+    event_kinds = [event.kind for event in events]
+    assert "transcript" in event_kinds
+    assert event_kinds.index("transcript") < event_kinds.index("subtitle")
+    agent_messages = [event.message for event in events if event.kind == "agent"]
+    assert any("Running" in message for message in agent_messages)
+    assert agent_messages[-1] == "Agent · Idle"
+    progress = [event.progress for event in events if event.progress is not None]
+    assert progress == sorted(progress)
+    assert progress[-1] == 1
+    progress_events = [event for event in events if event.progress is not None]
+    assert all(event.stage for event in progress_events)
+    assert progress_events[-1].estimated_remaining == 0
+    assert any("Whisper transcription · 50%" in event.message for event in events)
+    assert any("Agent draft translation · 1/1 batches" in event.message for event in events)
+    assert "translate" not in job._progress_plan.ranges
+    assert any(
+        event.stage == "transcribe" and "Agent draft translation" in event.message
+        for event in events
+    )
+    job.finish_review()
+    assert job.db.job()["status"] == "complete"
+    job.close()
+
+
+def test_reviewing_resume_preserves_and_finalizes_staged_agent_edits(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(b"media")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=model,
+        memory=tmp_path / "memory.md",
+        output_dir=output_dir,
+        work_dir=work_dir,
+    )
+    job = YakiFlowJob(
+        str(media), settings, runner=PipelineRunner(), backend=PipelineBackend()
+    )
+    staged = asyncio.run(job.run())[0]
+    staged.write_text("reviewed by Agent\n", encoding="utf-8")
+    job.close()
+
+    backend = PipelineBackend()
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=backend)
+    restored = asyncio.run(resumed.run())
+
+    assert restored == [staged]
+    assert staged.read_text(encoding="utf-8") == "reviewed by Agent\n"
+    assert backend.prompts == []
+    finalized = resumed.finalize_artifacts()
+    assert finalized == [output_dir / staged.name]
+    assert finalized[0].read_text(encoding="utf-8") == "reviewed by Agent\n"
+    resumed.close()
+
+
+def test_finalize_requires_all_staged_subtitles_before_moving_any(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "out"
+    work_dir = tmp_path / "work"
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            translation_backend="codex",
+            memory=tmp_path / "memory.md",
+            output_dir=output_dir,
+            work_dir=work_dir,
+        ),
+        backend=PipelineBackend(),
+    )
+    present = work_dir / "movie.source.srt"
+    missing = work_dir / "movie.translated.srt"
+    present.write_text("new source\n", encoding="utf-8")
+    output_dir.mkdir()
+    stale_destination = output_dir / missing.name
+    stale_destination.write_text("stale translation\n", encoding="utf-8")
+    job.outputs = [present, missing]
+    job._output_destination_base = output_dir / "movie"
+
+    with pytest.raises(RuntimeError, match="missing staged subtitle files"):
+        job.finalize_artifacts()
+
+    assert present.is_file()
+    assert not (output_dir / present.name).exists()
+    assert stale_destination.read_text(encoding="utf-8") == "stale translation\n"
+    assert job.outputs == [present, missing]
+    job.close()
+
+
+def test_overlapping_translation_does_not_add_an_empty_progress_stage(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF-fake")
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=model,
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path,
+        translation_batch_size=1,
+        translation_context=1,
+    )
+    events = []
+    backend = PipelineBackend()
+
+    async def listener(event):
+        events.append(event)
+
+    job = YakiFlowJob(
+        "input.mp4",
+        settings,
+        runner=PipelineRunner(),
+        backend=backend,
+        listener=listener,
+    )
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+    job._configure_progress()
+
+    async def run_stages() -> None:
+        cues = await job._transcription_stage(artifact)
+        progress_after_transcription = events[-1].progress
+        assert all(cue.translated for cue in cues)
+        await job._translation_stage(artifact, cues)
+        assert events[-1].progress == progress_after_transcription
+
+    asyncio.run(run_stages())
+
+    assert "translate" not in job._progress_plan.ranges
+    assert not any(event.stage == "translate" for event in events)
+    payloads = [
+        json.loads(prompt.split("INPUT:\n", 1)[1]) for prompt in backend.prompts
+    ]
+    payload_by_cue = {payload["cues"][0]["id"]: payload for payload in payloads}
+    assert [cue["id"] for cue in payload_by_cue["1"]["context"]] == []
+    assert [cue["id"] for cue in payload_by_cue["2"]["context"]] == ["1"]
+    job.close()
+
+
+def test_authoritative_transcription_retranslates_provisional_stream_cues(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF-fake")
+    backend = PipelineBackend()
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            source_language="auto",
+            target_language="zh-CN",
+            translation_backend="codex",
+            whisper_model=model,
+            memory=tmp_path / "memory.md",
+            work_dir=tmp_path / "work",
+            output_dir=tmp_path,
+            stream=True,
+            translation_batch_size=20,
+        ),
+        runner=PipelineRunner(),
+        backend=backend,
+    )
+    job.db.upsert_cues([
+        Cue("1", 0, 1, "unrelated live text", "T:unrelated live text"),
+        Cue("2", 1, 2, "other live text", "T:other live text"),
+    ])
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+    job._configure_progress()
+
+    async def run_stages() -> list[Cue]:
+        transcribed = await job._transcription_stage(artifact)
+        assert all(cue.translated is None for cue in transcribed)
+        return await job._translation_stage(artifact, transcribed)
+
+    result = asyncio.run(run_stages())
+
+    assert [cue.source for cue in result] == ["hello", "world"]
+    assert [cue.translated for cue in result] == ["T:hello", "T:world"]
+    assert len(backend.prompts) == 1
+    job.close()
+
+
+def test_resumed_progress_scales_transcription_to_remaining_audio(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    audio = tmp_path / "reference.wav"
+    with wave.open(str(audio), "wb") as destination:
+        destination.setnchannels(1)
+        destination.setsampwidth(2)
+        destination.setframerate(16_000)
+        destination.writeframes(b"\0\0" * 160_000)
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=model,
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path,
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
+    job.db.add_artifact("reference_audio", audio)
+    job.db.upsert_cues([Cue("1", 0, 9, "mostly complete", "已完成")])
+    job.db.checkpoint("transcription_started", True)
+
+    job._configure_progress()
+
+    transcribe = job._progress_plan.ranges["transcribe"]
+    align = job._progress_plan.ranges["align"]
+    assert transcribe.span / align.span == pytest.approx((38 * 0.1) / 8)
+    assert "acquire" not in job._progress_plan.ranges
+    assert "translate" not in job._progress_plan.ranges
+    job.close()
+
+
+def test_memory_destination_change_must_be_accepted_before_finalize(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "memory.md"
+    destination.write_text("# Memory\n\n- original\n", encoding="utf-8")
+    settings = Settings(
+        source_language="en",
+        target_language="zh-CN",
+        translation_backend="codex",
+        memory=destination,
+        work_dir=tmp_path / "work",
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
+    job.memory_path.write_text(
+        "# Memory\n\n- original\n- work-dir edit\n", encoding="utf-8"
+    )
+    destination.write_text(
+        "# Memory\n\n- original\n- destination edit\n", encoding="utf-8"
+    )
+
+    with pytest.raises(MemoryDestinationConflict) as raised:
+        job.finalize_artifacts()
+
+    assert destination.read_text(encoding="utf-8").endswith("- destination edit\n")
+    assert "- destination edit" in raised.value.diff()
+    assert "+- destination edit" in raised.value.diff()
+
+    job.memory_path.write_text(
+        "# Memory\n\n- original\n- work-dir edit\n- destination edit\n",
+        encoding="utf-8",
+    )
+    job.accept_memory_destination_change(raised.value)
+    job.finalize_artifacts()
+
+    assert "- work-dir edit" in destination.read_text(encoding="utf-8")
+    assert "- destination edit" in destination.read_text(encoding="utf-8")
+    job.close()
+
+
+def test_interrupted_whisper_resumes_after_preserved_cues(tmp_path: Path) -> None:
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF-audio")
+    work_dir = tmp_path / "work"
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=model,
+        memory=tmp_path / "memory.md",
+        work_dir=work_dir,
+        output_dir=tmp_path,
+    )
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+    job = YakiFlowJob(
+        "input.mp4",
+        settings,
+        runner=InterruptedWhisperRunner(),
+        backend=PipelineBackend(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(job._transcription_stage(artifact))
+    interrupted = job.db.list_cues(stable_only=True)
+    assert [(cue.id, cue.source) for cue in interrupted] == [
+        ("1", "hello"),
+        ("2", "world"),
+    ]
+    job.db.upsert_cues([
+        Cue(
+            interrupted[0].id,
+            interrupted[0].start,
+            interrupted[0].end,
+            interrupted[0].source,
+            "你好",
+        )
+    ])
+    preserved = job.db.list_cues(stable_only=True)
+    assert job.db.get_checkpoint("transcription_started") is True
+    job.db.set_status("interrupted", "interrupted")
+    job.close()
+
+    runner = ResumedWhisperRunner()
+    resumed = YakiFlowJob.from_workdir(
+        work_dir,
+        runner=runner,
+        backend=PipelineBackend(),
+    )
+    result = asyncio.run(resumed._transcription_stage(artifact))
+
+    assert result[0] == preserved[0]
+    assert result[1].translated == "T:world"
+    assert [(cue.id, cue.start, cue.end, cue.source) for cue in result] == [
+        ("1", 0.2, 1.5, "hello"),
+        ("2", 1.5, 2.8, "world"),
+        ("3", 3.0, 4.0, "again"),
+    ]
+    ffmpeg_call = next(call for call in runner.calls if call[0] == "ffmpeg")
+    whisper_call = next(call for call in runner.calls if call[0] == "whisper-cli")
+    assert ffmpeg_call[ffmpeg_call.index("-ss") + 1] == "2.8"
+    assert whisper_call[whisper_call.index("-f") + 1] == str(
+        work_dir / "whisper-resume.wav"
+    )
+    assert resumed.db.get_checkpoint("transcribed") is True
+    resumed.close()
+
+
+def test_missing_translations_are_sent_as_contiguous_agent_batches(
+    tmp_path: Path,
+) -> None:
+    backend = PipelineBackend()
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=tmp_path / "model.bin",
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path,
+        translation_batch_size=2,
+        translation_context=2,
+    )
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF-audio")
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+    job = YakiFlowJob("input.mp4", settings, backend=backend)
+    job.db.upsert_cues([
+        Cue("1", 0, 1, "one", "T:one"),
+        Cue("2", 1, 2, "two"),
+        Cue("3", 2, 3, "three"),
+        Cue("4", 3, 4, "four", "T:four"),
+        Cue("5", 4, 5, "five"),
+        Cue("6", 5, 6, "six"),
+        Cue("7", 6, 7, "seven"),
+    ])
+
+    result = asyncio.run(job._translation_stage(artifact, job.db.list_cues()))
+
+    payloads = [json.loads(prompt.split("INPUT:\n", 1)[1]) for prompt in backend.prompts]
+    assert [[cue["id"] for cue in payload["cues"]] for payload in payloads] == [
+        ["2", "3"],
+        ["5", "6"],
+        ["7"],
+    ]
+    assert [[cue["id"] for cue in payload["context"]] for payload in payloads] == [
+        ["1"],
+        ["3", "4"],
+        ["5", "6"],
+    ]
+    assert all(cue.translated for cue in result)
+    job.close()
+
+
+def test_transcription_failure_cancels_draft_agent_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = BlockingBackend()
+
+    class FailingTranscriber:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def transcribe(
+            self,
+            audio,
+            on_event=None,
+            on_progress=None,
+            *,
+            resume_from=(),
+        ):
+            assert on_event is not None
+            await on_event(TranscriptEvent(Cue("cue", 0, 1, "hello"), final=False))
+            await backend.started.wait()
+            raise ValueError("transcription failed")
+
+    monkeypatch.setattr(job_module, "WhisperCliTranscriber", FailingTranscriber)
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF-fake")
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=tmp_path / "model.bin",
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+        draft_model="draft",
+        final_model="final",
+        translation_batch_size=1,
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=backend)
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+
+    async def run_stage() -> None:
+        with pytest.raises(ValueError, match="transcription failed"):
+            await job._transcription_stage(artifact)
+        assert backend.cancelled.is_set()
+        assert not job._agent_operations
+
+    asyncio.run(run_stage())
+    job.close()
