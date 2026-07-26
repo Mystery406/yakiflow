@@ -268,6 +268,12 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
     assert result[0].source == "agent source"
     assert result[0].translated == "代理译文"
     assert "target language (zh-CN)" in backend.prompts[0]
+    assert "highly certain ASR/transcription errors" in backend.prompts[0]
+    assert "phonetically very close" in backend.prompts[0]
+    assert "preserve the source text exactly" in backend.prompts[0]
+    assert "do not guess from context" in backend.prompts[0]
+    assert "Follow all applicable terminology and style constraints in MEMORY" in backend.prompts[0]
+    assert "not as evidence for changing the source text" in backend.prompts[0]
     payload = json.loads(backend.prompts[0].split("INPUT:\n", 1)[1])
     assert set(payload["cues"][0]) == {"id", "source", "translated"}
     assert set(backend.schemas[0]["properties"]) == {"cues"}

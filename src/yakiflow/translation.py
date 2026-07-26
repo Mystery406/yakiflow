@@ -591,7 +591,15 @@ class TranslationPipeline:
         instruction = (
             "Translate naturally and do not modify, correct, merge, or split the source text. "
             if translate_only
-            else "Correct only clear ASR errors and translate naturally "
+            else (
+                "Correct the source text only for highly certain ASR/transcription errors, "
+                "and only when the correction remains phonetically very close to the "
+                "recognized wording (such as an obvious homophone or minor recognition "
+                "mistake). If there is any doubt, preserve the source text exactly; "
+                "do not guess from context or change it for grammar, style, or plausibility, "
+                "and never rewrite it into wording with substantially different pronunciation. "
+                "Then translate naturally "
+            )
         )
         introduction = (
             f"You are YakiFlow's draft subtitle translator. {instruction}"
@@ -600,7 +608,12 @@ class TranslationPipeline:
         return (
             introduction
             + "Preserve every cue ID and cue order. Do not add facts or merge cues. "
-            + "Use context only for continuity. Return corrected source text and a "
+            + "Follow all applicable terminology and style constraints in MEMORY when "
+            + "writing translations. Treat MEMORY as translation guidance, not as evidence "
+            + "for changing the source text; source edits must still satisfy the "
+            + "high-confidence, phonetically-close rule above. Use context only for continuity. "
+            + "Return the original source text unless "
+            + "the high-confidence correction rule above applies, and return a "
             "non-empty translation for every cue."
             + "\nINPUT:\n"
             + json.dumps(self._payload(batch, context), ensure_ascii=False)
