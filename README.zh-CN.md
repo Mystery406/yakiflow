@@ -275,6 +275,7 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 | --- | --- | --- | --- |
 | `review_display_mode` | `--review-display-mode` | `split` | 使用 tmux 字幕窗格（`split`）或外部程序（`open`） |
 | `review_open_command` | `--review-open-command` | 未设置 | `open` 模式使用的命令模板；`{file}` 会替换为暂存 SRT 路径 |
+| `auto_open_video` | `--auto-open-video` / `--no-auto-open-video` | `false` | 交互式审校开始时自动打开源视频 |
 | `video_open_command` | `--video-open-command` | 内置 `mpv` 命令 | 打开媒体的命令模板；支持 `{file}` 和 `{subtitle}` |
 
 当 `review_display_mode = "open"` 时，必须设置 `review_open_command`。
@@ -309,6 +310,10 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 ```toml
 video_open_command = "vlc --sub-file={subtitle} {file}"
 ```
+
+如需在交互式审校开始时自动打开源视频，请启用 `auto_open_video`（或传入
+`--auto-open-video`）。程序会使用配置的 `video_open_command`，并在播放器支持时
+附加暂存字幕。
 
 如果希望用编辑器打开暂存 SRT，而不是使用分屏预览：
 

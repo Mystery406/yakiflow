@@ -22,6 +22,20 @@ def test_config_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     assert settings.final_model == "gpt-5.6-sol"
 
 
+def test_auto_open_video_setting_is_loaded(tmp_path: Path) -> None:
+    config = tmp_path / "project.toml"
+    config.write_text(
+        'source_language = "en"\n'
+        'target_language = "zh-CN"\n'
+        'translation_backend = "codex"\n'
+        'auto_open_video = true\n'
+    )
+
+    settings = load_settings({}, user_file=Path("/missing"), project_file=config)
+
+    assert settings.auto_open_video is True
+
+
 def test_required_translation_settings() -> None:
     settings = load_settings({}, user_file=Path("/missing"), project_file=Path("/missing"))
     with pytest.raises(ValueError, match="target-language"):

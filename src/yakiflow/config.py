@@ -49,6 +49,7 @@ class Settings:
     agent_retry_delay_seconds: float = 1
     review_display_mode: str = "split"
     review_open_command: str | None = None
+    auto_open_video: bool = False
     video_open_command: str = (
         "mpv --no-sub-auto --no-resume-playback "
         "--sub-file={subtitle} --sid=auto --sub-visibility=yes {file}"

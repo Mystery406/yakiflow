@@ -1,13 +1,16 @@
+import asyncio
 from pathlib import Path
 
 import pytest
 
+import yakiflow.interactive_agent as interactive_agent
 from yakiflow.config import Settings
 from yakiflow.interactive_agent import (
     build_interactive_command,
     build_interactive_prompt,
     build_memory_conflict_prompt,
 )
+from yakiflow.process import ProcessResult
 
 
 @pytest.mark.parametrize(
@@ -153,3 +156,74 @@ def test_interactive_commands_append_only_matching_final_options() -> None:
         "plan",
         "claude prompt",
     ]
+
+
+def test_interactive_agent_auto_opens_video_before_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TMUX", "test")
+    media = tmp_path / "movie.mp4"
+    subtitle = tmp_path / "movie.srt"
+    media.write_bytes(b"media")
+    subtitle.write_text("", encoding="utf-8")
+    calls: list[tuple[str | None, Path | None, Path | None, Path | None]] = []
+
+    monkeypatch.setattr(
+        interactive_agent,
+        "_source_media",
+        lambda _work_dir: media,
+    )
+
+    def fake_open_media(command, media_path, subtitle_path, *, cwd=None):
+        calls.append((command, media_path, subtitle_path, cwd))
+        return True
+
+    monkeypatch.setattr(interactive_agent, "open_media", fake_open_media)
+
+    class Runner:
+        async def run_interactive(self, command, *, cwd=None):
+            assert calls == [
+                (Settings().video_open_command, media, subtitle, tmp_path)
+            ]
+            return ProcessResult(tuple(command), 0, "", "")
+
+    result = asyncio.run(
+        interactive_agent.run_interactive_agent(
+            Settings(auto_open_video=True, translation_backend="codex"),
+            tmp_path,
+            [subtitle],
+            runner=Runner(),
+        )
+    )
+
+    assert result.returncode == 0
+
+
+def test_interactive_agent_does_not_auto_open_video_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TMUX", "test")
+    monkeypatch.setattr(interactive_agent, "_source_media", lambda _work_dir: None)
+    opened = False
+
+    def fake_open_media(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        return True
+
+    monkeypatch.setattr(interactive_agent, "open_media", fake_open_media)
+
+    class Runner:
+        async def run_interactive(self, command, *, cwd=None):
+            return ProcessResult(tuple(command), 0, "", "")
+
+    asyncio.run(
+        interactive_agent.run_interactive_agent(
+            Settings(translation_backend="codex"),
+            tmp_path,
+            [tmp_path / "movie.srt"],
+            runner=Runner(),
+        )
+    )
+
+    assert not opened

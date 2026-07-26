@@ -293,6 +293,7 @@ filter them. Invalid or conflicting options are reported by Codex or Claude.
 | --- | --- | --- | --- |
 | `review_display_mode` | `--review-display-mode` | `split` | Use a tmux subtitle pane (`split`) or an external program (`open`) |
 | `review_open_command` | `--review-open-command` | unset | Command template used by `open` mode; `{file}` is replaced with the staged SRT path |
+| `auto_open_video` | `--auto-open-video` / `--no-auto-open-video` | `false` | Open the source video automatically when interactive review starts |
 | `video_open_command` | `--video-open-command` | built-in `mpv` command | Command template for opening media; supports `{file}` and `{subtitle}` |
 
 `review_open_command` is required when `review_display_mode = "open"`.
@@ -329,6 +330,11 @@ subtitles in `mpv`. To use another player:
 ```toml
 video_open_command = "vlc --sub-file={subtitle} {file}"
 ```
+
+To open the source video automatically as the interactive review starts, enable
+`auto_open_video` (or pass `--auto-open-video`). The configured
+`video_open_command` is used, and the staged subtitles are attached when the
+player supports them.
 
 To open the staged SRT in an editor instead of using the split preview:
 

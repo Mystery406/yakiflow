@@ -20,6 +20,7 @@ from typing import Sequence
 
 from .config import Settings
 from .database import JobDatabase
+from .media_player import open_media
 from .models import OutputMode
 from .process import CommandRunner, ProcessError, ProcessResult
 
@@ -305,6 +306,13 @@ async def run_interactive_agent(
     command = build_interactive_command(
         settings, prompt
     )
+    if settings.auto_open_video and outputs:
+        open_media(
+            settings.video_open_command,
+            _source_media(work_dir),
+            outputs[0],
+            cwd=work_dir,
+        )
     if (
         settings.review_display_mode == "split"
         and not os.environ.get("TMUX")

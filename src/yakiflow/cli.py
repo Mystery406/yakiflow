@@ -85,6 +85,12 @@ def _settings_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-retry-delay-seconds", type=float)
     parser.add_argument("--review-display-mode", choices=["split", "open"])
     parser.add_argument("--review-open-command")
+    parser.add_argument(
+        "--auto-open-video",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="open the source video automatically when interactive review starts",
+    )
     parser.add_argument("--video-open-command")
 
 
