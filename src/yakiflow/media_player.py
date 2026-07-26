@@ -59,6 +59,11 @@ def open_media(
         subprocess.Popen(
             media_open_argv(command, media_path, subtitle_path),
             cwd=cwd,
+            # The player is a background convenience process.  Inheriting
+            # the TUI's terminal streams lets mpv status/log output overwrite
+            # Textual's rendering.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except (OSError, IndexError, ValueError):
