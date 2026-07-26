@@ -31,6 +31,11 @@ AlignmentModelFailureListener = Callable[
     Awaitable[AlignmentModelFailureDecision] | AlignmentModelFailureDecision,
 ]
 
+_SHORT_CUE_GAP = 0.7
+_LONG_CUE_GAP = 1.0
+_END_EXTENSION = 0.5
+_MIDPOINT_WEIGHT = 0.5
+
 
 @dataclass(slots=True)
 class AlignmentResult:
@@ -67,10 +72,6 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
     _SINGLE_CHARACTER_TOKEN_LENGTH = 1
     _MIN_REMAINING_VAD_SPEECH = 0.8
     _END_SEARCH_RADIUS = 1.0
-    _SHORT_CUE_GAP = 0.7
-    _LONG_CUE_GAP = 1.0
-    _END_EXTENSION = 0.5
-    _MIDPOINT_WEIGHT = 0.5
     _MOVED_START_CONFIDENCE = 0.9
     _UNCHANGED_START_CONFIDENCE = 0.75
     _MISSING_START_CONFIDENCE = 0.35
@@ -206,23 +207,14 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
             )
             for index, cue in enumerate(cues)
         ]
-        output: list[Cue] = []
-        for index, cue in enumerate(cues):
-            refined_end = refined_ends[index]
-            if index + 1 == len(cues):
-                end = refined_end + cls._END_EXTENSION
-            else:
-                next_start = starts[index + 1]
-                gap = next_start - refined_end
-                if gap <= cls._SHORT_CUE_GAP:
-                    end = next_start
-                elif gap < cls._LONG_CUE_GAP:
-                    end = (refined_end + next_start) * cls._MIDPOINT_WEIGHT
-                else:
-                    end = refined_end + cls._END_EXTENSION
-            output.append(
-                cue.with_timing(starts[index], max(starts[index], end), confidences[index])
+        output = [
+            cue.with_timing(
+                starts[index],
+                max(starts[index], refined_ends[index]),
+                confidences[index],
             )
+            for index, cue in enumerate(cues)
+        ]
         return AlignmentResult(output, backend, low_confidence_ids=low)
 
     @classmethod
@@ -479,6 +471,37 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
                     result.append((begin * window_seconds, index * window_seconds))
                 begin = None
         return cls._merge_intervals(result)
+
+
+def extend_cue_ends(
+    cues: Sequence[Cue],
+    *,
+    duration: float | None = None,
+) -> list[Cue]:
+    """Apply the shared subtitle end-extension policy to a final timeline."""
+    if not cues:
+        return []
+    ordered = sorted(cues, key=lambda cue: (cue.start, cue.end))
+    maximum = math.inf if duration is None else max(0.0, duration)
+    output: list[Cue] = []
+    for index, cue in enumerate(ordered):
+        start = min(maximum, cue.start)
+        base_end = min(maximum, max(start, cue.end))
+        if index + 1 == len(ordered):
+            end = min(maximum, base_end + _END_EXTENSION)
+        else:
+            next_start = min(maximum, max(0.0, ordered[index + 1].start))
+            gap = next_start - base_end
+            if gap <= _SHORT_CUE_GAP:
+                end = next_start
+            elif gap < _LONG_CUE_GAP:
+                end = (base_end + next_start) * _MIDPOINT_WEIGHT
+            else:
+                end = min(maximum, base_end + _END_EXTENSION)
+        output.append(
+            cue.with_timing(start, max(start, end), cue.timing_confidence)
+        )
+    return output
 
 
 _PRE_ALIGNMENT_LONG_SILENCE_SECONDS = 6.0
@@ -949,7 +972,6 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                 )
 
             combined: list[Cue] = []
-            fallback_parents: set[str] = set()
             for parent in original:
                 forced = aligned_by_parent.get(parent.id)
                 if forced:
@@ -975,9 +997,8 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                         metadata,
                     )
                 )
-                fallback_parents.add(parent.id)
 
-            combined = self._finish_timeline(combined, duration, fallback_parents)
+            combined = self._normalize_timeline(combined, duration)
             numbered = self._renumber(combined)
             low = [cue.id for cue in numbered if cue.metadata.get("parent_id") in failed_ids]
             return AlignmentResult(numbered, "whisperx", low_confidence_ids=low)
@@ -1351,60 +1372,19 @@ class WhisperXAlignmentBackend(AlignmentBackend):
         output.sort(key=lambda value: (value["start"], value["end"]))
         return output
 
-    @classmethod
-    def _finish_timeline(
-        cls,
+    @staticmethod
+    def _normalize_timeline(
         cues: list[Cue],
         duration: float,
-        fallback_parents: set[str],
     ) -> list[Cue]:
         if not cues:
             return []
         ordered = sorted(cues, key=lambda cue: (cue.start, cue.end))
         result: list[Cue] = []
-        for index, cue in enumerate(ordered):
-            parent_id = str(cue.metadata.get("parent_id", cue.id))
-            is_fallback = parent_id in fallback_parents
+        for cue in ordered:
             start = min(duration, max(0.0, cue.start))
             end = min(duration, max(start, cue.end))
-            if not is_fallback:
-                if index + 1 == len(ordered):
-                    end = min(duration, end + WhisperVadAlignmentBackend._END_EXTENSION)
-                else:
-                    next_start = min(duration, max(0.0, ordered[index + 1].start))
-                    gap = next_start - end
-                    if gap <= WhisperVadAlignmentBackend._SHORT_CUE_GAP:
-                        end = next_start
-                    elif gap < WhisperVadAlignmentBackend._LONG_CUE_GAP:
-                        end = (end + next_start) * WhisperVadAlignmentBackend._MIDPOINT_WEIGHT
-                    else:
-                        end = min(
-                            duration,
-                            end + WhisperVadAlignmentBackend._END_EXTENSION,
-                        )
             result.append(cue.with_timing(start, max(start, end), cue.timing_confidence))
-
-        # Preserve VAD fallback boundaries; trim or shift successful forced
-        # cues around them and enforce a valid, non-overlapping final timeline.
-        for index in range(1, len(result)):
-            previous = result[index - 1]
-            current = result[index]
-            if current.start >= previous.end:
-                continue
-            current_parent = str(current.metadata.get("parent_id", current.id))
-            previous_parent = str(previous.metadata.get("parent_id", previous.id))
-            if current_parent in fallback_parents and previous_parent not in fallback_parents:
-                result[index - 1] = previous.with_timing(
-                    previous.start,
-                    max(previous.start, current.start),
-                    previous.timing_confidence,
-                )
-            else:
-                result[index] = current.with_timing(
-                    previous.end,
-                    max(previous.end, current.end),
-                    current.timing_confidence,
-                )
         return result
 
     @staticmethod

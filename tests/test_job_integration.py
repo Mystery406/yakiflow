@@ -241,7 +241,9 @@ def test_alignment_stage_always_applies_volume_start_refinement(
         return [cue.with_timing(cue.start + 0.25, cue.end) for cue in cues]
 
     monkeypatch.setattr(
-        job_module, "make_alignment_backend", lambda *args, **kwargs: PassThroughAligner()
+        job_module,
+        "make_alignment_backend",
+        lambda *args, **kwargs: PassThroughAligner(),
     )
     monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", refine)
     work_dir = tmp_path / f"{configured_backend}-{result_backend}"
@@ -266,6 +268,7 @@ def test_alignment_stage_always_applies_volume_start_refinement(
 
     assert refine_calls == 1
     assert aligned[0].start == pytest.approx(0.35)
+    assert aligned[0].end == pytest.approx(1.5)
     job.close()
 
 
@@ -309,6 +312,49 @@ def test_alignment_stage_adjusts_long_vad_silence_before_backend(
 
     assert received_cues[0].start == 17
     assert aligned[0].start == 17
+    job.close()
+
+
+def test_alignment_stage_extends_ends_after_final_start_refinement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class PassThroughAligner:
+        async def align(self, _audio, cues, **_kwargs):
+            return AlignmentResult(list(cues), "whisperx")
+
+    async def refine(_self, _audio, cues, **_kwargs):
+        return [cues[0], cues[1].with_timing(1.5, cues[1].end)]
+
+    monkeypatch.setattr(
+        job_module, "make_alignment_backend", lambda *args, **kwargs: PassThroughAligner()
+    )
+    monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", refine)
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            alignment_backend="whisperx",
+            translation_backend="codex",
+            whisper_model=tmp_path / "model.bin",
+            work_dir=tmp_path / "final-end-extension",
+        ),
+        backend=PipelineBackend(),
+    )
+    job.db.upsert_cues(
+        [
+            Cue("1", 0, 1, "first", "第一句"),
+            Cue("2", 1, 2, "second", "第二句"),
+        ]
+    )
+    artifact = MediaArtifact(
+        MediaSource.parse("input.mp4"), tmp_path / "audio.wav", None, True
+    )
+
+    aligned = asyncio.run(job._alignment_stage(artifact, job.db.list_cues()))
+
+    assert aligned[0].end == pytest.approx(1.5)
+    assert aligned[1].start == pytest.approx(1.5)
     job.close()
 
 

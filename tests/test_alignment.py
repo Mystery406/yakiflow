@@ -16,6 +16,7 @@ from yakiflow.alignment import (
     WhisperVadAlignmentBackend,
     WhisperXAlignmentBackend,
     adjust_cue_starts_for_long_vad_silences,
+    extend_cue_ends,
 )
 from yakiflow.models import Cue
 
@@ -624,7 +625,7 @@ def test_whisperx_zero_first_token_score_retries_with_expanded_window(
     assert fake.excerpt_durations == pytest.approx([1.7, 5.0])
     assert vad.calls == 0
     assert warnings == []
-    assert (aligned.cues[0].start, aligned.cues[0].end) == (6.2, 7.3)
+    assert (aligned.cues[0].start, aligned.cues[0].end) == (6.2, 6.8)
     assert aligned.cues[0].metadata["alignment_backend"] == "whisperx"
     assert aligned.cues[0].metadata["whisperx"]["attempts"] == [
         {
@@ -813,8 +814,11 @@ def test_pcm_vad_is_used_without_whisper_intervals(tmp_path: Path) -> None:
 
     assert result.backend == "pcm-vad"
     assert result.cues[1].start >= 1.45
-    assert result.cues[0].end == pytest.approx(result.cues[1].start)
-    assert result.cues[1].end == pytest.approx(3.5)
+    assert result.cues[0].end == pytest.approx(0.8)
+    assert result.cues[1].end == pytest.approx(3.0)
+    extended = extend_cue_ends(result.cues)
+    assert extended[0].end == pytest.approx(extended[1].start)
+    assert extended[1].end == pytest.approx(3.5)
 
 
 def test_failed_pcm_vad_keeps_original_timeline(tmp_path: Path) -> None:
@@ -1011,9 +1015,10 @@ def test_vad_end_uses_nearest_endpoint_within_one_second() -> None:
         Path("unused.wav"), cues, [(0, 1.6), (2, 2.3), (3.8, 4.5)]
     )
 
-    # 2.3 is closer to the original 2.0 end than 1.6; the long-gap rule
-    # then adds 500 ms.
-    assert result.cues[0].end == pytest.approx(2.8)
+    # 2.3 is closer to the original 2.0 end than 1.6. End extension is a
+    # separate, backend-neutral pass.
+    assert result.cues[0].end == pytest.approx(2.3)
+    assert extend_cue_ends(result.cues)[0].end == pytest.approx(2.8)
 
 
 def test_vad_end_more_than_one_second_away_keeps_original_end() -> None:
@@ -1023,7 +1028,8 @@ def test_vad_end_more_than_one_second_away_keeps_original_end() -> None:
         Path("unused.wav"), cues, [(0, 0.9), (4, 4.7)]
     )
 
-    assert result.cues[0].end == 2.5
+    assert result.cues[0].end == 2.0
+    assert extend_cue_ends(result.cues)[0].end == 2.5
 
 
 @pytest.mark.parametrize(
@@ -1042,7 +1048,8 @@ def test_neighbor_gap_adjusts_end(next_start: float, expected_end: float) -> Non
         Path("unused.wav"), cues, [(0, 1), (next_start, next_start + 0.4)]
     )
 
-    assert result.cues[0].end == pytest.approx(expected_end)
+    assert result.cues[0].end == pytest.approx(1.0)
+    assert extend_cue_ends(result.cues)[0].end == pytest.approx(expected_end)
 
 
 def test_last_cue_uses_refined_end_then_adds_half_second() -> None:
@@ -1052,7 +1059,40 @@ def test_last_cue_uses_refined_end_then_adds_half_second() -> None:
         Path("unused.wav"), [cue], [(0, 1.7)]
     )
 
-    assert result.cues[0].end == 2.2
+    assert result.cues[0].end == 1.7
+    assert extend_cue_ends(result.cues)[0].end == 2.2
+
+
+@pytest.mark.parametrize(
+    ("fallback_end", "forced_start", "expected_fallback_end"),
+    [(1.0, 1.5, 1.5), (1.5, 1.0, 1.0)],
+)
+def test_shared_end_extension_uses_final_mixed_timeline_starts(
+    fallback_end: float,
+    forced_start: float,
+    expected_fallback_end: float,
+) -> None:
+    extended = extend_cue_ends(
+        [
+            Cue(
+                "fallback",
+                0,
+                fallback_end,
+                "fallback",
+                metadata={"alignment_backend": "vad-fallback"},
+            ),
+            Cue(
+                "forced",
+                forced_start,
+                2,
+                "forced",
+                metadata={"alignment_backend": "whisperx"},
+            ),
+        ]
+    )
+
+    assert extended[0].end == expected_fallback_end
+    assert extended[1].start == forced_start
 
 
 def test_alignment_preserves_cue_content_and_metadata() -> None:

@@ -22,6 +22,7 @@ from .alignment import (
     AlignmentResult,
     PcmVolumeStartRefiner,
     adjust_cue_starts_for_long_vad_silences,
+    extend_cue_ends,
     make_alignment_backend,
 )
 from .config import Settings
@@ -392,6 +393,16 @@ class YakiFlowJob:
         # Retain a small non-zero span for finalization when the last durable
         # cue reaches the apparent end of the file.
         return max(0.01, min(1.0, (duration - processed) / duration))
+
+    @staticmethod
+    def _pcm_audio_duration(audio: Path) -> float | None:
+        try:
+            with wave.open(str(audio), "rb") as source:
+                rate = source.getframerate()
+                duration = source.getnframes() / rate if rate > 0 else 0.0
+        except (EOFError, OSError, wave.Error):
+            return None
+        return duration if duration > 0 else None
 
     async def _report_progress(
         self,
@@ -897,6 +908,10 @@ class YakiFlowJob:
             artifact.audio_path,
             self.alignment_result.cues,
             on_warning=lambda message: self.emit("warning", message),
+        )
+        self.alignment_result.cues = extend_cue_ends(
+            self.alignment_result.cues,
+            duration=self._pcm_audio_duration(artifact.audio_path),
         )
         self.db.replace_aligned_timeline(self.alignment_result.cues)
         await self.emit("timeline-replaced", "aligned subtitle timeline replaced")
