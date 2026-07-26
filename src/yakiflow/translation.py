@@ -286,9 +286,15 @@ def parse_json_response(text: str) -> dict[str, Any]:
 class CodexBackend(AgentBackend):
     name = "codex"
 
-    def __init__(self, work_dir: Path, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        work_dir: Path,
+        runner: CommandRunner | None = None,
+        options: Sequence[str] = (),
+    ):
         self.work_dir = work_dir
         self.runner = runner or CommandRunner()
+        self.options = tuple(options)
 
     async def invoke_with_trace(
         self,
@@ -331,14 +337,27 @@ class CodexBackend(AgentBackend):
                     await maybe
 
         try:
+            command = [
+                "codex",
+                "exec",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--model",
+                model,
+                "--config",
+                f'model_reasoning_effort="{effort}"',
+                "--json",
+                "--output-schema",
+                schema_path,
+                "--output-last-message",
+                output_path,
+            ]
+            command.extend(self.options)
+            command.append("-")
             result = await self.runner.run(
-                [
-                    "codex", "exec", "--ephemeral", "--sandbox", "read-only",
-                    "--skip-git-repo-check",
-                    "--model", model, "--config", f'model_reasoning_effort="{effort}"',
-                    "--json", "--output-schema", schema_path,
-                    "--output-last-message", output_path, "-",
-                ],
+                command,
                 cwd=self.work_dir,
                 stdin=prompt.encode(),
                 on_line=line,
@@ -357,9 +376,15 @@ class CodexBackend(AgentBackend):
 class ClaudeBackend(AgentBackend):
     name = "claude"
 
-    def __init__(self, work_dir: Path, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        work_dir: Path,
+        runner: CommandRunner | None = None,
+        options: Sequence[str] = (),
+    ):
         self.work_dir = work_dir
         self.runner = runner or CommandRunner()
+        self.options = tuple(options)
 
     async def invoke_with_trace(
         self,
@@ -394,12 +419,22 @@ class ClaudeBackend(AgentBackend):
                     if inspect.isawaitable(maybe):
                         await maybe
 
+        command = [
+            "claude",
+            "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--json-schema",
+            json.dumps(schema, ensure_ascii=False),
+            "--model",
+            model,
+            "--effort",
+            effort,
+        ]
+        command.extend(self.options)
         result = await self.runner.run(
-            [
-                "claude", "--print", "--verbose", "--output-format", "stream-json",
-                "--json-schema", json.dumps(schema, ensure_ascii=False),
-                "--model", model, "--effort", effort,
-            ],
+            command,
             cwd=self.work_dir,
             stdin=prompt.encode(),
             on_line=line,
@@ -413,11 +448,17 @@ class ClaudeBackend(AgentBackend):
         raise ValueError(f"Claude stream did not contain a structured result: {result.stderr[-500:]}")
 
 
-def make_backend(name: str, work_dir: Path, runner: CommandRunner | None = None) -> AgentBackend:
+def make_backend(
+    name: str,
+    work_dir: Path,
+    runner: CommandRunner | None = None,
+    *,
+    options: Sequence[str] = (),
+) -> AgentBackend:
     if name == "codex":
-        return CodexBackend(work_dir, runner)
+        return CodexBackend(work_dir, runner, options)
     if name == "claude":
-        return ClaudeBackend(work_dir, runner)
+        return ClaudeBackend(work_dir, runner, options)
     raise ValueError(f"unsupported agent backend: {name}")
 
 

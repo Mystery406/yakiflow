@@ -37,6 +37,10 @@ class Settings:
     draft_effort: str = "low"
     final_model: str | None = None
     final_effort: str = "high"
+    draft_codex_options: tuple[str, ...] = ()
+    final_codex_options: tuple[str, ...] = ()
+    draft_claude_options: tuple[str, ...] = ()
+    final_claude_options: tuple[str, ...] = ()
     agent_workers: int = 4
     translation_batch_size: int = 20
     translation_context: int = 10
@@ -97,16 +101,45 @@ PATH_FIELDS = {
 
 PATH_SEQUENCE_FIELDS = {"context_files"}
 
+ARG_TOKEN_FIELDS = {
+    "draft_codex_options",
+    "final_codex_options",
+    "draft_claude_options",
+    "final_claude_options",
+}
 
-def _read_toml(path: Path | None) -> dict[str, Any]:
+
+def _read_toml(
+    path: Path | None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     if path is None or not path.is_file():
-        return {}
+        return {}, {}
     with path.open("rb") as fh:
         data = tomllib.load(fh)
-    section = data.get("yakiflow", data)
-    if not isinstance(section, dict):
-        raise ValueError(f"expected a table in {path}")
-    return section
+    if "yakiflow" in data:
+        raise ValueError(
+            f"legacy [yakiflow] configuration is not supported in {path}; "
+            "move its settings to the TOML document root"
+        )
+    raw_profiles = data.pop("profiles", {})
+    if not isinstance(raw_profiles, dict):
+        raise ValueError(f"profiles must be a table in {path}")
+    profiles: dict[str, dict[str, Any]] = {}
+    for name, values in raw_profiles.items():
+        if not isinstance(values, dict):
+            raise ValueError(f"profile {name!r} must be a table in {path}")
+        for key, value in values.items():
+            normalized = key.replace("-", "_")
+            if isinstance(value, dict):
+                raise ValueError(
+                    f"profile {name!r} cannot contain nested table {key!r} in {path}"
+                )
+            if normalized in {"profile", "profiles", "inherit", "inherits", "extends"}:
+                raise ValueError(
+                    f"profile {name!r} cannot inherit from another profile in {path}"
+                )
+        profiles[str(name)] = values
+    return data, profiles
 
 
 def _clean(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -125,6 +158,12 @@ def _clean(values: Mapping[str, Any]) -> dict[str, Any]:
                 else (value,)
             )
             result[key] = tuple(Path(item).expanduser() for item in values)
+        elif key in ARG_TOKEN_FIELDS:
+            if not isinstance(value, (list, tuple)) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise ValueError(f"{key} must be an array of strings")
+            result[key] = tuple(value)
         else:
             result[key] = value
     return result
@@ -135,15 +174,27 @@ def load_settings(
     *,
     project_file: Path | None = None,
     user_file: Path | None = None,
+    profile: str | None = None,
 ) -> Settings:
-    """Merge defaults < user config < project config < explicit CLI values."""
+    """Load base/profile settings and overlay explicit CLI values."""
     user_file = user_file or user_config_path("yakiflow") / "config.toml"
     if project_file is None:
         candidate = Path.cwd() / "yakiflow.toml"
         project_file = candidate if candidate.exists() else None
+    user_base, user_profiles = _read_toml(user_file)
+    project_base, project_profiles = _read_toml(project_file)
+    if (
+        profile is not None
+        and profile not in user_profiles
+        and profile not in project_profiles
+    ):
+        raise ValueError(f"unknown profile {profile!r}")
     merged = asdict(Settings())
-    merged.update(_clean(_read_toml(user_file)))
-    merged.update(_clean(_read_toml(project_file)))
+    merged.update(_clean(user_base))
+    merged.update(_clean(project_base))
+    if profile is not None:
+        merged.update(_clean(user_profiles.get(profile, {})))
+        merged.update(_clean(project_profiles.get(profile, {})))
     merged.update(_clean(cli or {}))
     return Settings(**merged).resolved()
 

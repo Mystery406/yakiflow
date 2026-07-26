@@ -175,6 +175,55 @@ def test_cli_backends_stream_trace_while_returning_structured_result(tmp_path: P
     assert claude_events[0].kind == "agent_message"
 
 
+def test_draft_backend_commands_append_only_matching_options(tmp_path: Path) -> None:
+    schema = {"type": "object"}
+    expected = {"cues": []}
+    commands: dict[str, list[object]] = {}
+
+    class CodexRunner:
+        async def run(self, args, **_kwargs):
+            commands["codex"] = list(args)
+            output = Path(args[args.index("--output-last-message") + 1])
+            output.write_text(json.dumps(expected))
+            return ProcessResult(tuple(str(arg) for arg in args), 0, "", "")
+
+    class ClaudeRunner:
+        async def run(self, args, *, on_line=None, **_kwargs):
+            commands["claude"] = list(args)
+            assert on_line is not None
+            await on_line(
+                "stdout",
+                json.dumps({"type": "result", "structured_output": expected}),
+            )
+            return ProcessResult(tuple(str(arg) for arg in args), 0, "", "")
+
+    async def exercise() -> None:
+        await CodexBackend(
+            tmp_path, CodexRunner(), ("-c", "service_tier=fast")
+        ).invoke_with_trace(
+            "prompt", model="draft-codex", effort="low", schema=schema
+        )
+        await ClaudeBackend(
+            tmp_path, ClaudeRunner(), ("--permission-mode", "plan")
+        ).invoke_with_trace(
+            "prompt", model="draft-claude", effort="medium", schema=schema
+        )
+
+    asyncio.run(exercise())
+
+    codex = commands["codex"]
+    assert codex[-3:] == ["-c", "service_tier=fast", "-"]
+    assert "--permission-mode" not in codex
+    claude = commands["claude"]
+    assert claude[-4:] == [
+        "--effort",
+        "medium",
+        "--permission-mode",
+        "plan",
+    ]
+    assert "service_tier=fast" not in claude
+
+
 def test_pipeline_emits_agent_lifecycle_and_readable_result(tmp_path: Path) -> None:
     settings = Settings(target_language="zh-CN", draft_model="draft")
     db = JobDatabase(tmp_path / "db.sqlite3")

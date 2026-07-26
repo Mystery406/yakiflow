@@ -446,6 +446,42 @@ def test_resume_preserves_temporary_workdir_status(
     assert not work_dir.exists()
 
 
+def test_resume_preserves_effective_profile_values_and_agent_option_tokens(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        stream=True,
+        translation_batch_size=5,
+        draft_codex_options=("-c", "service_tier=fast"),
+        final_codex_options=("--search",),
+        draft_claude_options=("--permission-mode", "plan"),
+        final_claude_options=("--verbose",),
+        work_dir=work_dir,
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
+    job.close()
+
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+
+    assert resumed.settings.stream is True
+    assert resumed.settings.translation_batch_size == 5
+    assert resumed.settings.draft_codex_options == (
+        "-c",
+        "service_tier=fast",
+    )
+    assert resumed.settings.final_codex_options == ("--search",)
+    assert resumed.settings.draft_claude_options == (
+        "--permission-mode",
+        "plan",
+    )
+    assert resumed.settings.final_claude_options == ("--verbose",)
+    resumed.close()
+
+
 def test_local_input_is_canonicalized_before_journaling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -41,7 +41,6 @@ python -m pip install -e .
 Create `yakiflow.toml` in the directory where you will run YakiFlow:
 
 ```toml
-[yakiflow]
 source_language = "auto"
 target_language = "zh-CN"
 translation_backend = "codex"
@@ -161,15 +160,53 @@ advance, start the job with `--work-dir ./work/video-job`.
 Settings are read in this order, from highest to lowest priority:
 
 1. command-line options;
-2. the file passed to `--config`, or `yakiflow.toml` in the current directory;
-3. the user configuration file;
-4. built-in defaults.
+2. the selected profile in the file passed to `--config`, or in
+   `yakiflow.toml` in the current directory;
+3. the selected profile in the user configuration file;
+4. base settings in the project configuration file;
+5. base settings in the user configuration file;
+6. built-in defaults.
 
 On Linux, the user configuration file is
 `~/.config/yakiflow/config.toml` (or
-`$XDG_CONFIG_HOME/yakiflow/config.toml`). Both config files use a `[yakiflow]`
-table. Relative paths are resolved from the directory in which you start the
-job.
+`$XDG_CONFIG_HOME/yakiflow/config.toml`). Put normal settings directly at the
+TOML document root. Relative paths are resolved from the directory in which you
+start the job.
+
+### Configuration profiles
+
+Put reusable variants under `[profiles.NAME]` and select one with `--profile`
+on `run`, `doctor`, or `models fetch`:
+
+```toml
+source_language = "auto"
+target_language = "zh-CN"
+translation_backend = "codex"
+
+[profiles.stream]
+stream = true
+translation_batch_size = 5
+draft_codex_options = ["-c", "service_tier=fast"]
+```
+
+```console
+yakiflow run 'https://example.com/live' --profile stream
+yakiflow doctor --profile stream
+yakiflow models fetch --profile stream
+```
+
+If both user and project files define the selected name, their profile settings
+merge field by field, with project values replacing user values. Lists replace
+earlier lists rather than being appended. A profile is applied after both base
+files, so even a user profile overrides project base settings; explicit CLI
+values still win. Unselected profiles have no effect.
+
+Selecting an unknown profile is an error. `profiles` and each named profile
+must be TOML tables, and profiles cannot contain nested tables or inherit from
+other profiles. YakiFlow saves the fully resolved settings with each job, so a
+resume does not depend on the profile or configuration files still existing.
+There are no built-in profiles and selecting no profile preserves the normal
+defaults.
 
 ### Common settings
 
@@ -234,6 +271,10 @@ command-line usage.
 | --- | --- | --- | --- |
 | `draft_effort` | `--draft-effort` | `low` | Reasoning effort for draft translation |
 | `final_effort` | `--final-effort` | `high` | Reasoning effort for interactive review |
+| `draft_codex_options` | — | `[]` | Extra Codex argv tokens for structured draft translation calls |
+| `final_codex_options` | — | `[]` | Extra Codex argv tokens for interactive review and memory-conflict sessions |
+| `draft_claude_options` | — | `[]` | Extra Claude argv tokens for structured draft translation calls |
+| `final_claude_options` | — | `[]` | Extra Claude argv tokens for interactive review and memory-conflict sessions |
 | `translation_batch_size` | — | `20` | Maximum subtitle cues sent in each draft request |
 | `translation_context` | — | `10` | Number of preceding cues supplied as translation context |
 | `draft_agent_timeout_seconds` | `--draft-agent-timeout-seconds` | `600` | Timeout for each draft Agent attempt |
@@ -241,7 +282,10 @@ command-line usage.
 | `agent_retry_delay_seconds` | `--agent-retry-delay-seconds` | `1` | Delay between draft request attempts |
 
 The supported effort values are `minimal`, `low`, `medium`, `high`, and
-`xhigh`.
+`xhigh`. Agent option settings must be TOML arrays containing only strings.
+YakiFlow passes each string directly as one argv token, after its managed flags
+and before the prompt or stdin sentinel; it does not shell-parse, combine, or
+filter them. Invalid or conflicting options are reported by Codex or Claude.
 
 #### Review display
 
@@ -283,14 +327,12 @@ Agent when possible. In that pane, press `O` to open the media with the current
 subtitles in `mpv`. To use another player:
 
 ```toml
-[yakiflow]
 video_open_command = "vlc --sub-file={subtitle} {file}"
 ```
 
 To open the staged SRT in an editor instead of using the split preview:
 
 ```toml
-[yakiflow]
 review_display_mode = "open"
 review_open_command = "code --reuse-window {file}"
 ```
@@ -306,7 +348,6 @@ A Silero VAD model helps Whisper skip silence and improves cue starts. Download
 a model supported by your whisper.cpp build, then configure its path:
 
 ```toml
-[yakiflow]
 vad_model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
 ```
 
@@ -331,7 +372,6 @@ uv sync --extra whisperx-cuda
 Then enable and verify it:
 
 ```toml
-[yakiflow]
 alignment_backend = "whisperx"
 alignment_device = "auto" # auto, cpu, or cuda
 ```

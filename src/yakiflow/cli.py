@@ -41,12 +41,14 @@ def _parser() -> argparse.ArgumentParser:
     models_sub = models.add_subparsers(dest="models_command", required=True)
     fetch = models_sub.add_parser("fetch")
     fetch.add_argument("--config", type=Path)
+    fetch.add_argument("--profile", metavar="NAME")
     fetch.add_argument("--whisper-model", type=Path)
     return parser
 
 
 def _settings_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--profile", metavar="NAME")
     parser.add_argument("--source-language")
     parser.add_argument("--target-language")
     parser.add_argument("--whisper-model", type=Path)
@@ -89,9 +91,10 @@ def _settings_arguments(parser: argparse.ArgumentParser) -> None:
 def _settings(namespace: argparse.Namespace):
     values = vars(namespace).copy()
     config = values.pop("config", None)
+    profile = values.pop("profile", None)
     for key in ("command", "input", "workdir", "models_command"):
         values.pop(key, None)
-    return load_settings(values, project_file=config)
+    return load_settings(values, project_file=config, profile=profile)
 
 
 async def _run_job(job: YakiFlowJob) -> int:

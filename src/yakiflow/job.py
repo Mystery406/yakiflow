@@ -113,7 +113,17 @@ class YakiFlowJob:
         self.runner = runner or CommandRunner()
         self.db = JobDatabase(self.work_dir / "job.sqlite3")
         self.listener = listener
-        self.backend = backend or make_backend(settings.translation_backend or "", self.work_dir, self.runner)
+        draft_options = (
+            settings.draft_codex_options
+            if settings.translation_backend == "codex"
+            else settings.draft_claude_options
+        )
+        self.backend = backend or make_backend(
+            settings.translation_backend or "",
+            self.work_dir,
+            self.runner,
+            options=draft_options,
+        )
         self.memory_destination = settings.memory
         self.memory_path = self.work_dir / "memory.md"
         existing_job = self.db.job() is not None

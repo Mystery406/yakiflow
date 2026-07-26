@@ -39,7 +39,6 @@ python -m pip install -e .
 在准备运行 YakiFlow 的目录中创建 `yakiflow.toml`：
 
 ```toml
-[yakiflow]
 source_language = "auto"
 target_language = "zh-CN"
 translation_backend = "codex"
@@ -153,13 +152,47 @@ yakiflow resume /path/to/workdir
 YakiFlow 按以下顺序读取配置，越靠前优先级越高：
 
 1. 命令行参数；
-2. `--config` 指定的文件，或当前目录中的 `yakiflow.toml`；
-3. 用户配置文件；
-4. 内置默认值。
+2. `--config` 指定的文件（或当前目录中的 `yakiflow.toml`）里选中的配置档；
+3. 用户配置文件里选中的配置档；
+4. 项目配置文件的基础设置；
+5. 用户配置文件的基础设置；
+6. 内置默认值。
 
 Linux 用户配置文件位于 `~/.config/yakiflow/config.toml`（设置了
-`XDG_CONFIG_HOME` 时则在 `$XDG_CONFIG_HOME/yakiflow/config.toml`）。两类配置
-文件都使用 `[yakiflow]` 表。相对路径以启动任务时所在的目录为基准。
+`XDG_CONFIG_HOME` 时则在 `$XDG_CONFIG_HOME/yakiflow/config.toml`）。普通设置
+直接写在 TOML 文档根部。相对路径以启动任务时所在的目录为基准。
+
+### 配置档
+
+可复用的变体写在 `[profiles.NAME]` 下，并在 `run`、`doctor` 或
+`models fetch` 中用 `--profile` 选择：
+
+```toml
+source_language = "auto"
+target_language = "zh-CN"
+translation_backend = "codex"
+
+[profiles.stream]
+stream = true
+translation_batch_size = 5
+draft_codex_options = ["-c", "service_tier=fast"]
+```
+
+```console
+yakiflow run 'https://example.com/live' --profile stream
+yakiflow doctor --profile stream
+yakiflow models fetch --profile stream
+```
+
+如果用户与项目文件都定义了所选名称，两处配置档会按字段合并，项目值覆盖用户
+值；列表会整体替换，而不是追加。配置档在两个基础配置文件之后应用，因此用户
+配置档也会覆盖项目基础设置；显式命令行参数仍有最高优先级。未选中的配置档完全
+不生效。
+
+选择不存在的配置档会报错。`profiles` 和每个命名配置档都必须是 TOML 表，配置档
+不能包含嵌套表，也不能继承其他配置档。YakiFlow 会把完全解析后的有效设置随任务
+保存，因此恢复任务不依赖原配置档或配置文件继续存在。YakiFlow 不提供内置配置档；
+不选择配置档时仍使用原有默认行为。
 
 ### 常用设置
 
@@ -221,13 +254,20 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 | --- | --- | --- | --- |
 | `draft_effort` | `--draft-effort` | `low` | 草稿翻译的推理强度 |
 | `final_effort` | `--final-effort` | `high` | 交互式审校的推理强度 |
+| `draft_codex_options` | — | `[]` | 仅传给 Codex 结构化草稿翻译调用的额外 argv token |
+| `final_codex_options` | — | `[]` | 传给 Codex 交互式审校和记忆冲突会话的额外 argv token |
+| `draft_claude_options` | — | `[]` | 仅传给 Claude 结构化草稿翻译调用的额外 argv token |
+| `final_claude_options` | — | `[]` | 传给 Claude 交互式审校和记忆冲突会话的额外 argv token |
 | `translation_batch_size` | — | `20` | 每次草稿请求最多发送的字幕条数 |
 | `translation_context` | — | `10` | 作为翻译上下文提供的前文字幕条数 |
 | `draft_agent_timeout_seconds` | `--draft-agent-timeout-seconds` | `600` | 每次草稿 Agent 尝试的超时时间 |
 | `agent_max_attempts` | `--agent-max-attempts` | `3` | 草稿请求失败后的最大尝试次数 |
 | `agent_retry_delay_seconds` | `--agent-retry-delay-seconds` | `1` | 草稿请求两次尝试之间的等待秒数 |
 
-推理强度可设为 `minimal`、`low`、`medium`、`high` 或 `xhigh`。
+推理强度可设为 `minimal`、`low`、`medium`、`high` 或 `xhigh`。Agent 选项设置
+必须是只含字符串的 TOML 数组。YakiFlow 会把每个字符串直接作为一个 argv token，
+放在自身管理的参数之后、提示词或标准输入哨兵之前；不会进行 shell 解析、拼接或
+过滤。无效或冲突的参数由 Codex 或 Claude 报错。
 
 #### 审校显示
 
@@ -267,14 +307,12 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 按 `O`，可以用 `mpv` 打开媒体并加载当前字幕。要使用其他播放器：
 
 ```toml
-[yakiflow]
 video_open_command = "vlc --sub-file={subtitle} {file}"
 ```
 
 如果希望用编辑器打开暂存 SRT，而不是使用分屏预览：
 
 ```toml
-[yakiflow]
 review_display_mode = "open"
 review_open_command = "code --reuse-window {file}"
 ```
@@ -290,7 +328,6 @@ Silero VAD 模型可以帮助 Whisper 跳过静音，并改善字幕起点。下
 whisper.cpp 构建兼容的模型，然后配置路径：
 
 ```toml
-[yakiflow]
 vad_model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
 ```
 
@@ -313,7 +350,6 @@ uv sync --extra whisperx-cuda
 然后启用并检查：
 
 ```toml
-[yakiflow]
 alignment_backend = "whisperx"
 alignment_device = "auto" # auto、cpu 或 cuda
 ```

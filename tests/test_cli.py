@@ -19,7 +19,10 @@ class TTY(io.StringIO):
         return True
 
 
-def test_alignment_cli_options_are_loaded() -> None:
+def test_alignment_cli_options_are_loaded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     args = cli._parser().parse_args([
         "run",
         "input.mp4",
@@ -40,6 +43,7 @@ def test_alignment_cli_options_are_loaded() -> None:
 def test_context_file_cli_option_is_repeatable(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.chdir(tmp_path)
     args = cli._parser().parse_args([
         "run",
@@ -56,6 +60,25 @@ def test_context_file_cli_option_is_repeatable(
         tmp_path / "chat.xml",
         tmp_path / "notes.txt",
     )
+
+
+def test_profile_option_is_available_on_config_loading_commands(monkeypatch) -> None:
+    selected: list[str | None] = []
+
+    def fake_load_settings(_values, **kwargs):
+        selected.append(kwargs.get("profile"))
+        return Settings()
+
+    monkeypatch.setattr(cli, "load_settings", fake_load_settings)
+    parser = cli._parser()
+    for argv in (
+        ["run", "input.mp4", "--profile", "stream"],
+        ["doctor", "--profile", "stream"],
+        ["models", "fetch", "--profile", "stream"],
+    ):
+        cli._settings(parser.parse_args(argv))
+
+    assert selected == ["stream", "stream", "stream"]
 
 
 def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> None:

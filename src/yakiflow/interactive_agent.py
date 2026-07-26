@@ -236,14 +236,18 @@ def build_interactive_command(
         if model:
             command.extend(("--model", model))
         command.extend(
-            ("--config", f'model_reasoning_effort="{settings.final_effort}"', prompt)
+            ("--config", f'model_reasoning_effort="{settings.final_effort}"')
         )
+        command.extend(settings.final_codex_options)
+        command.append(prompt)
         return command
     if settings.translation_backend == "claude":
         command = ["claude"]
         if model:
             command.extend(("--model", model))
-        command.extend(("--effort", settings.final_effort, prompt))
+        command.extend(("--effort", settings.final_effort))
+        command.extend(settings.final_claude_options)
+        command.append(prompt)
         return command
     raise ValueError(f"unsupported agent backend: {settings.translation_backend}")
 

@@ -4,6 +4,7 @@ import pytest
 
 from yakiflow.config import Settings
 from yakiflow.interactive_agent import (
+    build_interactive_command,
     build_interactive_prompt,
     build_memory_conflict_prompt,
 )
@@ -106,3 +107,49 @@ def test_memory_conflict_prompt_scopes_agent_to_staged_memory(tmp_path: Path) ->
     assert "-old\n+new" in prompt
     assert "do not edit the destination" in prompt
     assert "avoid duplicate memory entries" in " ".join(prompt.split())
+
+
+def test_interactive_commands_append_only_matching_final_options() -> None:
+    codex = build_interactive_command(
+        Settings(
+            translation_backend="codex",
+            final_model="final-codex",
+            final_effort="high",
+            final_codex_options=("-c", "service_tier=fast"),
+            final_claude_options=("--dangerously-skip-permissions",),
+        ),
+        "codex prompt",
+    )
+    claude = build_interactive_command(
+        Settings(
+            translation_backend="claude",
+            final_model="final-claude",
+            final_effort="medium",
+            final_codex_options=("--search",),
+            final_claude_options=("--permission-mode", "plan"),
+        ),
+        "claude prompt",
+    )
+
+    assert codex == [
+        "codex",
+        "--sandbox",
+        "workspace-write",
+        "--model",
+        "final-codex",
+        "--config",
+        'model_reasoning_effort="high"',
+        "-c",
+        "service_tier=fast",
+        "codex prompt",
+    ]
+    assert claude == [
+        "claude",
+        "--model",
+        "final-claude",
+        "--effort",
+        "medium",
+        "--permission-mode",
+        "plan",
+        "claude prompt",
+    ]
