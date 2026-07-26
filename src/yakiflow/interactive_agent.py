@@ -188,7 +188,9 @@ of the following in this one session:
 1. Review: ask for and understand natural-language subtitle feedback. Inspect
    the staged subtitles and any source/translation evidence applicable to the
    output-specific scope yourself; do not require the user to provide cue IDs
-   or line numbers.
+   or line numbers. Whenever you point out or discuss a specific subtitle
+   sentence/cue in the terminal, include its SRT start and end timestamp
+   (for example, `00:01:23,456 --> 00:01:25,000`).
 2. Refinement: apply agreed corrections to the subtitle artifacts, preserving
    SRT structure and any timing or formatting that does not need correction,
    and check the complete timeline for consistency.

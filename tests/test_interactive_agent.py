@@ -58,6 +58,9 @@ def test_interactive_prompt_scopes_review_to_final_output(
     assert expected in normalized
     assert required_detail in normalized
     assert "source/translation evidence applicable to the output-specific scope" in normalized
+    assert "Whenever you point out or discuss a specific subtitle" in normalized
+    assert "include its SRT start and end timestamp" in normalized
+    assert "00:01:23,456 --> 00:01:25,000" in normalized
 
 
 def test_interactive_prompt_requires_proactive_novel_memory_candidates(
