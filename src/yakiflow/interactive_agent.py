@@ -61,6 +61,28 @@ def _source_media(work_dir: Path) -> Path | None:
         db.close()
 
 
+def review_open_argv(command: str, file_path: Path, work_dir: Path) -> list[str]:
+    """Expand a review-display command without invoking a shell."""
+    has_srt = any(
+        placeholder in command for placeholder in ("{srt}", "{file}", "{srt_file}")
+    )
+    memory_file = work_dir / "memory.md"
+    replacements = {
+        "{srt}": file_path,
+        "{file}": file_path,
+        "{srt_file}": file_path,
+        "{workdir}": work_dir,
+        "{memory}": memory_file,
+        "{memory_file}": memory_file,
+    }
+    for placeholder, path in replacements.items():
+        command = command.replace(placeholder, shlex.quote(str(path)))
+    argv = shlex.split(command)
+    if not has_srt:
+        argv.append(str(file_path))
+    return argv
+
+
 async def start_agent_file_display(
     settings: Settings,
     work_dir: Path,
@@ -77,10 +99,7 @@ async def start_agent_file_display(
         command_text = settings.review_open_command
         if not command_text:
             raise ValueError("review_open_command is required for open display mode")
-        command_text = command_text.replace("{file}", shlex.quote(str(file_path)))
-        command = shlex.split(command_text)
-        if "{file}" not in settings.review_open_command:
-            command.append(str(file_path))
+        command = review_open_argv(command_text, file_path, work_dir)
         await asyncio.create_subprocess_exec(*command, cwd=work_dir)
         return AgentFileDisplay()
 

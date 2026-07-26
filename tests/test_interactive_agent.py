@@ -9,6 +9,7 @@ from yakiflow.interactive_agent import (
     build_interactive_command,
     build_interactive_prompt,
     build_memory_conflict_prompt,
+    review_open_argv,
 )
 from yakiflow.process import ProcessResult
 
@@ -113,6 +114,55 @@ def test_memory_conflict_prompt_scopes_agent_to_staged_memory(tmp_path: Path) ->
     assert "-old\n+new" in prompt
     assert "do not edit the destination" in prompt
     assert "avoid duplicate memory entries" in " ".join(prompt.split())
+
+
+def test_review_open_command_expands_job_path_placeholders(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work dir"
+    subtitle = work_dir / "movie file.srt"
+
+    assert review_open_argv(
+        "code --reuse-window {workdir} {srt} {memory}", subtitle, work_dir
+    ) == [
+        "code",
+        "--reuse-window",
+        str(work_dir),
+        str(subtitle),
+        str(work_dir / "memory.md"),
+    ]
+
+
+@pytest.mark.parametrize("srt_placeholder", ["{file}", "{srt_file}"])
+def test_review_open_command_supports_srt_aliases_without_appending(
+    tmp_path: Path, srt_placeholder: str
+) -> None:
+    subtitle = tmp_path / "movie.srt"
+
+    assert review_open_argv(f"editor {srt_placeholder}", subtitle, tmp_path) == [
+        "editor",
+        str(subtitle),
+    ]
+
+
+def test_review_open_command_supports_memory_file_alias(tmp_path: Path) -> None:
+    subtitle = tmp_path / "movie.srt"
+
+    assert review_open_argv("editor {memory_file}", subtitle, tmp_path) == [
+        "editor",
+        str(tmp_path / "memory.md"),
+        str(subtitle),
+    ]
+
+
+def test_review_open_command_appends_srt_when_no_srt_placeholder(
+    tmp_path: Path,
+) -> None:
+    subtitle = tmp_path / "movie.srt"
+
+    assert review_open_argv("editor {workdir}", subtitle, tmp_path) == [
+        "editor",
+        str(tmp_path),
+        str(subtitle),
+    ]
 
 
 def test_interactive_commands_append_only_matching_final_options() -> None:
