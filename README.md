@@ -291,12 +291,13 @@ filter them. Invalid or conflicting options are reported by Codex or Claude.
 
 | TOML key | CLI option | Default | What it controls |
 | --- | --- | --- | --- |
-| `review_display_mode` | `--review-display-mode` | `split` | Use a tmux subtitle pane (`split`) or an external program (`open`) |
-| `review_open_command` | `--review-open-command` | unset | Command template used by `open` mode; supports `{srt}`, `{workdir}`, and `{memory}` |
+| `review_display_mode` | `--review-display-mode` | `split` | Use a tmux subtitle pane (`split`), an external program (`open`), or both (`both`) |
+| `review_open_command` | `--review-open-command` | unset | Command template used by `open` and `both` modes; supports `{srt}`, `{workdir}`, and `{memory}` |
 | `auto_open_video` | `--auto-open-video` / `--no-auto-open-video` | `false` | Open the source video automatically when interactive review starts |
 | `video_open_command` | `--video-open-command` | built-in `mpv` command | Command template for opening media; supports `{file}` and `{subtitle}` |
 
-`review_open_command` is required when `review_display_mode = "open"`.
+`review_open_command` is required when `review_display_mode` is `"open"` or
+`"both"`.
 Leave its placeholders unquoted; YakiFlow safely keeps substituted paths,
 including paths containing spaces, as single arguments. The template uses
 shell-style argument parsing, but the resulting command is launched directly
@@ -346,6 +347,9 @@ To open the staged SRT in an editor instead of using the split preview:
 review_display_mode = "open"
 review_open_command = "code --reuse-window {workdir} {srt} {memory}"
 ```
+
+Use `review_display_mode = "both"` to open the editor and retain the split
+preview at the same time.
 
 In CI or with redirected input/output, interactive review is skipped and the
 batch result is finalized directly.

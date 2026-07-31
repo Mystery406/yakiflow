@@ -83,7 +83,7 @@ def _settings_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draft-agent-timeout-seconds", type=float)
     parser.add_argument("--agent-max-attempts", type=int)
     parser.add_argument("--agent-retry-delay-seconds", type=float)
-    parser.add_argument("--review-display-mode", choices=["split", "open"])
+    parser.add_argument("--review-display-mode", choices=["split", "open", "both"])
     parser.add_argument("--review-open-command")
     parser.add_argument(
         "--auto-open-video",

@@ -10,6 +10,7 @@ from yakiflow.interactive_agent import (
     build_interactive_prompt,
     build_memory_conflict_prompt,
     review_open_argv,
+    start_agent_file_display,
 )
 from yakiflow.process import ProcessResult
 
@@ -163,6 +164,47 @@ def test_review_open_command_appends_srt_when_no_srt_placeholder(
         str(tmp_path),
         str(subtitle),
     ]
+
+
+def test_both_display_mode_opens_external_command_and_tmux_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subtitle = tmp_path / "movie.srt"
+    subtitle.write_text("", encoding="utf-8")
+    monkeypatch.setenv("TMUX", "test")
+    monkeypatch.setattr(interactive_agent, "_source_media", lambda _work_dir: None)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class Process:
+        returncode = 0
+
+        async def wait(self) -> None:
+            return None
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr(
+        interactive_agent.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    display = asyncio.run(
+        start_agent_file_display(
+            Settings(
+                review_display_mode="both",
+                review_open_command="editor {srt}",
+            ),
+            tmp_path,
+            [subtitle],
+        )
+    )
+
+    assert calls[0][0] == ("editor", str(subtitle))
+    assert calls[1][0][:2] == ("tmux", "split-window")
+    assert display.marker == tmp_path / ".agent-display-done"
 
 
 def test_interactive_commands_append_only_matching_final_options() -> None:

@@ -213,10 +213,15 @@ def validate_run_settings(settings: Settings) -> None:
         raise ValueError("--alignment-backend must be vad or whisperx")
     if settings.alignment_device not in {"auto", "cpu", "cuda"}:
         raise ValueError("--alignment-device must be auto, cpu, or cuda")
-    if settings.review_display_mode not in {"split", "open"}:
+    if settings.review_display_mode not in {"split", "open", "both"}:
         raise ValueError("invalid --review-display-mode")
-    if settings.review_display_mode == "open" and not settings.review_open_command:
-        raise ValueError("--review-open-command is required when review display mode is open")
+    if (
+        settings.review_display_mode in {"open", "both"}
+        and not settings.review_open_command
+    ):
+        raise ValueError(
+            "--review-open-command is required when review display mode is open or both"
+        )
     if settings.agent_workers < 1 or settings.translation_batch_size < 1:
         raise ValueError("agent worker and batch counts must be positive")
     if settings.translation_context < 0:

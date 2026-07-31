@@ -89,3 +89,29 @@ def test_doctor_names_both_whisperx_install_variants(
     assert not whisperx.ok
     assert "yakiflow[whisperx-cpu]" in whisperx.detail
     assert "yakiflow[whisperx-cuda]" in whisperx.detail
+
+
+def test_doctor_checks_both_review_display_dependencies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = tmp_path / "whisper.bin"
+    model.write_bytes(b"model")
+    monkeypatch.setattr(doctor_module.shutil, "which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr(
+        doctor_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+    )
+
+    checks = run_doctor(
+        Settings(
+            whisper_model=model,
+            translation_backend="codex",
+            review_display_mode="both",
+            review_open_command="editor {srt}",
+        )
+    )
+    mapped = {check.name: check for check in checks}
+
+    assert mapped["tmux"].ok
+    assert mapped["review open command"].ok

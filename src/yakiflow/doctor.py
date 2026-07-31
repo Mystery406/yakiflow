@@ -84,10 +84,10 @@ def run_doctor(settings: Settings) -> list[Check]:
             checks.append(Check(f"{name} auth", result.returncode == 0, detail[-1] if detail else f"exit {result.returncode}"))
         except (OSError, subprocess.SubprocessError) as exc:
             checks.append(Check(f"{name} auth", False, str(exc)))
-    if settings.review_display_mode == "split":
+    if settings.review_display_mode in {"split", "both"}:
         tmux = shutil.which("tmux")
         checks.append(Check("tmux", bool(tmux), tmux or "not found (split review will have no preview)"))
-    elif settings.review_display_mode == "open":
+    if settings.review_display_mode in {"open", "both"}:
         command = settings.review_open_command or ""
         try:
             executable = shlex.split(command)[0]

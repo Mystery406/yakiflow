@@ -55,6 +55,25 @@ def test_auto_open_video_cli_option_is_loaded(
     assert settings.auto_open_video is True
 
 
+def test_both_review_display_mode_cli_option_is_loaded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    args = cli._parser().parse_args([
+        "run",
+        "input.mp4",
+        "--review-display-mode",
+        "both",
+        "--review-open-command",
+        "editor {srt}",
+    ])
+
+    settings = cli._settings(args)
+
+    assert settings.review_display_mode == "both"
+    assert settings.review_open_command == "editor {srt}"
+
+
 def test_context_file_cli_option_is_repeatable(
     tmp_path: Path, monkeypatch
 ) -> None:

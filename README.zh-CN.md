@@ -273,12 +273,13 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 
 | TOML 键 | 命令行参数 | 默认值 | 用途 |
 | --- | --- | --- | --- |
-| `review_display_mode` | `--review-display-mode` | `split` | 使用 tmux 字幕窗格（`split`）或外部程序（`open`） |
-| `review_open_command` | `--review-open-command` | 未设置 | `open` 模式使用的命令模板；支持 `{srt}`、`{workdir}` 和 `{memory}` |
+| `review_display_mode` | `--review-display-mode` | `split` | 使用 tmux 字幕窗格（`split`）、外部程序（`open`）或同时使用两者（`both`） |
+| `review_open_command` | `--review-open-command` | 未设置 | `open` 和 `both` 模式使用的命令模板；支持 `{srt}`、`{workdir}` 和 `{memory}` |
 | `auto_open_video` | `--auto-open-video` / `--no-auto-open-video` | `false` | 交互式审校开始时自动打开源视频 |
 | `video_open_command` | `--video-open-command` | 内置 `mpv` 命令 | 打开媒体的命令模板；支持 `{file}` 和 `{subtitle}` |
 
-当 `review_display_mode = "open"` 时，必须设置 `review_open_command`。
+当 `review_display_mode` 为 `"open"` 或 `"both"` 时，必须设置
+`review_open_command`。
 请勿给其中的占位符加引号；YakiFlow 会安全地将替换后的路径（包括含空格的路径）
 保留为单个参数。模板采用 shell 风格的参数解析，但解析后的命令会绕过 shell 直接
 启动。包含空格的字面参数仍需加引号。
@@ -324,6 +325,8 @@ video_open_command = "vlc --sub-file={subtitle} {file}"
 review_display_mode = "open"
 review_open_command = "code --reuse-window {workdir} {srt} {memory}"
 ```
+
+若要同时打开编辑器并保留分屏预览，请使用 `review_display_mode = "both"`。
 
 在 CI 或标准输入输出被重定向时，YakiFlow 会跳过交互式审校，直接保存批处理
 结果。

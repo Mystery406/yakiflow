@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,24 @@ def test_auto_is_an_explicit_source_language() -> None:
         user_file=Path("/missing"), project_file=Path("/missing"),
     )
     validate_run_settings(settings)
+
+
+def test_both_review_display_mode_requires_open_command() -> None:
+    settings = load_settings(
+        {
+            "source_language": "en",
+            "target_language": "zh-CN",
+            "translation_backend": "codex",
+            "review_display_mode": "both",
+        },
+        user_file=Path("/missing"),
+        project_file=Path("/missing"),
+    )
+
+    with pytest.raises(ValueError, match="review-open-command"):
+        validate_run_settings(settings)
+
+    validate_run_settings(replace(settings, review_open_command="editor {srt}"))
 
 
 def test_whisperx_alignment_settings_are_loaded_and_validated(tmp_path: Path) -> None:

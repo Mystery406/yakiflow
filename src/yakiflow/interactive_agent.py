@@ -95,13 +95,16 @@ async def start_agent_file_display(
     media_path = _source_media(work_dir)
     marker = work_dir / ".agent-display-done"
     marker.unlink(missing_ok=True)
-    if settings.review_display_mode == "open":
+    if settings.review_display_mode in {"open", "both"}:
         command_text = settings.review_open_command
         if not command_text:
-            raise ValueError("review_open_command is required for open display mode")
+            raise ValueError(
+                "review_open_command is required for open or both display mode"
+            )
         command = review_open_argv(command_text, file_path, work_dir)
         await asyncio.create_subprocess_exec(*command, cwd=work_dir)
-        return AgentFileDisplay()
+        if settings.review_display_mode == "open":
+            return AgentFileDisplay()
 
     command = ["tmux"]
     # A split pane only makes sense from inside an active multiplexer
@@ -335,7 +338,7 @@ async def run_interactive_agent(
             cwd=work_dir,
         )
     if (
-        settings.review_display_mode == "split"
+        settings.review_display_mode in {"split", "both"}
         and not os.environ.get("TMUX")
     ):
         return await _run_in_new_tmux_session(
