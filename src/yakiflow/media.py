@@ -149,6 +149,11 @@ class MediaAcquirer:
             args += ["-f", "bestaudio/best"]
         else:
             args += ["--merge-output-format", "mkv"]
+        # A live service can expose a single fragmented MP4 format (``fmp4``).
+        # ``--merge-output-format`` is ignored when no merge is needed, and
+        # recent yt-dlp versions reject that unusual extension for safety.
+        # Remuxing gives yt-dlp a safe, stable final extension in both cases.
+        args += ["--remux-video", "mkv"]
         args.append(source.value)
         task = asyncio.create_task(self.runner.run(args, on_line=self._download_log))
         result = None

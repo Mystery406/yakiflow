@@ -121,4 +121,5 @@ def test_stream_download_ignores_files_from_previous_jobs(
     assert Path(yt_dlp_call[yt_dlp_call.index("-o") + 1]).name.startswith(
         "source-"
     )
+    assert yt_dlp_call[yt_dlp_call.index("--remux-video") + 1] == "mkv"
     db.close()
