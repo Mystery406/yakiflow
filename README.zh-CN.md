@@ -119,7 +119,8 @@ yakiflow run 'https://example.com/live' \
 ```
 
 直播字幕是临时结果。采集结束后，YakiFlow 会重新转录完整录制内容，再发布最终
-SRT。按一次 Ctrl-C 可以停止采集，并完成已经收到的内容。
+SRT。在 TUI 中按 `s` 可以停止采集，并完成已经收到的内容；未使用 TUI 时按一次
+Ctrl-C。
 
 ### 选择字幕格式
 
@@ -137,8 +138,9 @@ SRT。按一次 Ctrl-C 可以停止采集，并完成已经收到的内容。
 
 ### 恢复中断的任务
 
-第一次按 Ctrl-C 会正常停止采集，第二次会强制退出。任务中断或失败后，YakiFlow
-会打印保留下来的工作目录。运行以下命令恢复：
+在 TUI 中按 `s` 会正常停止当前任务，按 Ctrl-Q 退出界面；未使用 TUI 时，第一次
+按 Ctrl-C 会正常停止采集，第二次会强制退出。任务中断或失败后，YakiFlow 会打印
+保留下来的工作目录。运行以下命令恢复：
 
 ```console
 yakiflow resume /path/to/workdir

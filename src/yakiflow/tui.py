@@ -17,6 +17,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
+from textual.worker import Worker
 from textual.widgets import Button, DataTable, Footer, Header, ProgressBar, RichLog, Static
 
 
@@ -594,6 +595,7 @@ class YakiFlowApp(App[None]):
     """
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("s", "stop", "Stop", priority=True),
         Binding("f2", "agents", "Agents", priority=True),
         Binding("o", "open_media", "Open media", priority=True),
         Binding("up", "subtitles_up", "", show=False, priority=True),
@@ -612,6 +614,7 @@ class YakiFlowApp(App[None]):
         self.processed_ids: set[str] = set()
         self.agent_tasks: dict[str, AgentTaskState] = {}
         self._agent_display_sequence = 0
+        self._drive_worker: Worker[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -640,7 +643,7 @@ class YakiFlowApp(App[None]):
         # arrow/page bindings to the log instead of this panel.
         self.query_one("#recent", SubtitleTable).focus()
         self._load_existing_subtitles()
-        self.run_worker(self._drive(), exclusive=True)
+        self._drive_worker = self.run_worker(self._drive(), exclusive=True)
 
     def _load_existing_subtitles(self) -> None:
         """Restore the durable subtitle timeline before a resumed job runs."""
@@ -775,6 +778,17 @@ class YakiFlowApp(App[None]):
 
     def action_quit(self) -> None:
         self.exit()
+
+    def action_stop(self) -> None:
+        worker = self._drive_worker
+        if worker is None or worker.is_finished:
+            self.notify("No running job to stop.")
+            return
+        self.query_one("#status", Static).update("Current stage · Stopping…")
+        self.query_one("#conversation", RichLog).write(
+            "Stop requested; preserving completed work and finalizing available media…"
+        )
+        worker.cancel()
 
     def _media_preview_paths(self) -> tuple[Path | None, Path | None]:
         """Find the acquired media and the live/published subtitle file."""

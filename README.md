@@ -124,8 +124,9 @@ yakiflow run 'https://example.com/live' \
 ```
 
 Live subtitles are provisional. After capture ends, YakiFlow transcribes the
-complete recording again before publishing the final SRT. Press Ctrl-C once to
-stop capture and finalize what has been received.
+complete recording again before publishing the final SRT. In the TUI, press
+`s` to stop capture and finalize what has been received; press Ctrl-C once in a
+non-TUI run.
 
 ### Choose the subtitle format
 
@@ -143,9 +144,10 @@ example `video.auto-zh-cn.srt`.
 
 ### Resume an interrupted job
 
-The first Ctrl-C stops acquisition cleanly; a second Ctrl-C forces exit. After
-an interruption or failure, YakiFlow prints the preserved work directory.
-Resume it with:
+In the TUI, press `s` to stop the current job cleanly and Ctrl-Q to leave the
+interface. In a non-TUI run, the first Ctrl-C stops acquisition cleanly and a
+second Ctrl-C forces exit. After an interruption or failure, YakiFlow prints
+the preserved work directory. Resume it with:
 
 ```console
 yakiflow resume /path/to/workdir

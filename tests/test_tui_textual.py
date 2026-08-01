@@ -221,6 +221,53 @@ def test_successful_pipeline_exits_for_interactive_agent_handoff(tmp_path) -> No
     asyncio.run(exercise())
 
 
+def test_stop_shortcut_cancels_pipeline_without_immediately_exiting_tui(
+    tmp_path,
+) -> None:
+    class StoppableJob:
+        def __init__(self) -> None:
+            self.db = JobDatabase(tmp_path / "job.sqlite3")
+            self.work_dir = tmp_path
+            self.listener = None
+            self.alignment_model_failure_listener = None
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def run(self):
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    async def exercise() -> None:
+        job = StoppableJob()
+        app = YakiFlowApp(job)
+        async with app.run_test(size=(80, 30)) as pilot:
+            await job.started.wait()
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            assert not job.cancelled.is_set()
+
+            await pilot.press("s")
+            await asyncio.wait_for(job.cancelled.wait(), timeout=1)
+            await pilot.pause()
+
+            assert app.is_running
+            assert not app.succeeded
+            conversation = app.query_one("#conversation", RichLog)
+            rendered = "\n".join(line.text for line in conversation.lines)
+            assert "Stop requested" in rendered
+            assert "Interrupted; resume" in rendered
+            assert str(tmp_path) in rendered
+
+            await pilot.press("ctrl+q")
+        job.db.close()
+
+    asyncio.run(exercise())
+
+
 def test_resumed_app_loads_all_existing_subtitles(tmp_path) -> None:
     class FakeJob:
         def __init__(self) -> None:
