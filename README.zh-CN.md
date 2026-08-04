@@ -299,9 +299,13 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 | --- | --- | --- | --- |
 | `ffmpeg` | — | `ffmpeg` | FFmpeg 可执行文件名或路径 |
 | `yt_dlp` | — | `yt-dlp` | yt-dlp 可执行文件名或路径 |
+| `yt_dlp_options` | — | `[]` | 额外的 yt-dlp argv token，例如 `["--cookies-from-browser", "chrome"]` |
 | `whisper_cli` | — | `whisper-cli` | whisper.cpp 批处理可执行文件名或路径 |
 | `whisper_server` | — | `whisper-server` | whisper.cpp 服务端可执行文件名或路径 |
 
+`yt_dlp_options` 必须是只含字符串的 TOML 数组。数组中的每个字符串都会原样传给
+yt-dlp；需要参数值的选项，要把选项名和值分别写成两个字符串，例如
+`yt_dlp_options = ["--cookies-from-browser", "chrome"]`。
 如果外部命令不在 `PATH` 中，请将对应设置改为它的完整路径。
 
 ## 审校与翻译记忆

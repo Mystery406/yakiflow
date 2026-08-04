@@ -37,6 +37,17 @@ def test_auto_open_video_setting_is_loaded(tmp_path: Path) -> None:
     assert settings.auto_open_video is True
 
 
+def test_yt_dlp_options_are_loaded_as_argv_tokens(tmp_path: Path) -> None:
+    config = tmp_path / "project.toml"
+    config.write_text(
+        'yt_dlp_options = ["--cookies-from-browser", "chrome"]\n'
+    )
+
+    settings = load_settings({}, user_file=Path("/missing"), project_file=config)
+
+    assert settings.yt_dlp_options == ("--cookies-from-browser", "chrome")
+
+
 def test_required_translation_settings() -> None:
     settings = load_settings({}, user_file=Path("/missing"), project_file=Path("/missing"))
     with pytest.raises(ValueError, match="target-language"):
@@ -203,6 +214,14 @@ def test_agent_options_require_arrays_of_strings(
     config.write_text(f"draft_codex_options = {value}\n")
 
     with pytest.raises(ValueError, match="draft_codex_options must be an array of strings"):
+        load_settings({}, user_file=Path("/missing"), project_file=config)
+
+
+def test_yt_dlp_options_require_arrays_of_strings(tmp_path: Path) -> None:
+    config = tmp_path / "project.toml"
+    config.write_text('yt_dlp_options = ["--cookies-from-browser", 1]\n')
+
+    with pytest.raises(ValueError, match="yt_dlp_options must be an array of strings"):
         load_settings({}, user_file=Path("/missing"), project_file=config)
 
 

@@ -318,9 +318,13 @@ without a shell. Literal arguments containing spaces still need quotes.
 | --- | --- | --- | --- |
 | `ffmpeg` | — | `ffmpeg` | FFmpeg executable name or path |
 | `yt_dlp` | — | `yt-dlp` | yt-dlp executable name or path |
+| `yt_dlp_options` | — | `[]` | Extra yt-dlp argv tokens, such as `["--cookies-from-browser", "chrome"]` |
 | `whisper_cli` | — | `whisper-cli` | whisper.cpp batch executable name or path |
 | `whisper_server` | — | `whisper-server` | whisper.cpp server executable name or path |
 
+`yt_dlp_options` must be a TOML array containing only strings. Each string is
+passed directly as one yt-dlp argv token, so options with a value use two array
+items, for example `yt_dlp_options = ["--cookies-from-browser", "chrome"]`.
 Set an external command to its full path if it is not on `PATH`.
 
 ## Review and translation memory

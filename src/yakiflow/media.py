@@ -110,6 +110,7 @@ class MediaAcquirer:
             # yt-dlp's normal best format and merge logic preserves the preferred
             # container and falls back to mkv when needed.
             args += ["--merge-output-format", "mkv"]
+        args.extend(self.settings.yt_dlp_options)
         args.append(source.value)
 
         result = await self.runner.run(args, on_line=self._download_log)
@@ -154,6 +155,7 @@ class MediaAcquirer:
         # recent yt-dlp versions reject that unusual extension for safety.
         # Remuxing gives yt-dlp a safe, stable final extension in both cases.
         args += ["--remux-video", "mkv"]
+        args.extend(self.settings.yt_dlp_options)
         args.append(source.value)
         task = asyncio.create_task(self.runner.run(args, on_line=self._download_log))
         result = None

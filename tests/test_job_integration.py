@@ -492,7 +492,7 @@ def test_resume_preserves_temporary_workdir_status(
     assert not work_dir.exists()
 
 
-def test_resume_preserves_effective_profile_values_and_agent_option_tokens(
+def test_resume_preserves_effective_profile_values_and_option_tokens(
     tmp_path: Path,
 ) -> None:
     work_dir = tmp_path / "work"
@@ -506,6 +506,7 @@ def test_resume_preserves_effective_profile_values_and_agent_option_tokens(
         final_codex_options=("--search",),
         draft_claude_options=("--permission-mode", "plan"),
         final_claude_options=("--verbose",),
+        yt_dlp_options=("--cookies-from-browser", "chrome"),
         work_dir=work_dir,
     )
     job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
@@ -525,6 +526,10 @@ def test_resume_preserves_effective_profile_values_and_agent_option_tokens(
         "plan",
     )
     assert resumed.settings.final_claude_options == ("--verbose",)
+    assert resumed.settings.yt_dlp_options == (
+        "--cookies-from-browser",
+        "chrome",
+    )
     resumed.close()
 
 

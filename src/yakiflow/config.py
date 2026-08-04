@@ -60,6 +60,7 @@ class Settings:
     whisper_server: str = "whisper-server"
     ffmpeg: str = "ffmpeg"
     yt_dlp: str = "yt-dlp"
+    yt_dlp_options: tuple[str, ...] = ()
 
     def resolved(self) -> Settings:
         def absolute(path: Path | None) -> Path | None:
@@ -107,6 +108,7 @@ ARG_TOKEN_FIELDS = {
     "final_codex_options",
     "draft_claude_options",
     "final_claude_options",
+    "yt_dlp_options",
 }
 
 

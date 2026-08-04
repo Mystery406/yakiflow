@@ -43,7 +43,12 @@ def test_media_source_preserves_urls_and_canonicalizes_local_paths(
 def test_persistent_url_downloads_once_then_extracts(tmp_path: Path) -> None:
     media = tmp_path / "downloads" / "video.mkv"
     runner = FakeRunner(media)
-    settings = Settings(download_dir=media.parent, ffmpeg="ffmpeg", yt_dlp="yt-dlp")
+    settings = Settings(
+        download_dir=media.parent,
+        ffmpeg="ffmpeg",
+        yt_dlp="yt-dlp",
+        yt_dlp_options=("--cookies-from-browser", "chrome"),
+    )
     db = JobDatabase(tmp_path / "db.sqlite3")
     progress: list[float] = []
 
@@ -57,6 +62,8 @@ def test_persistent_url_downloads_once_then_extracts(tmp_path: Path) -> None:
     )
     assert artifact.media_path == media.resolve()
     assert sum(call[0] == "yt-dlp" for call in runner.calls) == 1
+    yt_dlp_call = next(call for call in runner.calls if call[0] == "yt-dlp")
+    assert yt_dlp_call[-3:-1] == ["--cookies-from-browser", "chrome"]
     assert sum(call[0] == "ffmpeg" for call in runner.calls) == 1
     assert progress == [0.425, 0.95]
     db.close()
@@ -108,7 +115,12 @@ def test_stream_download_ignores_files_from_previous_jobs(
     db = JobDatabase(tmp_path / "db.sqlite3")
     artifact = asyncio.run(
         MediaAcquirer(
-            Settings(download_dir=download_dir, ffmpeg="ffmpeg", yt_dlp="yt-dlp"),
+            Settings(
+                download_dir=download_dir,
+                ffmpeg="ffmpeg",
+                yt_dlp="yt-dlp",
+                yt_dlp_options=("--cookies-from-browser", "chrome"),
+            ),
             tmp_path / "work",
             db,
             runner,
@@ -122,4 +134,5 @@ def test_stream_download_ignores_files_from_previous_jobs(
         "source-"
     )
     assert yt_dlp_call[yt_dlp_call.index("--remux-video") + 1] == "mkv"
+    assert yt_dlp_call[-3:-1] == ["--cookies-from-browser", "chrome"]
     db.close()
