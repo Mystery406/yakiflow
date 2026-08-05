@@ -235,6 +235,11 @@ of the following in this one session:
    explicit approval, and only then write the approved item to {memory}. If
    nothing is genuinely reusable, say so rather than inventing candidates. Do
    not merely describe approved subtitle or memory edits--make them in the files.
+   Whenever the user asks to add, remove, or change anything in {memory},
+   re-check every staged subtitle artifact against the resulting memory for
+   inconsistent terminology, style, names, or other applicable guidance. Apply
+   all necessary subtitle corrections in the same session (mirroring them
+   across the configured output artifacts); do not stop after editing memory.
 
 You have permission to read and edit the files in the work directory. Keep
 generated subtitle outputs and memory internally consistent.

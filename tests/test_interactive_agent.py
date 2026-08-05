@@ -84,6 +84,20 @@ def test_interactive_prompt_requires_proactive_novel_memory_candidates(
     assert "obtain explicit approval" in normalized
 
 
+def test_interactive_prompt_rechecks_subtitles_after_memory_changes(
+    tmp_path: Path,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(source_language="en", target_language="zh-CN"),
+        tmp_path,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "Whenever the user asks to add, remove, or change anything" in normalized
+    assert "re-check every staged subtitle artifact against the resulting memory" in normalized
+    assert "do not stop after editing memory" in normalized
+
+
 def test_interactive_prompt_lists_read_only_context_files(tmp_path: Path) -> None:
     context_files = (
         tmp_path / "context" / "danmaku.xml",
