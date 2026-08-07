@@ -58,6 +58,25 @@ def _volume_wav(path: Path, amplitude_at, *, duration: float = 2.0) -> None:
         wav.writeframes(b"".join(samples))
 
 
+def _zero_frame_rate_wav(path: Path, samples: list[int]) -> None:
+    """Write a mono 16-bit WAV whose header declares a zero frame rate.
+
+    ``wave.open(..., "wb")`` rejects a zero frame rate, so such a file can only
+    reach us from outside; the RIFF header is emitted directly instead.
+    """
+    data = b"".join(struct.pack("<h", value) for value in samples)
+    path.write_bytes(
+        b"RIFF"
+        + struct.pack("<I", 36 + len(data))
+        + b"WAVEfmt "
+        # size, PCM tag, channels, frame rate, byte rate, block align, bits
+        + struct.pack("<IHHIIHH", 16, 1, 1, 0, 0, 2, 16)
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+
+
 class FakeVadBackend(WhisperVadAlignmentBackend):
     def __init__(self, timings: dict[str, tuple[float, float]] | None = None) -> None:
         self.calls = 0
@@ -819,6 +838,17 @@ def test_pcm_vad_is_used_without_whisper_intervals(tmp_path: Path) -> None:
     extended = extend_cue_ends(result.cues)
     assert extended[0].end == pytest.approx(extended[1].start)
     assert extended[1].end == pytest.approx(3.5)
+
+
+def test_pcm_vad_tolerates_a_zero_frame_rate_header(tmp_path: Path) -> None:
+    audio = tmp_path / "zero-frame-rate.wav"
+    _zero_frame_rate_wav(audio, [0] * 10 + [9_000] * 10 + [0] * 10)
+
+    intervals = WhisperVadAlignmentBackend._pcm_intervals(audio)
+
+    # Each window degenerates to one frame, still measured in whole windows of
+    # _PCM_WINDOW_SECONDS rather than a rate-derived step.
+    assert intervals == [pytest.approx((0.2, 0.4))]
 
 
 def test_failed_pcm_vad_keeps_original_timeline(tmp_path: Path) -> None:

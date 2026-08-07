@@ -189,39 +189,28 @@ def claude_trace_events(data: dict[str, Any]) -> list[BackendTraceEvent]:
     return events
 
 
-def _translation_response_schema(
-    title: str,
-    description: str,
-) -> dict[str, Any]:
-    properties: dict[str, Any] = {
-        "id": {"type": "string"},
-        "source": {"type": "string"},
-        "translated": {"type": "string"},
-    }
-    return {
-        "title": title,
-        "description": description,
-        "type": "object",
-        "properties": {
-            "cues": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": ["id", "source", "translated"],
-                    "additionalProperties": False,
+DRAFT_RESPONSE_SCHEMA: dict[str, Any] = {
+    "title": "DraftTranslationResponse",
+    "description": "Corrected source text and a first-pass translation for every input cue.",
+    "type": "object",
+    "properties": {
+        "cues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "source": {"type": "string"},
+                    "translated": {"type": "string"},
                 },
+                "required": ["id", "source", "translated"],
+                "additionalProperties": False,
             },
         },
-        "required": ["cues"],
-        "additionalProperties": False,
-    }
-
-
-DRAFT_RESPONSE_SCHEMA = _translation_response_schema(
-    "DraftTranslationResponse",
-    "Corrected source text and a first-pass translation for every input cue.",
-)
+    },
+    "required": ["cues"],
+    "additionalProperties": False,
+}
 
 
 @dataclass(slots=True)

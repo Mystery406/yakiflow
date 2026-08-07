@@ -110,7 +110,7 @@ class JobDatabase:
                 [
                     (
                         cue.id,
-                        i,
+                        ordinal,
                         cue.start,
                         cue.end,
                         cue.source,
@@ -119,7 +119,7 @@ class JobDatabase:
                         json.dumps(cue.metadata),
                         stable,
                     )
-                    for i, cue in zip(ordinals, cues, strict=True)
+                    for ordinal, cue in zip(ordinals, cues, strict=True)
                 ],
             )
 

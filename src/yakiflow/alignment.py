@@ -37,6 +37,34 @@ _END_EXTENSION = 0.5
 _MIDPOINT_WEIGHT = 0.5
 
 
+def _pcm_window_levels(
+    audio: Path,
+    window_seconds: float,
+    requirement: str,
+) -> tuple[list[float], int, int]:
+    """Return per-window RMS levels of a mono 16-bit PCM file.
+
+    The window size in frames and the declared sample rate are returned
+    alongside the levels so that only callers needing a wall-clock step divide
+    by the rate; a header declaring a zero rate stays readable otherwise.
+    """
+    with wave.open(str(audio), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            raise ValueError(requirement)
+        rate = wav.getframerate()
+        window = max(1, int(rate * window_seconds))
+        levels: list[float] = []
+        while frames := wav.readframes(window):
+            samples = array("h")
+            samples.frombytes(frames)
+            levels.append(
+                math.sqrt(math.sumprod(samples, samples) / len(samples))
+                if samples
+                else 0.0
+            )
+    return levels, window, rate
+
+
 @dataclass(slots=True)
 class AlignmentResult:
     cues: list[Cue]
@@ -79,8 +107,6 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
     _SECONDS_PER_MINUTE = 60
     _MINUTES_PER_HOUR = 60
     _TIMESTAMP_PARTS = 3
-    _PCM_CHANNELS = 1
-    _PCM_SAMPLE_WIDTH_BYTES = 2
     _PCM_WINDOW_SECONDS = 0.02
     _PCM_NOISE_FLOOR_QUANTILE = 0.15
     _PCM_NOISE_FLOOR_MULTIPLIER = 3.0
@@ -431,19 +457,13 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
 
     @classmethod
     def _pcm_intervals(cls, audio: Path) -> list[tuple[float, float]]:
-        with wave.open(str(audio), "rb") as wav:
-            if (
-                wav.getnchannels() != cls._PCM_CHANNELS
-                or wav.getsampwidth() != cls._PCM_SAMPLE_WIDTH_BYTES
-            ):
-                raise ValueError("Whisper VAD fallback requires mono 16-bit PCM audio")
-            rate = wav.getframerate()
-            window = max(1, int(rate * cls._PCM_WINDOW_SECONDS))
-            levels: list[float] = []
-            while frames := wav.readframes(window):
-                samples = array("h")
-                samples.frombytes(frames)
-                levels.append(math.sqrt(math.sumprod(samples, samples) / max(1, len(samples))))
+        # Intervals are expressed in whole windows of ``_PCM_WINDOW_SECONDS``,
+        # so the sample rate is never divided by here.
+        levels, _, _ = _pcm_window_levels(
+            audio,
+            cls._PCM_WINDOW_SECONDS,
+            "Whisper VAD fallback requires mono 16-bit PCM audio",
+        )
         if not levels or max(levels) <= 0:
             return []
         ordered = sorted(levels)
@@ -581,7 +601,12 @@ class PcmVolumeStartRefiner:
 
     @classmethod
     def _refine(cls, audio: Path, cues: list[Cue]) -> list[Cue]:
-        levels, step = cls._pcm_levels(audio)
+        levels, window, rate = _pcm_window_levels(
+            audio,
+            cls._WINDOW_SECONDS,
+            "volume refinement requires mono 16-bit PCM audio",
+        )
+        step = window / rate
         if not levels or max(levels) <= 0:
             return cues
         global_floor = cls._quantile(levels, cls._NOISE_QUANTILE)
@@ -677,25 +702,6 @@ class PcmVolumeStartRefiner:
                 onset = max(cue.start, (start_index + first_offset) * step)
                 return onset, noise_floor, weak_threshold, strong_threshold
         return None
-
-    @classmethod
-    def _pcm_levels(cls, audio: Path) -> tuple[list[float], float]:
-        with wave.open(str(audio), "rb") as wav:
-            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
-                raise ValueError("volume refinement requires mono 16-bit PCM audio")
-            rate = wav.getframerate()
-            window = max(1, int(rate * cls._WINDOW_SECONDS))
-            step = window / rate
-            levels: list[float] = []
-            while frames := wav.readframes(window):
-                samples = array("h")
-                samples.frombytes(frames)
-                levels.append(
-                    math.sqrt(math.sumprod(samples, samples) / len(samples))
-                    if samples
-                    else 0.0
-                )
-        return levels, step
 
     @staticmethod
     def _quantile(values: Sequence[float], quantile: float) -> float:

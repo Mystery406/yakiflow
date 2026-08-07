@@ -43,6 +43,8 @@ from .translation import AgentBackend, TranslationPipeline, make_backend
 
 EventListener = Callable[[JobEvent], Awaitable[None] | None]
 
+_DRAFT_PARTIAL_SUFFIX = ".draft.incomplete.srt"
+
 
 def _temporary_workdir() -> Path:
     """Create a job directory below a private per-user temporary repo."""
@@ -844,7 +846,7 @@ class YakiFlowJob:
             if artifact.media_path is None and self.settings.output_dir is None
             else default_output_base(artifact, self.settings, self.work_dir)
         )
-        return base.parent / f"{base.name}.draft.incomplete.srt"
+        return base.parent / f"{base.name}{_DRAFT_PARTIAL_SUFFIX}"
 
     def _live_partial_path(self, source: MediaSource) -> Path:
         directory = self.work_dir
@@ -1047,12 +1049,9 @@ class YakiFlowJob:
             self.outputs = destinations
             # Remove the corresponding draft snapshot from the configured
             # output directory once the finished subtitle has been published.
-            (destination_base.parent / f"{destination_base.name}.draft.incomplete.srt").unlink(
-                missing_ok=True
-            )
-            (self.work_dir / f"{destination_base.name}.draft.incomplete.srt").unlink(
-                missing_ok=True
-            )
+            draft_name = f"{destination_base.name}{_DRAFT_PARTIAL_SUFFIX}"
+            (destination_base.parent / draft_name).unlink(missing_ok=True)
+            (self.work_dir / draft_name).unlink(missing_ok=True)
         if self.memory_destination and self.memory_path.is_file():
             self.memory_destination.parent.mkdir(parents=True, exist_ok=True)
             if self.memory_path.resolve() != self.memory_destination.resolve():
