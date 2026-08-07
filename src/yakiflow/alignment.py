@@ -37,6 +37,14 @@ _END_EXTENSION = 0.5
 _MIDPOINT_WEIGHT = 0.5
 
 
+async def _warn(listener: WarningListener | None, message: str) -> None:
+    if listener is None:
+        return
+    maybe = listener(message)
+    if inspect.isawaitable(maybe):
+        await maybe
+
+
 def _pcm_window_levels(
     audio: Path,
     window_seconds: float,
@@ -136,10 +144,7 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
             return self._align(audio, original, list(vad_intervals))
         except Exception as exc:
             # A timing pass must never make a successful transcription fail.
-            if on_warning is not None:
-                maybe = on_warning(f"Whisper VAD timing adjustment skipped: {exc}")
-                if inspect.isawaitable(maybe):
-                    await maybe
+            await _warn(on_warning, f"Whisper VAD timing adjustment skipped: {exc}")
             return AlignmentResult(
                 original,
                 "whisper-vad-unaligned",
@@ -593,10 +598,7 @@ class PcmVolumeStartRefiner:
         try:
             return await asyncio.to_thread(self._refine, audio, original)
         except Exception as exc:
-            if on_warning is not None:
-                maybe = on_warning(f"PCM volume start refinement skipped: {exc}")
-                if inspect.isawaitable(maybe):
-                    await maybe
+            await _warn(on_warning, f"PCM volume start refinement skipped: {exc}")
             return original
 
     @classmethod
@@ -821,7 +823,7 @@ class WhisperXAlignmentBackend(AlignmentBackend):
             raise
         except Exception as exc:
             warning = f"WhisperX unavailable; using Whisper VAD alignment: {exc}"
-            await self._warn(on_warning, warning)
+            await _warn(on_warning, warning)
             try:
                 fallback = await self.vad_backend.align(
                     audio,
@@ -961,7 +963,7 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                         "WhisperX could not align cue IDs "
                         f"{', '.join(other_failed_ids)}"
                     )
-                await self._warn(
+                await _warn(
                     on_warning,
                     "; ".join(warning_parts) + "; used Whisper VAD fallback",
                 )
@@ -1004,14 +1006,6 @@ class WhisperXAlignmentBackend(AlignmentBackend):
             model_metadata = None
             audio_data = None
             await asyncio.to_thread(self._release_model_cache, selected_device)
-
-    @staticmethod
-    async def _warn(listener: WarningListener | None, message: str) -> None:
-        if listener is None:
-            return
-        maybe = listener(message)
-        if inspect.isawaitable(maybe):
-            await maybe
 
     @staticmethod
     async def _notify_progress(

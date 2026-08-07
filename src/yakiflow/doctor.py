@@ -56,7 +56,6 @@ def run_doctor(settings: Settings) -> list[Check]:
             )
         )
         cuda_available = False
-        torch_detail = "PyTorch unavailable"
         try:
             import torch
 
