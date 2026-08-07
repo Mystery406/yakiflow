@@ -432,6 +432,16 @@ class YakiFlowJob:
         await self._report_progress(stage, 1.0, message)
         self._completed_progress_stages.add(stage)
 
+    async def _report_draft_batch_progress(self) -> None:
+        await self._report_progress(
+            "transcribe",
+            0.85
+            + 0.15
+            * self._translation_batches_completed
+            / self._translation_batches_total,
+            f"draft Agent batches · {self._translation_batches_completed}/{self._translation_batches_total}",
+        )
+
     async def run(self) -> list[Path]:
         try:
             if self._resume_status is JobStatus.REVIEWING:
@@ -555,22 +565,15 @@ class YakiFlowJob:
             await server.submit(excerpt, start)
             new_cues = [cue for cue in server.cues if cue.id not in existing_ids]
             self.db.replace_transcript(server.cues)
-            await self._write_partial(
-                partial_path, self.db.list_cues(stable_only=True)
-            )
+            timeline = self.db.list_cues(stable_only=True)
+            await self._write_partial(partial_path, timeline)
             for cue in new_cues:
                 await self.emit("transcript", "Whisper subtitle", cue=cue)
-            pending = [
-                cue
-                for cue in self.db.list_cues(stable_only=True)
-                if not cue.translated
-            ]
+            pending = [cue for cue in timeline if not cue.translated]
             if pending:
                 updated = await pipeline.translate_draft(pending)
                 translated_ids = {cue.id for cue in pending}
-                await self._write_partial(
-                    partial_path, self.db.list_cues(stable_only=True)
-                )
+                await self._write_partial(partial_path, updated)
                 await self._emit_agent_cues(cue for cue in updated if cue.id in translated_ids)
             completed_chunks += 1
             await self._report_progress(
@@ -637,14 +640,7 @@ class YakiFlowJob:
                 and self._combined_translation_progress
                 and self._translation_batches_total
             ):
-                await self._report_progress(
-                    "transcribe",
-                    0.85
-                    + 0.15
-                    * self._translation_batches_completed
-                    / self._translation_batches_total,
-                    f"draft Agent batches · {self._translation_batches_completed}/{self._translation_batches_total}",
-                )
+                await self._report_draft_batch_progress()
 
         async def event(item: TranscriptEvent) -> None:
             if item.final:
@@ -715,14 +711,7 @@ class YakiFlowJob:
             self.db.checkpoint("transcribed", True)
             if translation_tasks:
                 if self._combined_translation_progress:
-                    await self._report_progress(
-                        "transcribe",
-                        0.85
-                        + 0.15
-                        * self._translation_batches_completed
-                        / self._translation_batches_total,
-                        f"draft Agent batches · {self._translation_batches_completed}/{self._translation_batches_total}",
-                    )
+                    await self._report_draft_batch_progress()
                 await asyncio.gather(*translation_tasks)
             transcription_succeeded = True
         finally:

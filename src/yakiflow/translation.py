@@ -516,10 +516,12 @@ class TranslationPipeline:
 
     @staticmethod
     def _request_summary(batch: Sequence[Cue], context: Sequence[Cue]) -> str:
-        cue_range = (
-            f"cue {batch[0].id}" if len(batch) == 1
-            else f"cues {batch[0].id}–{batch[-1].id}"
-        ) if batch else "no cues"
+        if not batch:
+            cue_range = "no cues"
+        elif len(batch) == 1:
+            cue_range = f"cue {batch[0].id}"
+        else:
+            cue_range = f"cues {batch[0].id}–{batch[-1].id}"
         context_suffix = f" · Context: {len(context)} cues" if context else ""
         return f"Draft translate {cue_range}{context_suffix}"
 

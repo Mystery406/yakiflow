@@ -154,12 +154,12 @@ def _clean(values: Mapping[str, Any]) -> dict[str, Any]:
         if key in PATH_FIELDS:
             result[key] = Path(value).expanduser()
         elif key in PATH_SEQUENCE_FIELDS:
-            values = (
+            items = (
                 value
                 if isinstance(value, Sequence) and not isinstance(value, str)
                 else (value,)
             )
-            result[key] = tuple(Path(item).expanduser() for item in values)
+            result[key] = tuple(Path(item).expanduser() for item in items)
         elif key in ARG_TOKEN_FIELDS:
             if not isinstance(value, (list, tuple)) or not all(
                 isinstance(item, str) for item in value

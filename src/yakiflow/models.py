@@ -49,7 +49,6 @@ class Cue:
 @dataclass(slots=True)
 class TranscriptEvent:
     cue: Cue
-    stable: bool = True
     final: bool = False
 
 

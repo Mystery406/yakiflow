@@ -5,7 +5,7 @@ import pytest
 pytest.importorskip("textual")
 
 from textual.app import App, ComposeResult
-from textual.widgets import DataTable, RichLog, Static
+from textual.widgets import DataTable, RichLog
 
 from yakiflow.database import JobDatabase
 from yakiflow.memory import MemoryStore

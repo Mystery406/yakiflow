@@ -7,7 +7,7 @@ import shlex
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 from .config import load_settings, validate_run_settings
 from .doctor import run_doctor

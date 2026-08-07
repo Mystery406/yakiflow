@@ -6,7 +6,7 @@ import re
 import socket
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -88,7 +88,7 @@ def merge_vad_intervals(
 def parse_json_full(data: dict[str, Any], *, offset: float = 0.0, ordinal_offset: int = 0) -> list[Cue]:
     entries = data.get("transcription") or data.get("segments") or []
     cues: list[Cue] = []
-    for index, entry in enumerate(entries):
+    for entry in entries:
         timestamps = entry.get("timestamps", {})
         offsets = entry.get("offsets", {})
 
@@ -134,6 +134,16 @@ def merge_overlap(existing: list[Cue], incoming: list[Cue]) -> list[Cue]:
         result.append(Cue(cue_id(ordinal), cue.start, cue.end, cue.source, metadata=cue.metadata))
     result.sort(key=lambda item: (item.start, item.end))
     return result
+
+
+def whisper_language_and_vad_args(settings: Settings) -> list[str]:
+    """Return the language/VAD flags shared by whisper-cli and whisper-server."""
+    args: list[str] = []
+    if settings.source_language:
+        args += ["--language", settings.source_language]
+    if settings.vad_model:
+        args += ["--vad", "--vad-model", str(settings.vad_model)]
+    return args
 
 
 class Transcriber(ABC):
@@ -214,17 +224,14 @@ class WhisperCliTranscriber(Transcriber):
             )
             incremental.append(cue)
             if on_event:
-                await on_event(TranscriptEvent(cue, stable=True, final=False))
+                await on_event(TranscriptEvent(cue, final=False))
 
         args = [
             self.settings.whisper_cli, "-m", self.settings.whisper_model,
             "-f", input_audio, "-mc", "0", "--print-progress",
             "--output-json-full", "--output-file", prefix,
         ]
-        if self.settings.source_language:
-            args += ["--language", self.settings.source_language]
-        if self.settings.vad_model:
-            args += ["--vad", "--vad-model", str(self.settings.vad_model)]
+        args += whisper_language_and_vad_args(self.settings)
         try:
             await self.runner.run(args, on_line=line)
         except ProcessError:
@@ -270,7 +277,7 @@ class WhisperCliTranscriber(Transcriber):
         self.db.checkpoint("whisper_vad_intervals", vad_intervals)
         for cue in cues:
             if on_event:
-                await on_event(TranscriptEvent(cue, stable=True, final=True))
+                await on_event(TranscriptEvent(cue, final=True))
         return cues
 
     async def _extract_tail(self, audio: Path, start: float, destination: Path) -> None:
@@ -328,10 +335,7 @@ class WhisperServerTranscriber:
             "--host", "127.0.0.1", "--port", str(self.port),
             "--request-path", self.request_path,
         ]
-        if self.settings.source_language:
-            args += ["--language", self.settings.source_language]
-        if self.settings.vad_model:
-            args += ["--vad", "--vad-model", str(self.settings.vad_model)]
+        args += whisper_language_and_vad_args(self.settings)
         self.process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

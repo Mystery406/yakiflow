@@ -4,7 +4,6 @@ import asyncio
 import traceback
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 
 from .alignment import AlignmentModelFailureDecision
 from .job import YakiFlowJob
@@ -648,7 +647,7 @@ class YakiFlowApp(App[None]):
         self._drive_worker = self.run_worker(self._drive(), exclusive=True)
 
     def _load_existing_subtitles(self) -> None:
-        """Restore the durable subtitle timeline before a resumed job runs."""
+        """Load the durable subtitle timeline into the subtitle table."""
         table = self.query_one("#recent", SubtitleTable)
         for cue in self.job.db.list_cues(stable_only=True):
             table.add_subtitle(cue)
@@ -722,11 +721,7 @@ class YakiFlowApp(App[None]):
             table.clear(columns=False)
             self.whisper_cues = 0
             self.processed_ids.clear()
-            for cue in self.job.db.list_cues(stable_only=True):
-                table.add_subtitle(cue)
-                self.whisper_cues += 1
-                if cue.translated:
-                    self.processed_ids.add(cue.id)
+            self._load_existing_subtitles()
             table.restore_scroll_after_update(previous_y)
             self.query_one("#status", Static).update(
                 f"Current stage · aligned timeline: {self.whisper_cues} subtitles"
@@ -792,16 +787,11 @@ class YakiFlowApp(App[None]):
         )
         worker.cancel()
 
-    def _media_preview_paths(self) -> tuple[Path | None, Path | None]:
-        """Find the acquired media and the live/published subtitle file."""
-        return self.job.media_path, self.job.subtitle_path
-
     def action_open_media(self) -> None:
-        media, subtitle = self._media_preview_paths()
         if open_media(
             self.job.settings.video_open_command,
-            media,
-            subtitle,
+            self.job.media_path,
+            self.job.subtitle_path,
             cwd=self.job.work_dir,
         ):
             self.notify("Opened media with subtitles.")

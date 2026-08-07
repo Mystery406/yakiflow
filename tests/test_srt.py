@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from yakiflow.models import Cue
-from yakiflow.srt import publish_outputs, render_srt, timestamp
+from yakiflow.srt import publish_outputs, render_srt
 
 
 def test_timestamp_rounding_and_bilingual_order() -> None:

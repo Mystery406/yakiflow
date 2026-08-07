@@ -252,12 +252,7 @@ When the user says the session is complete, summarize the changes and exit.
 """
 
 
-def build_interactive_command(
-    settings: Settings,
-    prompt: str,
-    *,
-    additional_dirs: Sequence[Path] = (),
-) -> list[str]:
+def build_interactive_command(settings: Settings, prompt: str) -> list[str]:
     """Build the configured Agent CLI command in interactive mode."""
     model = settings.final_model or ""
     if settings.translation_backend == "codex":
@@ -266,8 +261,6 @@ def build_interactive_command(
             "--sandbox",
             "workspace-write",
         ]
-        for directory in additional_dirs:
-            command.extend(("--add-dir", str(directory)))
         if model:
             command.extend(("--model", model))
         command.extend(
@@ -337,9 +330,7 @@ async def run_interactive_agent(
     """Hand the terminal to the configured interactive Agent CLI."""
     runner = runner or CommandRunner()
     prompt = build_interactive_prompt(settings, work_dir, outputs, context_files)
-    command = build_interactive_command(
-        settings, prompt
-    )
+    command = build_interactive_command(settings, prompt)
     if settings.auto_open_video and outputs:
         open_media(
             settings.video_open_command,
