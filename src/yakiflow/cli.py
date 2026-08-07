@@ -15,7 +15,6 @@ from .job import YakiFlowJob
 from .models import JobEvent
 from .models_manager import fetch_model
 from .interactive_agent import (
-    AgentFileDisplay,
     run_interactive_agent,
     run_memory_conflict_agent,
     start_agent_file_display,
@@ -140,7 +139,6 @@ async def _complete_job(
     job: YakiFlowJob,
     outputs: Sequence[Path],
 ) -> int:
-    display = AgentFileDisplay()
     if sys.stdin.isatty() and sys.stdout.isatty():
         display = await start_agent_file_display(job.settings, job.work_dir, outputs)
         try:
@@ -153,8 +151,6 @@ async def _complete_job(
             )
         finally:
             await display.close()
-    else:
-        await display.close()
     while True:
         try:
             outputs = job.finalize_artifacts()

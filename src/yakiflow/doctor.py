@@ -71,8 +71,6 @@ def run_doctor(settings: Settings) -> list[Check]:
             checks.append(Check("WhisperX device", True, f"{selected} ({torch_detail})"))
     backend = settings.translation_backend
     for name in ([backend] if backend else ["codex", "claude"]):
-        if not name:
-            continue
         executable = shutil.which(name)
         if not executable:
             checks.append(Check(f"{name} CLI", False, "not found"))

@@ -566,19 +566,19 @@ class TranslationPipeline:
         batch: Sequence[Cue],
         context: Sequence[Cue],
     ) -> dict[str, Any]:
-        cue_payloads: list[dict[str, Any]] = []
-        for cue in batch:
-            cue_payloads.append({
+        def cue_payload(cue: Cue) -> dict[str, Any]:
+            return {
                 "id": cue.id,
                 "source": cue.source,
                 "translated": cue.translated,
-            })
+            }
+
         return {
             "source_language": self.settings.source_language,
             "target_language": self.settings.target_language,
             "memory": self.memory,
-            "context": [{"id": c.id, "source": c.source, "translated": c.translated} for c in context],
-            "cues": cue_payloads,
+            "context": [cue_payload(cue) for cue in context],
+            "cues": [cue_payload(cue) for cue in batch],
         }
 
     def _draft_prompt(
@@ -652,7 +652,7 @@ class TranslationPipeline:
                     translate_only=translate_only,
                 )
             async with self._write_lock:
-                current = {cue.id: cue for cue in self.db.list_cues()}
+                current = self.db.cues_by_id([cue.id for cue in batch])
                 updated = self._apply(
                     batch,
                     result,

@@ -299,11 +299,6 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
         return candidates
 
     @classmethod
-    def _first_token_range(cls, cue: Cue) -> tuple[float, float] | None:
-        token_ranges = cls._leading_token_ranges(cue)
-        return token_ranges[0] if token_ranges else None
-
-    @classmethod
     def _first_token_text(cls, cue: Cue) -> str | None:
         whisper = cue.metadata.get("whisper")
         if not isinstance(whisper, dict):
@@ -448,7 +443,7 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
             while frames := wav.readframes(window):
                 samples = array("h")
                 samples.frombytes(frames)
-                levels.append(math.sqrt(sum(x * x for x in samples) / max(1, len(samples))))
+                levels.append(math.sqrt(math.sumprod(samples, samples) / max(1, len(samples))))
         if not levels or max(levels) <= 0:
             return []
         ordered = sorted(levels)
@@ -696,7 +691,7 @@ class PcmVolumeStartRefiner:
                 samples = array("h")
                 samples.frombytes(frames)
                 levels.append(
-                    math.sqrt(sum(value * value for value in samples) / len(samples))
+                    math.sqrt(math.sumprod(samples, samples) / len(samples))
                     if samples
                     else 0.0
                 )
@@ -812,13 +807,7 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                         continue
                     raise _AlignmentFallbackRequested(message) from exc
                 break
-        except asyncio.CancelledError:
-            align_model = None
-            model_metadata = None
-            audio_data = None
-            await asyncio.to_thread(self._release_model_cache, selected_device)
-            raise
-        except AlignmentModelDecisionRequired:
+        except (asyncio.CancelledError, AlignmentModelDecisionRequired):
             align_model = None
             model_metadata = None
             audio_data = None

@@ -166,7 +166,7 @@ class YakiFlowJob:
         self._output_destination_base: Path | None = None
         self.alignment_result: AlignmentResult | None = None
         self.alignment_model_failure_listener: AlignmentModelFailureListener | None = None
-        self._agent_operations: dict[str, str] = {}
+        self._agent_operations: set[str] = set()
         self._progress_plan: ProgressPlan | None = None
         self._time_estimator: StageTimeEstimator | None = None
         self._progress_value = 0.0
@@ -290,18 +290,17 @@ class YakiFlowJob:
     def _agent_status(self) -> str:
         if not self._agent_operations:
             return "Agent · Idle"
-        label = self._agent_operations[next(reversed(self._agent_operations))]
         count = len(self._agent_operations)
         suffix = f" · {count} active" if count > 1 else ""
-        return f"Agent · Running · {label}{suffix}"
+        return f"Agent · Running · draft translation{suffix}"
 
     async def agent_event(self, event: AgentTraceEvent) -> None:
         """Forward one Agent trace event and keep the compact summary honest."""
         if event.kind == "lifecycle":
             if event.state in {"running", "retrying"}:
-                self._agent_operations[event.operation_id] = "draft translation"
+                self._agent_operations.add(event.operation_id)
             else:
-                self._agent_operations.pop(event.operation_id, None)
+                self._agent_operations.discard(event.operation_id)
         await self.emit(
             "agent_trace", event.message, agent_trace=event
         )
@@ -374,20 +373,15 @@ class YakiFlowJob:
             return existing
         return []
 
-    @staticmethod
+    @classmethod
     def _remaining_transcription_fraction(
-        audio: Path | None, resume_from: Sequence[Cue]
+        cls, audio: Path | None, resume_from: Sequence[Cue]
     ) -> float:
         """Return the unprocessed share of a resumable PCM WAV file."""
         if audio is None or not resume_from:
             return 1.0
-        try:
-            with wave.open(str(audio), "rb") as source:
-                rate = source.getframerate()
-                duration = source.getnframes() / rate if rate > 0 else 0.0
-        except (EOFError, OSError, wave.Error):
-            return 1.0
-        if duration <= 0:
+        duration = cls._pcm_audio_duration(audio)
+        if duration is None:
             return 1.0
         processed = max(cue.end for cue in resume_from)
         # Retain a small non-zero span for finalization when the last durable
@@ -1078,9 +1072,6 @@ class YakiFlowJob:
                 # guard. Check again at the actual overwrite boundary.
                 self._check_memory_destination_unchanged()
                 shutil.move(str(self.memory_path), str(self.memory_destination))
-        # Draft/live subtitle snapshots are only useful while the job is
-        # running. Once the Agent has finished editing and final outputs have
-        # been moved, never leave an incomplete SRT beside the published one.
         return self.outputs
 
     def _check_memory_destination_unchanged(self) -> None:

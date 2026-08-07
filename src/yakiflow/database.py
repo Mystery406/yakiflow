@@ -192,17 +192,28 @@ class JobDatabase:
                 ("alignment_complete", json.dumps(True), now),
             )
 
+    @staticmethod
+    def _cue(row: sqlite3.Row) -> Cue:
+        return Cue(
+            id=row["id"], start=row["start"], end=row["end"], source=row["source"],
+            translated=row["translated"],
+            timing_confidence=row["timing_confidence"], metadata=json.loads(row["metadata_json"]),
+        )
+
     def list_cues(self, *, stable_only: bool = False) -> list[Cue]:
         where = " WHERE stable=1" if stable_only else ""
         rows = self.connection.execute(f"SELECT * FROM cues{where} ORDER BY ordinal").fetchall()
-        return [
-            Cue(
-                id=row["id"], start=row["start"], end=row["end"], source=row["source"],
-                translated=row["translated"],
-                timing_confidence=row["timing_confidence"], metadata=json.loads(row["metadata_json"]),
-            )
-            for row in rows
-        ]
+        return [self._cue(row) for row in rows]
+
+    def cues_by_id(self, ids: Sequence[str]) -> dict[str, Cue]:
+        """Return only the requested cues, keyed by ID."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self.connection.execute(
+            f"SELECT * FROM cues WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+        return {row["id"]: self._cue(row) for row in rows}
 
     def checkpoint(self, name: str, value: Any) -> None:
         with self.connection:

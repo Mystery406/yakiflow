@@ -173,11 +173,7 @@ class WhisperCliTranscriber(Transcriber):
             # remain attached to the same timeline prefix.
             input_offset = preserved[-1].end
             input_audio = self.work_dir / "whisper-resume.wav"
-            await self.runner.run([
-                self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(input_offset), "-i", audio,
-                "-ac", "1", "-ar", "16000", input_audio,
-            ])
+            await self._extract_tail(audio, input_offset, input_audio)
             prefix = self.work_dir / "whisper-resume"
         incremental: list[Cue] = []
         stored_intervals = self.db.get_checkpoint("whisper_vad_intervals", [])
@@ -239,10 +235,7 @@ class WhisperCliTranscriber(Transcriber):
             durable = preserved + incremental
             resume_at = max(0.0, durable[-1].end - 5.0)
             recovered = self.work_dir / "recovery.wav"
-            await self.runner.run([
-                self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(resume_at), "-i", audio, "-ac", "1", "-ar", "16000", recovered,
-            ])
+            await self._extract_tail(audio, resume_at, recovered)
             recovery_prefix = self.work_dir / "whisper-recovery"
             recovery_args = list(args)
             recovery_args[recovery_args.index("-f") + 1] = recovered
@@ -279,6 +272,14 @@ class WhisperCliTranscriber(Transcriber):
             if on_event:
                 await on_event(TranscriptEvent(cue, stable=True, final=True))
         return cues
+
+    async def _extract_tail(self, audio: Path, start: float, destination: Path) -> None:
+        """Write 16 kHz mono PCM covering ``audio`` from ``start`` onwards."""
+        await self.runner.run([
+            self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", str(start), "-i", audio,
+            "-ac", "1", "-ar", "16000", destination,
+        ])
 
     @staticmethod
     def _json_path(prefix: Path) -> Path:

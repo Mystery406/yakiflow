@@ -83,6 +83,15 @@ def review_open_argv(command: str, file_path: Path, work_dir: Path) -> list[str]
     return argv
 
 
+def _split_window_args() -> list[str]:
+    """Return the tmux split-window argv for the current terminal shape."""
+    wide = shutil.get_terminal_size(fallback=(100, 24)).columns >= 120
+    args = ["tmux", "split-window", "-h" if wide else "-v"]
+    if not wide:
+        args.append("-b")
+    return args
+
+
 async def start_agent_file_display(
     settings: Settings,
     work_dir: Path,
@@ -106,16 +115,12 @@ async def start_agent_file_display(
         if settings.review_display_mode == "open":
             return AgentFileDisplay()
 
-    command = ["tmux"]
     # A split pane only makes sense from inside an active multiplexer
     # session. If tmux has no server/socket, leave the Agent terminal alone
     # instead of turning an optional preview into a failed review.
-    if command and command[0] == "tmux" and not os.environ.get("TMUX"):
+    if not os.environ.get("TMUX"):
         return AgentFileDisplay()
-    wide = shutil.get_terminal_size(fallback=(100, 24)).columns >= 120
-    command.extend(("split-window", "-h" if wide else "-v"))
-    if not wide:
-        command.append("-b")
+    command = _split_window_args()
     command.extend(("--", *_preview_command(
         file_path, marker, media_path, settings.video_open_command
     )))
@@ -385,10 +390,7 @@ async def _run_in_new_tmux_session(
         await created.wait()
         if created.returncode:
             return await CommandRunner().run_interactive(command, cwd=work_dir)
-        wide = shutil.get_terminal_size(fallback=(100, 24)).columns >= 120
-        split_args = ["tmux", "split-window", "-h" if wide else "-v"]
-        if not wide:
-            split_args.append("-b")
+        split_args = _split_window_args()
         split = await asyncio.create_subprocess_exec(
             *split_args, "-t", session, "-c", str(work_dir),
             "--", *preview,

@@ -384,21 +384,23 @@ class AgentInspector(ModalScreen[None]):
             task = self.tasks.get(operation_id)
             if task is None:
                 continue
+            row = (
+                task.display_id,
+                task.state.title(),
+                task.task_label,
+                task.attempt_label,
+                task.elapsed_label,
+            )
             if operation_id not in table.rows:
-                table.add_row(
-                    task.display_id,
-                    task.state.title(),
-                    task.task_label,
-                    task.attempt_label,
-                    task.elapsed_label,
-                    key=operation_id,
-                )
-            else:
-                table.update_cell(operation_id, "id", task.display_id)
-                table.update_cell(operation_id, "state", task.state.title())
-                table.update_cell(operation_id, "task", task.task_label)
-                table.update_cell(operation_id, "attempt", task.attempt_label)
-                table.update_cell(operation_id, "elapsed", task.elapsed_label)
+                table.add_row(*row, key=operation_id)
+                continue
+            # Rewriting an unchanged cell still invalidates the DataTable
+            # render cache, and finished tasks never change again.
+            for column, value in zip(
+                ("id", "state", "task", "attempt", "elapsed"), row
+            ):
+                if table.get_cell(operation_id, column) != value:
+                    table.update_cell(operation_id, column, value)
         if self.selected_operation is None and self._table_order:
             self.selected_operation = self._table_order[0]
             table.move_cursor(row=0, column=0, animate=False)

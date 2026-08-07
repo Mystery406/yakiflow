@@ -73,7 +73,11 @@ def publish_outputs(
 ) -> list[Path]:
     cues = list(cues)
     mode = OutputMode(mode)
-    modes = list(OutputMode)[:3] if mode is OutputMode.ALL else [mode]
+    modes = (
+        [OutputMode.SOURCE, OutputMode.TRANSLATED, OutputMode.BILINGUAL]
+        if mode is OutputMode.ALL
+        else [mode]
+    )
     suffixes = {
         OutputMode.SOURCE: ".source.srt",
         OutputMode.TRANSLATED: ".translated.srt",

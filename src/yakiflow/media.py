@@ -123,9 +123,8 @@ class MediaAcquirer:
             raise RuntimeError("yt-dlp completed without producing a media file")
         return max(files, key=lambda p: p.stat().st_mtime).resolve()
 
-    async def extract_audio(self, media_path: Path, output: Path, *, overwrite: bool = True) -> None:
-        args = [self.settings.ffmpeg, "-hide_banner", "-loglevel", "error"]
-        args.append("-y" if overwrite else "-n")
+    async def extract_audio(self, media_path: Path, output: Path) -> None:
+        args = [self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
         args += ["-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", output]
         await self.runner.run(args, on_line=lambda stream, line: self.db.log("ffmpeg", stream, line))
 

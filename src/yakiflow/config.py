@@ -7,6 +7,8 @@ from typing import Any, Mapping, Sequence
 
 from platformdirs import user_cache_path, user_config_path
 
+from .media_player import DEFAULT_VIDEO_OPEN_COMMAND
+
 
 DEFAULT_MODEL_NAME = "ggml-large-v3-turbo-q5_0.bin"
 
@@ -50,10 +52,7 @@ class Settings:
     review_display_mode: str = "split"
     review_open_command: str | None = None
     auto_open_video: bool = False
-    video_open_command: str = (
-        "mpv --no-sub-auto --no-resume-playback "
-        "--sub-file={subtitle} --sid=auto --sub-visibility=yes {file}"
-    )
+    video_open_command: str = DEFAULT_VIDEO_OPEN_COMMAND
     stream_chunk_seconds: int = 15
     stream_context_seconds: int = 5
     whisper_cli: str = "whisper-cli"
