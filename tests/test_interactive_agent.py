@@ -267,6 +267,51 @@ def test_interactive_commands_append_only_matching_final_options() -> None:
     ]
 
 
+def test_interactive_agent_stages_multiline_prompt_for_cli_shims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TMUX", "test")
+    subtitle = tmp_path / "movie.srt"
+    subtitle.write_text("", encoding="utf-8")
+    staged_prompt: Path | None = None
+
+    class Runner:
+        async def run_interactive(self, command, *, cwd=None):
+            nonlocal staged_prompt
+            assert cwd == tmp_path
+            kickoff = str(command[-1])
+            assert "\n" not in kickoff
+            assert "\r" not in kickoff
+
+            prompt_files = list(
+                tmp_path.glob(".yakiflow-agent-prompt-*.md")
+            )
+            assert len(prompt_files) == 1
+            staged_prompt = prompt_files[0]
+            assert staged_prompt.name in kickoff
+
+            prompt = staged_prompt.read_text(encoding="utf-8")
+            assert prompt.startswith(
+                "You are the interactive YakiFlow subtitle editor.\n"
+            )
+            assert str(subtitle) in prompt
+            assert "Start immediately with an autonomous review" in prompt
+            return ProcessResult(tuple(command), 0, "", "")
+
+    result = asyncio.run(
+        interactive_agent.run_interactive_agent(
+            Settings(translation_backend="codex"),
+            tmp_path,
+            [subtitle],
+            runner=Runner(),
+        )
+    )
+
+    assert result.returncode == 0
+    assert staged_prompt is not None
+    assert not staged_prompt.exists()
+
+
 def test_interactive_agent_auto_opens_video_before_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

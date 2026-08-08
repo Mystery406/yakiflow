@@ -59,6 +59,38 @@ def test_doctor_does_not_require_whisperx_for_default_vad(
     assert all(not check.name.startswith("WhisperX") for check in checks)
 
 
+def test_doctor_runs_auth_with_resolved_cli_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = tmp_path / "whisper.bin"
+    model.write_bytes(b"model")
+    codex = r"C:\Users\test\AppData\Roaming\npm\codex.CMD"
+    commands: list[list[str]] = []
+
+    def which(command: str) -> str:
+        return codex if command == "codex" else f"/bin/{command}"
+
+    def run(command: list[str], **_kwargs) -> SimpleNamespace:
+        commands.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Logged in using ChatGPT\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(doctor_module.shutil, "which", which)
+    monkeypatch.setattr(doctor_module.subprocess, "run", run)
+
+    checks = run_doctor(
+        Settings(whisper_model=model, translation_backend="codex")
+    )
+    auth = next(check for check in checks if check.name == "codex auth")
+
+    assert commands == [[codex, "login", "status"]]
+    assert auth.ok
+    assert auth.detail == "Logged in using ChatGPT"
+
+
 def test_doctor_names_both_whisperx_install_variants(
     tmp_path: Path, monkeypatch
 ) -> None:

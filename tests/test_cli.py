@@ -160,7 +160,14 @@ def test_memory_conflict_agent_retries_when_destination_changes_again(
 
         async def run_interactive(self, args, *, cwd=None, check=True):
             assert cwd == work_dir.resolve()
-            prompt = str(args[-1])
+            kickoff = str(args[-1])
+            assert "\n" not in kickoff
+            prompt_files = list(
+                cwd.glob(".yakiflow-agent-prompt-*.md")
+            )
+            assert len(prompt_files) == 1
+            assert prompt_files[0].name in kickoff
+            prompt = prompt_files[0].read_text(encoding="utf-8")
             self.prompts.append(prompt)
             if len(self.prompts) == 1:
                 assert "+- destination edit 1" in prompt

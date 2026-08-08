@@ -77,7 +77,11 @@ def run_doctor(settings: Settings) -> list[Check]:
         if not executable:
             checks.append(Check(f"{name} CLI", False, "not found"))
             continue
-        auth_command = [name, "login", "status"] if name == "codex" else [name, "auth", "status"]
+        auth_command = (
+            [executable, "login", "status"]
+            if name == "codex"
+            else [executable, "auth", "status"]
+        )
         try:
             result = subprocess.run(auth_command, capture_output=True, text=True, timeout=10)
             detail = (result.stdout or result.stderr).strip().splitlines()

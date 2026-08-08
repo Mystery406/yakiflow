@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import shutil
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,24 @@ from typing import Awaitable, Callable, Sequence
 
 
 LineCallback = Callable[[str, str], Awaitable[None] | None]
+
+
+def _resolve_command(
+    args: Sequence[str | os.PathLike[str]],
+) -> tuple[str, ...]:
+    """Resolve the executable before launching it.
+
+    Windows' process APIs do not reliably apply ``PATHEXT`` when a command is
+    launched without a shell.  In particular, npm CLIs such as Codex are
+    installed as ``.cmd`` shims, even though shells expose them as ``codex``.
+    """
+    normalized = tuple(os.fspath(arg) for arg in args)
+    if not normalized:
+        return normalized
+    executable = shutil.which(normalized[0])
+    if not executable:
+        return normalized
+    return (executable, *normalized[1:])
 
 
 @dataclass(slots=True)
@@ -38,7 +57,7 @@ class CommandRunner:
         check: bool = True,
         stdin: bytes | None = None,
     ) -> ProcessResult:
-        normalized = tuple(os.fspath(arg) for arg in args)
+        normalized = _resolve_command(args)
         process = await asyncio.create_subprocess_exec(
             *normalized,
             cwd=cwd,
@@ -158,7 +177,7 @@ class CommandRunner:
         the user.  Keeping this as a separate method prevents accidentally
         turning a non-interactive pipeline invocation into a terminal session.
         """
-        normalized = tuple(os.fspath(arg) for arg in args)
+        normalized = _resolve_command(args)
         process = await asyncio.create_subprocess_exec(
             *normalized,
             cwd=cwd,

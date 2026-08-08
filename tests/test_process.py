@@ -31,8 +31,27 @@ def test_command_runner_accepts_lines_longer_than_asyncio_limit() -> None:
         )
     )
 
-    assert len(result.stdout) == 200_001
+    assert len(result.stdout.rstrip("\r\n")) == 200_000
+    assert result.stdout.endswith(("\n", "\r\n"))
     assert lines == [("stdout", "x" * 200_000)]
+
+
+def test_command_runner_resolves_executable_shims(monkeypatch) -> None:
+    original_which = process_module.shutil.which
+
+    def which(command: str) -> str | None:
+        if command == "python-shim":
+            return sys.executable
+        return original_which(command)
+
+    monkeypatch.setattr(process_module.shutil, "which", which)
+
+    result = asyncio.run(
+        CommandRunner().run(["python-shim", "-c", "print('resolved')"])
+    )
+
+    assert result.args[0] == sys.executable
+    assert result.stdout.splitlines() == ["resolved"]
 
 
 def test_command_runner_awaits_custom_line_callback_awaitable() -> None:
@@ -98,6 +117,7 @@ def test_terminate_process_uses_portable_windows_fallback(monkeypatch) -> None:
         process_module.os,
         "killpg",
         lambda *_args: (_ for _ in ()).throw(AssertionError("killpg called")),
+        raising=False,
     )
 
     asyncio.run(terminate_process(process))

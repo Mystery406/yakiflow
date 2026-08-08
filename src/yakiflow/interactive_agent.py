@@ -247,6 +247,26 @@ When the user says the session is complete, summarize the changes and exit.
 """
 
 
+def _stage_interactive_prompt(work_dir: Path, prompt: str) -> tuple[Path, str]:
+    """Persist a multiline prompt and return a shell-safe kickoff message.
+
+    Windows npm CLIs are commonly exposed through ``.cmd`` shims. Passing a
+    multiline positional argument through such a shim can stop at the first
+    newline, so keep the full prompt in the Agent's working directory and put
+    only a short single-line instruction on the command line.
+    """
+    prompt_path = (
+        work_dir / f".yakiflow-agent-prompt-{uuid.uuid4().hex}.md"
+    )
+    prompt_path.write_text(prompt, encoding="utf-8")
+    kickoff = (
+        f"Read {prompt_path.name} completely and follow every instruction in "
+        "it immediately. Begin the requested work now instead of waiting for "
+        "another user message."
+    )
+    return prompt_path, kickoff
+
+
 def build_interactive_command(
     settings: Settings,
     prompt: str,
@@ -317,8 +337,12 @@ async def run_memory_conflict_agent(
     """Launch an interactive Agent to merge one destination memory revision."""
     runner = runner or CommandRunner()
     prompt = build_memory_conflict_prompt(work_dir, destination, diff)
-    command = build_interactive_command(settings, prompt)
-    return await runner.run_interactive(command, cwd=work_dir)
+    prompt_path, kickoff = _stage_interactive_prompt(work_dir, prompt)
+    try:
+        command = build_interactive_command(settings, kickoff)
+        return await runner.run_interactive(command, cwd=work_dir)
+    finally:
+        prompt_path.unlink(missing_ok=True)
 
 
 async def run_interactive_agent(
@@ -332,25 +356,27 @@ async def run_interactive_agent(
     """Hand the terminal to the configured interactive Agent CLI."""
     runner = runner or CommandRunner()
     prompt = build_interactive_prompt(settings, work_dir, outputs, context_files)
-    command = build_interactive_command(
-        settings, prompt
-    )
-    if settings.auto_open_video and outputs:
-        open_media(
-            settings.video_open_command,
-            _source_media(work_dir),
-            outputs[0],
-            cwd=work_dir,
-        )
-    if (
-        settings.review_display_mode in {"split", "both"}
-        and not os.environ.get("TMUX")
-    ):
-        return await _run_in_new_tmux_session(
-            command, work_dir, outputs, _source_media(work_dir),
-            settings.video_open_command,
-        )
-    return await runner.run_interactive(command, cwd=work_dir)
+    prompt_path, kickoff = _stage_interactive_prompt(work_dir, prompt)
+    try:
+        command = build_interactive_command(settings, kickoff)
+        if settings.auto_open_video and outputs:
+            open_media(
+                settings.video_open_command,
+                _source_media(work_dir),
+                outputs[0],
+                cwd=work_dir,
+            )
+        if (
+            settings.review_display_mode in {"split", "both"}
+            and not os.environ.get("TMUX")
+        ):
+            return await _run_in_new_tmux_session(
+                command, work_dir, outputs, _source_media(work_dir),
+                settings.video_open_command,
+            )
+        return await runner.run_interactive(command, cwd=work_dir)
+    finally:
+        prompt_path.unlink(missing_ok=True)
 
 
 async def _run_in_new_tmux_session(
