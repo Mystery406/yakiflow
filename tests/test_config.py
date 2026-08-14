@@ -286,6 +286,21 @@ def test_path_settings_are_canonicalized_when_loaded(
     assert settings.work_dir == tmp_path / "work"
 
 
+def test_vad_can_be_disabled_without_unsetting_the_model(tmp_path: Path) -> None:
+    project_file = tmp_path / "yakiflow.toml"
+    project_file.write_text('vad_model = "/models/vad.bin"\n', encoding="utf-8")
+
+    enabled = load_settings(
+        {}, user_file=Path("/missing"), project_file=project_file
+    )
+    disabled = load_settings(
+        {"vad": False}, user_file=Path("/missing"), project_file=project_file
+    )
+
+    assert enabled.vad_model == Path("/models/vad.bin")
+    assert disabled.vad_model is None
+
+
 @pytest.mark.parametrize(
     ("values", "message"),
     [

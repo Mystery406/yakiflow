@@ -224,6 +224,7 @@ Most users only need these settings:
 | `download_dir` | `--download-dir` | Keep media downloaded from a URL |
 | `whisper_model` | `--whisper-model` | Use an existing custom whisper.cpp model |
 | `vad_model` | `--vad-model` | Enable a local Whisper-compatible VAD model |
+| `vad` | `--vad` / `--no-vad` | Ignore the configured VAD model without editing the config (default: `true`) |
 | `memory` | `--memory` | Choose the persistent terminology/style memory file |
 | `context_files` | `--context-file` | Copy reference files into the work directory for interactive review; repeat the option for multiple files |
 | `agent_workers` | `--agent-workers` | Limit parallel draft translations (default: 4) |
@@ -374,6 +375,10 @@ vad_model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
 `yakiflow models fetch` does not download VAD models. The
 [whisper.cpp VAD guide](https://github.com/ggml-org/whisper.cpp#voice-activity-detection-vad)
 has the model download commands.
+
+Pass `--no-vad` (or set `vad = false`) to run without VAD while keeping
+`vad_model` in the config file. VAD is off whenever no model is configured, so
+`--vad` on its own changes nothing.
 
 ### WhisperX forced alignment
 

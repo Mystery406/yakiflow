@@ -22,6 +22,7 @@ class Settings:
     source_language: str | None = None
     target_language: str | None = None
     whisper_model: Path | None = None
+    vad: bool = True
     vad_model: Path | None = None
     alignment_backend: str = "vad"
     alignment_device: str = "auto"
@@ -79,7 +80,7 @@ class Settings:
             self,
             memory=memory,
             whisper_model=model,
-            vad_model=absolute(self.vad_model),
+            vad_model=absolute(self.vad_model) if self.vad else None,
             download_dir=absolute(self.download_dir),
             output_dir=absolute(self.output_dir),
             context_files=tuple(

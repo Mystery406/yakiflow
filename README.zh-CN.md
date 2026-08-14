@@ -210,6 +210,7 @@ yakiflow models fetch --profile stream
 | `download_dir` | `--download-dir` | 保留从 URL 下载的媒体 |
 | `whisper_model` | `--whisper-model` | 使用已有的自定义 whisper.cpp 模型 |
 | `vad_model` | `--vad-model` | 启用本地 Whisper 兼容 VAD 模型 |
+| `vad` | `--vad` / `--no-vad` | 无需修改配置即可忽略已配置的 VAD 模型（默认 `true`） |
 | `memory` | `--memory` | 指定持久化术语和风格记忆文件 |
 | `context_files` | `--context-file` | 将参考文件复制到工作目录供交互式审校使用；多个文件可重复指定此参数 |
 | `agent_workers` | `--agent-workers` | 限制草稿翻译并发数，默认为 4 |
@@ -350,6 +351,10 @@ vad_model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
 
 `yakiflow models fetch` 不会下载 VAD 模型。下载命令请参考
 [whisper.cpp VAD 指南](https://github.com/ggml-org/whisper.cpp#voice-activity-detection-vad)。
+
+如果想保留配置文件中的 `vad_model` 但本次运行不使用 VAD，可以传入 `--no-vad`
+（或设置 `vad = false`）。没有配置模型时 VAD 本来就不会启用，因此单独传 `--vad`
+不会有任何效果。
 
 ### WhisperX 强制对齐
 

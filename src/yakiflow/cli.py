@@ -51,6 +51,12 @@ def _settings_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-language")
     parser.add_argument("--target-language")
     parser.add_argument("--whisper-model", type=Path)
+    parser.add_argument(
+        "--vad",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="use the configured VAD model; --no-vad ignores it for this run",
+    )
     parser.add_argument("--vad-model", type=Path)
     parser.add_argument("--alignment-backend", choices=["vad", "whisperx"])
     parser.add_argument("--alignment-device", choices=["auto", "cpu", "cuda"])
