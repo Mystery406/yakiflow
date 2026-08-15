@@ -42,10 +42,14 @@ class FakeBackend(AgentBackend):
 
     def __init__(self):
         self.prompts: list[str] = []
+        self.systems: list[str] = []
         self.schemas: list[dict] = []
 
-    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+    async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
         self.prompts.append(prompt)
+        self.systems.append(system)
         self.schemas.append(schema)
         response = {
             "cues": [{"id": "c1", "source": "agent source", "translated": "代理译文"}],
@@ -60,9 +64,13 @@ class EchoBackend(AgentBackend):
 
     def __init__(self):
         self.prompts: list[str] = []
+        self.systems: list[str] = []
 
-    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+    async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
         self.prompts.append(prompt)
+        self.systems.append(system)
         payload = json.loads(prompt.split("INPUT:\n", 1)[1])
         return {
             "cues": [
@@ -79,7 +87,9 @@ class SequenceBackend(AgentBackend):
         self.translations = translations
         self.calls = 0
 
-    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+    async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
         translated = self.translations[min(self.calls, len(self.translations) - 1)]
         self.calls += 1
         return {
@@ -93,7 +103,9 @@ class TimeoutThenSuccessBackend(AgentBackend):
     def __init__(self):
         self.calls = 0
 
-    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+    async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
         self.calls += 1
         if self.calls == 1:
             await asyncio.sleep(1)
@@ -205,17 +217,23 @@ def test_draft_backend_commands_append_only_matching_options(tmp_path: Path) -> 
     schema = {"type": "object"}
     expected = {"cues": []}
     commands: dict[str, list[object]] = {}
+    stdin: dict[str, bytes] = {}
+    staged: dict[str, str] = {}
 
     class CodexRunner:
-        async def run(self, args, **_kwargs):
+        async def run(self, args, **kwargs):
             commands["codex"] = list(args)
+            stdin["codex"] = kwargs.get("stdin", b"")
             output = Path(args[args.index("--output-last-message") + 1])
             output.write_text(json.dumps(expected))
             return ProcessResult(tuple(str(arg) for arg in args), 0, "", "")
 
     class ClaudeRunner:
-        async def run(self, args, *, on_line=None, **_kwargs):
+        async def run(self, args, *, on_line=None, **kwargs):
             commands["claude"] = list(args)
+            stdin["claude"] = kwargs.get("stdin", b"")
+            index = list(args).index("--system-prompt-file")
+            staged["system"] = Path(args[index + 1]).read_text(encoding="utf-8")
             assert on_line is not None
             await on_line(
                 "stdout",
@@ -227,12 +245,14 @@ def test_draft_backend_commands_append_only_matching_options(tmp_path: Path) -> 
         await CodexBackend(
             tmp_path, CodexRunner(), ("-c", "service_tier=fast")
         ).invoke_with_trace(
-            "prompt", model="draft-codex", effort="low", schema=schema
+            "prompt", system="stable guidance", model="draft-codex",
+            effort="low", schema=schema,
         )
         await ClaudeBackend(
             tmp_path, ClaudeRunner(), ("--permission-mode", "plan")
         ).invoke_with_trace(
-            "prompt", model="draft-claude", effort="medium", schema=schema
+            "prompt", system="stable guidance", model="draft-claude",
+            effort="medium", schema=schema,
         )
 
     asyncio.run(exercise())
@@ -240,14 +260,25 @@ def test_draft_backend_commands_append_only_matching_options(tmp_path: Path) -> 
     codex = commands["codex"]
     assert codex[-3:] == ["-c", "service_tier=fast", "-"]
     assert "--permission-mode" not in codex
+    # Codex has no system-prompt flag, so the stable text leads the stdin prompt
+    # and its automatic prefix matching does the rest.
+    assert "--system-prompt-file" not in codex
+    assert stdin["codex"] == b"stable guidance\nprompt"
+
     claude = commands["claude"]
-    assert claude[-4:] == [
-        "--effort",
-        "medium",
+    assert staged["system"] == "stable guidance"
+    assert stdin["claude"] == b"prompt"
+    # `--tools` is variadic, so an empty value has to be followed by a flag
+    # rather than by a caller-supplied token it would otherwise swallow.
+    assert claude[claude.index("--tools") + 1:] == [
+        "",
+        "--no-session-persistence",
         "--permission-mode",
         "plan",
     ]
     assert "service_tier=fast" not in claude
+    # The staged system prompt is written for the call and cleaned up after it.
+    assert not list(tmp_path.glob("agent-system-*.md"))
 
 
 def test_pipeline_emits_agent_lifecycle_and_readable_result(tmp_path: Path) -> None:
@@ -293,24 +324,29 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
     result = asyncio.run(pipeline.translate_draft(db.list_cues()))
     assert result[0].source == "agent source"
     assert result[0].translated == "代理译文"
-    assert "target language (zh-CN)" in backend.prompts[0]
-    assert "highly certain ASR/transcription errors" in backend.prompts[0]
-    assert "phonetically very close" in backend.prompts[0]
-    assert "preserve the source text exactly" in backend.prompts[0]
-    assert "do not guess from context" in backend.prompts[0]
+    system = backend.systems[0]
+    assert "target language (zh-CN)" in system
+    assert "highly certain ASR/transcription errors" in system
+    assert "phonetically very close" in system
+    assert "preserve the source text exactly" in system
+    assert "do not guess from context" in system
     assert (
         "Follow every applicable terminology, naming, and style constraint in MEMORY"
-        in backend.prompts[0]
+        in system
     )
-    assert "rather than as a word-by-word rendering" in backend.prompts[0]
-    assert "calqued idioms and other translationese" in backend.prompts[0]
-    assert "never add, drop, or embellish content" in backend.prompts[0]
+    assert "rather than as a word-by-word rendering" in system
+    assert "calqued idioms and other translationese" in system
+    assert "never add, drop, or embellish content" in system
     # MEMORY reaches the Agent as its own raw-Markdown block rather than as a
     # JSON-escaped string field buried among the task data.
-    assert f"<memory>\n{MEMORY.strip()}\n</memory>" in backend.prompts[0]
-    assert "Use MEMORY as the evidence for the source corrections" in backend.prompts[0]
-    assert "plausible misrecognition of something MEMORY records" in backend.prompts[0]
-    payload = json.loads(backend.prompts[0].rsplit("\nINPUT:\n", 1)[1])
+    assert f"<memory>\n{MEMORY.strip()}\n</memory>" in system
+    assert "Use MEMORY as the evidence for the source corrections" in system
+    assert "plausible misrecognition of something MEMORY records" in system
+    # Nothing that repeats across batches may ride along with the cues, or the
+    # backends that cache a stable prefix have nothing stable to cache.
+    assert backend.prompts[0].startswith("INPUT:\n")
+    assert MEMORY.strip() not in backend.prompts[0]
+    payload = json.loads(backend.prompts[0].split("INPUT:\n", 1)[1])
     assert "memory" not in payload
     assert set(payload["cues"][0]) == {"id", "source", "translated"}
     assert set(backend.schemas[0]["properties"]) == {"cues"}
@@ -347,8 +383,11 @@ def test_draft_batches_see_the_cues_on_both_sides(tmp_path: Path) -> None:
     assert [cue["id"] for cue in payloads["3"]["preceding_context"]] == ["2"]
     assert [cue["id"] for cue in payloads["3"]["following_context"]] == ["4"]
     assert [cue["id"] for cue in payloads["4"]["following_context"]] == []
-    assert "never translate them and never return them" in backend.prompts[0]
-    assert "translate only the part that belongs to `cues`" in backend.prompts[0]
+    assert "never translate them and never return them" in backend.systems[0]
+    assert "translate only the part that belongs to `cues`" in backend.systems[0]
+    # Every batch of a stage must see the identical system text, or a cached
+    # prefix would be rewritten on each one.
+    assert len(set(backend.systems)) == 1
     db.close()
 
 
@@ -396,7 +435,7 @@ def test_post_alignment_translation_ignores_agent_source_edits(tmp_path: Path) -
 
     assert result[0].source == "forced-aligned sentence"
     assert result[0].translated == "代理译文"
-    assert "do not modify, correct, merge, or split the source text" in backend.prompts[0]
+    assert "do not modify, correct, merge, or split the source text" in backend.systems[0]
     db.close()
 
 
@@ -413,8 +452,8 @@ def test_draft_prompt_omits_memory_rules_without_memory(tmp_path: Path) -> None:
 
     # A rule pointing at guidance that was never supplied is noise the Agent
     # has to resolve on its own.
-    assert "MEMORY" not in backend.prompts[0]
-    assert "highly certain ASR/transcription errors" in backend.prompts[0]
+    assert "MEMORY" not in backend.systems[0]
+    assert "highly certain ASR/transcription errors" in backend.systems[0]
     db.close()
 
 
@@ -429,10 +468,10 @@ def test_post_alignment_memory_rule_keeps_the_source_frozen(tmp_path: Path) -> N
 
     asyncio.run(pipeline.translate_draft(db.list_cues(), translate_only=True))
 
-    prompt = backend.prompts[0]
-    assert f"<memory>\n{MEMORY.strip()}\n</memory>" in prompt
-    assert "leave the source text unchanged even where it contradicts MEMORY" in prompt
-    assert "Use MEMORY as the evidence for the source corrections" not in prompt
+    system = backend.systems[0]
+    assert f"<memory>\n{MEMORY.strip()}\n</memory>" in system
+    assert "leave the source text unchanged even where it contradicts MEMORY" in system
+    assert "Use MEMORY as the evidence for the source corrections" not in system
     db.close()
 
 

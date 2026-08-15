@@ -156,7 +156,9 @@ def test_memory_conflict_agent_retries_when_destination_changes_again(
     class UnusedBackend(AgentBackend):
         name = "unused"
 
-        async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+        async def invoke_with_trace(
+            self, prompt, *, system="", model, effort, schema, on_event=None
+        ):
             raise AssertionError("structured agent should not run")
 
     class ConflictRunner:

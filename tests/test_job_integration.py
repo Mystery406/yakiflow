@@ -73,7 +73,9 @@ class PipelineBackend(AgentBackend):
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+    async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
         self.prompts.append(prompt)
         payload = json.loads(prompt.split("INPUT:\n", 1)[1])
         return {
@@ -143,9 +145,13 @@ def test_forced_alignment_replaces_timeline_then_translation_only_resumes(
 
         def __init__(self) -> None:
             self.prompts: list[str] = []
+            self.systems: list[str] = []
 
-        async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+        async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
             self.prompts.append(prompt)
+            self.systems.append(system)
             payload = json.loads(prompt.split("INPUT:\n", 1)[1])
             return {
                 "cues": [
@@ -205,7 +211,7 @@ def test_forced_alignment_replaces_timeline_then_translation_only_resumes(
         "T:first sentence",
         "T:second sentence",
     ]
-    assert "do not modify, correct, merge, or split" in backend.prompts[0]
+    assert "do not modify, correct, merge, or split" in backend.systems[0]
     assert "timeline-replaced" in [event.kind for event in events]
     assert [
         event.message
@@ -365,7 +371,9 @@ class BlockingBackend(AgentBackend):
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+    async def invoke_with_trace(
+        self, prompt, *, system="", model, effort, schema, on_event=None
+    ):
         self.started.set()
         try:
             await asyncio.Event().wait()

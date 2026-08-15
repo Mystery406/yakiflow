@@ -245,11 +245,19 @@ class AgentBackend(ABC):
         self,
         prompt: str,
         *,
+        system: str = "",
         model: str,
         effort: str,
         schema: dict[str, Any],
         on_event: BackendTraceCallback | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any]:
+        """Run one batch.
+
+        ``system`` carries the guidance that is identical for every batch of a
+        stage, kept apart from ``prompt`` so a backend able to cache a stable
+        prefix can do so; ``prompt`` carries only the cues, which differ every
+        time. A backend that cannot separate them may concatenate the two.
+        """
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
@@ -290,11 +298,17 @@ class CodexBackend(AgentBackend):
         self,
         prompt: str,
         *,
+        system: str = "",
         model: str,
         effort: str,
         schema: dict[str, Any],
         on_event: BackendTraceCallback | None = None,
     ) -> dict[str, Any]:
+        # Codex takes one prompt on stdin and caches prefixes automatically, so
+        # the stable guidance simply leads the message and is matched as a
+        # prefix without anything further from us.
+        if system:
+            prompt = f"{system}\n{prompt}"
         token = uuid.uuid4().hex
         schema_path = self.work_dir / f"agent-schema-{token}.json"
         output_path = self.work_dir / f"agent-output-{token}.json"
@@ -380,6 +394,7 @@ class ClaudeBackend(AgentBackend):
         self,
         prompt: str,
         *,
+        system: str = "",
         model: str,
         effort: str,
         schema: dict[str, Any],
@@ -422,13 +437,35 @@ class ClaudeBackend(AgentBackend):
             "--effort",
             effort,
         ]
+        system_path: Path | None = None
+        if system:
+            # Claude Code caches at its own breakpoints, and the last one before
+            # the cues falls at the end of the whole stdin message: sending the
+            # guidance there means every batch re-uploads it as an uncached
+            # write. The system prompt sits ahead of the message and inside a
+            # breakpoint that a changed message does not disturb, so the batches
+            # after the first read it back instead. Replacing rather than
+            # appending also drops Claude Code's own agent instructions, which a
+            # translator has no use for.
+            system_path = self.work_dir / f"agent-system-{uuid.uuid4().hex}.md"
+            system_path.write_text(system, encoding="utf-8")
+            command.extend(("--system-prompt-file", str(system_path)))
+        # Draft translation answers from the prompt alone. Dropping the tool
+        # definitions removes the largest remaining block of per-request tokens,
+        # and `--tools` is variadic, so its empty value has to be followed by a
+        # flag rather than by whatever the caller configured.
+        command.extend(("--tools", "", "--no-session-persistence"))
         command.extend(self.options)
-        result = await self.runner.run(
-            command,
-            cwd=self.work_dir,
-            stdin=prompt.encode(),
-            on_line=line,
-        )
+        try:
+            result = await self.runner.run(
+                command,
+                cwd=self.work_dir,
+                stdin=prompt.encode(),
+                on_line=line,
+            )
+        finally:
+            if system_path is not None:
+                system_path.unlink(missing_ok=True)
         if isinstance(final_response, dict):
             return final_response
         if isinstance(final_response, str):
@@ -609,14 +646,12 @@ class TranslationPipeline:
             f"in MEMORY when writing the translations below. {rule}\n"
         )
 
-    def _draft_prompt(
-        self,
-        batch: Sequence[Cue],
-        context: Sequence[Cue],
-        following: Sequence[Cue] = (),
-        *,
-        translate_only: bool = False,
-    ) -> str:
+    def _draft_system(self, *, translate_only: bool) -> str:
+        """The guidance every batch of a stage shares, verbatim.
+
+        Kept apart from the cues so a backend that caches a stable prefix pays
+        for it once per stage rather than once per batch.
+        """
         # An ASR pass mangles exactly the proper nouns MEMORY exists to pin
         # down, and MEMORY is the only thing that can make such a correction
         # high-confidence; without it the Agent has nothing but the audio-free
@@ -668,10 +703,17 @@ class TranslationPipeline:
             "runs past its end, translate only the part that belongs to `cues` "
             "and keep it consistent with the rest of that sentence.\n"
             + self._memory_section(translate_only=translate_only)
-            + "INPUT:\n"
-            + json.dumps(
-                self._payload(batch, context, following), ensure_ascii=False
-            )
+        )
+
+    def _draft_prompt(
+        self,
+        batch: Sequence[Cue],
+        context: Sequence[Cue],
+        following: Sequence[Cue] = (),
+    ) -> str:
+        """The cues for one batch, and nothing that repeats across batches."""
+        return "INPUT:\n" + json.dumps(
+            self._payload(batch, context, following), ensure_ascii=False
         )
 
     async def translate_draft(
@@ -762,12 +804,8 @@ class TranslationPipeline:
         translate_only: bool = False,
     ) -> TranslationBatchResult:
         operation_id = uuid.uuid4().hex
-        prompt = self._draft_prompt(
-            batch,
-            context,
-            following,
-            translate_only=translate_only,
-        )
+        system = self._draft_system(translate_only=translate_only)
+        prompt = self._draft_prompt(batch, context, following)
         schema = DRAFT_RESPONSE_SCHEMA
         attempts = self.settings.agent_max_attempts
         summary = self._request_summary(batch, context, following)
@@ -780,7 +818,12 @@ class TranslationPipeline:
                 [cue.id for cue in batch],
                 self.backend.name,
                 model,
-                {"prompt": prompt, "attempt": attempt, "max_attempts": attempts},
+                {
+                    "system": system,
+                    "prompt": prompt,
+                    "attempt": attempt,
+                    "max_attempts": attempts,
+                },
             )
             await self._emit_agent(
                 operation_id, "lifecycle", summary,
@@ -800,8 +843,8 @@ class TranslationPipeline:
                 timeout = self.settings.draft_agent_timeout_seconds
                 async with asyncio.timeout(timeout):
                     raw = await self.backend.invoke_with_trace(
-                        prompt, model=model, effort=effort, schema=schema,
-                        on_event=backend_event,
+                        prompt, system=system, model=model, effort=effort,
+                        schema=schema, on_event=backend_event,
                     )
                 raw_cues = raw.get("cues")
                 cue_count = len(raw_cues) if isinstance(raw_cues, list) else 0
