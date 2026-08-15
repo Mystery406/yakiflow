@@ -47,6 +47,7 @@ class Settings:
     agent_workers: int = 4
     translation_batch_size: int = 20
     translation_context: int = 10
+    translation_following_context: int = 5
     draft_agent_timeout_seconds: float = 600
     agent_max_attempts: int = 3
     agent_retry_delay_seconds: float = 1
@@ -226,7 +227,7 @@ def validate_run_settings(settings: Settings) -> None:
         )
     if settings.agent_workers < 1 or settings.translation_batch_size < 1:
         raise ValueError("agent worker and batch counts must be positive")
-    if settings.translation_context < 0:
+    if settings.translation_context < 0 or settings.translation_following_context < 0:
         raise ValueError("translation context cannot be negative")
     if settings.draft_agent_timeout_seconds <= 0:
         raise ValueError("agent timeouts must be positive")

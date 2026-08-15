@@ -504,14 +504,19 @@ class TranslationPipeline:
             await maybe
 
     @staticmethod
-    def _request_summary(batch: Sequence[Cue], context: Sequence[Cue]) -> str:
+    def _request_summary(
+        batch: Sequence[Cue],
+        context: Sequence[Cue],
+        following: Sequence[Cue] = (),
+    ) -> str:
         if not batch:
             cue_range = "no cues"
         elif len(batch) == 1:
             cue_range = f"cue {batch[0].id}"
         else:
             cue_range = f"cues {batch[0].id}–{batch[-1].id}"
-        context_suffix = f" · Context: {len(context)} cues" if context else ""
+        total_context = len(context) + len(following)
+        context_suffix = f" · Context: {total_context} cues" if total_context else ""
         return f"Draft translate {cue_range}{context_suffix}"
 
     @staticmethod
@@ -556,6 +561,7 @@ class TranslationPipeline:
         self,
         batch: Sequence[Cue],
         context: Sequence[Cue],
+        following: Sequence[Cue] = (),
     ) -> dict[str, Any]:
         def cue_payload(cue: Cue) -> dict[str, Any]:
             return {
@@ -568,7 +574,8 @@ class TranslationPipeline:
             "source_language": self.settings.source_language,
             "target_language": self.settings.target_language,
             "memory": self.memory,
-            "context": [cue_payload(cue) for cue in context],
+            "preceding_context": [cue_payload(cue) for cue in context],
+            "following_context": [cue_payload(cue) for cue in following],
             "cues": [cue_payload(cue) for cue in batch],
         }
 
@@ -576,38 +583,52 @@ class TranslationPipeline:
         self,
         batch: Sequence[Cue],
         context: Sequence[Cue],
+        following: Sequence[Cue] = (),
         *,
         translate_only: bool = False,
     ) -> str:
-        instruction = (
-            "Translate naturally and do not modify, correct, merge, or split the source text. "
+        source_rule = (
+            "Keep the source text exactly as given: do not modify, correct, "
+            "merge, or split the source text."
             if translate_only
             else (
-                "Correct the source text only for highly certain ASR/transcription errors, "
-                "and only when the correction remains phonetically very close to the "
-                "recognized wording (such as an obvious homophone or minor recognition "
-                "mistake). If there is any doubt, preserve the source text exactly; "
-                "do not guess from context or change it for grammar, style, or plausibility, "
-                "and never rewrite it into wording with substantially different pronunciation. "
-                "Then translate naturally "
+                "Correct the source text only for highly certain "
+                "ASR/transcription errors, and only when the correction remains "
+                "phonetically very close to the recognized wording (such as an "
+                "obvious homophone or minor recognition mistake). If there is "
+                "any doubt, preserve the source text exactly; do not guess from "
+                "context or change it for grammar, style, or plausibility, and "
+                "never rewrite it into wording with substantially different "
+                "pronunciation. Return the original source text unless this "
+                "high-confidence, phonetically-close rule applies."
             )
         )
-        introduction = (
-            f"You are YakiFlow's draft subtitle translator. {instruction}"
-            f"into the target language ({self.settings.target_language}). "
-        )
         return (
-            introduction
-            + "Preserve every cue ID and cue order. Do not add facts or merge cues. "
-            + "Follow all applicable terminology and style constraints in MEMORY when "
-            + "writing translations. Treat MEMORY as translation guidance, not as evidence "
-            + "for changing the source text; source edits must still satisfy the "
-            + "high-confidence, phonetically-close rule above. Use context only for continuity. "
-            + "Return the original source text unless "
-            + "the high-confidence correction rule above applies, and return a "
-            "non-empty translation for every cue."
-            + "\nINPUT:\n"
-            + json.dumps(self._payload(batch, context), ensure_ascii=False)
+            "You are YakiFlow's draft subtitle translator. Translate every cue "
+            f"in `cues` into the target language ({self.settings.target_language}). "
+            + source_rule
+            + " Preserve every cue ID and cue order, return a non-empty "
+            "translation for every cue, and do not add facts, merge cues, or "
+            "split cues.\n"
+            "Write each translation the way a native speaker of the target "
+            "language would say it rather than as a word-by-word rendering: use "
+            "the word order that language actually uses, and replace calqued "
+            "idioms and other translationese with natural wording. Keep the "
+            "meaning, speaker intent, and tone unchanged while doing so, and "
+            "never add, drop, or embellish content to make a line read better.\n"
+            "Follow all applicable terminology and style constraints in MEMORY "
+            "when writing translations. Treat MEMORY as translation guidance, "
+            "not as evidence for changing the source text.\n"
+            "`preceding_context` and `following_context` are the neighbouring "
+            "cues, supplied so you can see how a sentence continues on either "
+            "side of this batch. Use them for continuity only: never translate "
+            "them and never return them. When a sentence starts before `cues` or "
+            "runs past its end, translate only the part that belongs to `cues` "
+            "and keep it consistent with the rest of that sentence.\n"
+            "INPUT:\n"
+            + json.dumps(
+                self._payload(batch, context, following), ensure_ascii=False
+            )
         )
 
     async def translate_draft(
@@ -617,6 +638,7 @@ class TranslationPipeline:
         on_progress: ProgressCallback | None = None,
         *,
         preceding_context: Sequence[Cue] = (),
+        following_context: Sequence[Cue] = (),
         translate_only: bool = False,
     ) -> list[Cue]:
         batches = [
@@ -634,10 +656,20 @@ class TranslationPipeline:
                 if self.settings.translation_context
                 else []
             )
+            available_following = [
+                *cues[batch_start + len(batch):],
+                *following_context,
+            ]
+            following = (
+                available_following[:self.settings.translation_following_context]
+                if self.settings.translation_following_context
+                else []
+            )
             async with self._agent_semaphore:
                 result = await self._run_draft_batch(
                     batch,
                     context,
+                    following,
                     self.settings.draft_model or "",
                     self.settings.draft_effort,
                     translate_only=translate_only,
@@ -673,6 +705,7 @@ class TranslationPipeline:
         self,
         batch: Sequence[Cue],
         context: Sequence[Cue],
+        following: Sequence[Cue],
         model: str,
         effort: str,
         *,
@@ -682,11 +715,12 @@ class TranslationPipeline:
         prompt = self._draft_prompt(
             batch,
             context,
+            following,
             translate_only=translate_only,
         )
         schema = DRAFT_RESPONSE_SCHEMA
         attempts = self.settings.agent_max_attempts
-        summary = self._request_summary(batch, context)
+        summary = self._request_summary(batch, context, following)
         await self._emit_agent(
             operation_id, "user_message", summary,
             cues=batch, model=model, attempt=1, max_attempts=attempts,

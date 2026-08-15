@@ -730,8 +730,9 @@ def test_reviewing_resume_preserves_and_finalizes_staged_agent_edits(
     job = YakiFlowJob(
         str(media), settings, runner=PipelineRunner(), backend=PipelineBackend()
     )
+    reviewed = "1\n00:00:00,000 --> 00:00:01,000\nreviewed by Agent\n"
     staged = asyncio.run(job.run())[0]
-    staged.write_text("reviewed by Agent\n", encoding="utf-8")
+    staged.write_text(reviewed, encoding="utf-8")
     job.close()
 
     backend = PipelineBackend()
@@ -739,11 +740,11 @@ def test_reviewing_resume_preserves_and_finalizes_staged_agent_edits(
     restored = asyncio.run(resumed.run())
 
     assert restored == [staged]
-    assert staged.read_text(encoding="utf-8") == "reviewed by Agent\n"
+    assert staged.read_text(encoding="utf-8") == reviewed
     assert backend.prompts == []
     finalized = resumed.finalize_artifacts()
     assert finalized == [output_dir / staged.name]
-    assert finalized[0].read_text(encoding="utf-8") == "reviewed by Agent\n"
+    assert finalized[0].read_text(encoding="utf-8") == reviewed
     resumed.close()
 
 
@@ -778,6 +779,97 @@ def test_finalize_requires_all_staged_subtitles_before_moving_any(
     assert not (output_dir / present.name).exists()
     assert stale_destination.read_text(encoding="utf-8") == "stale translation\n"
     assert job.outputs == [present, missing]
+    job.close()
+
+
+def _review_job(tmp_path: Path, cues: list[Cue], output_mode: str = "bilingual"):
+    job = YakiFlowJob(
+        "input.mp4",
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            translation_backend="codex",
+            memory=tmp_path / "memory.md",
+            output_dir=tmp_path / "out",
+            work_dir=tmp_path / "work",
+            output_mode=output_mode,
+        ),
+        backend=PipelineBackend(),
+    )
+    job.db.upsert_cues(cues, stable=True)
+    job._output_destination_base = tmp_path / "out" / "movie"
+    return job
+
+
+def test_finalize_rejects_a_merge_applied_to_only_one_artifact(tmp_path: Path) -> None:
+    job = _review_job(
+        tmp_path,
+        [Cue("1", 0, 1, "one", "T:one"), Cue("2", 1, 2, "two", "T:two")],
+        output_mode="all",
+    )
+    merged = "1\n00:00:00,000 --> 00:00:02,000\nT:one T:two\n"
+    split = (
+        "1\n00:00:00,000 --> 00:00:01,000\none\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\ntwo\n"
+    )
+    translated = job.work_dir / "movie.translated.srt"
+    source = job.work_dir / "movie.source.srt"
+    translated.write_text(merged, encoding="utf-8")
+    source.write_text(split, encoding="utf-8")
+    job.outputs = [translated, source]
+
+    with pytest.raises(RuntimeError, match="not publishable"):
+        job.finalize_artifacts()
+
+    assert translated.is_file() and source.is_file()
+    assert not (tmp_path / "out" / translated.name).exists()
+    job.close()
+
+
+def test_finalize_repairs_cue_numbering_left_by_a_merge(tmp_path: Path) -> None:
+    job = _review_job(
+        tmp_path,
+        [Cue("1", 0, 1, "one", "T:one"), Cue("2", 1, 2, "two", "T:two")],
+    )
+    staged = job.work_dir / "movie.en-zh-cn.srt"
+    staged.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nT:one\n"
+        "\n"
+        "3\n00:00:01,000 --> 00:00:02,000\nT:two\n",
+        encoding="utf-8",
+    )
+    job.outputs = [staged]
+
+    published = job.finalize_artifacts()
+
+    assert published[0].read_text(encoding="utf-8") == (
+        "1\n00:00:00,000 --> 00:00:01,000\nT:one\n"
+        "\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nT:two\n"
+    )
+    job.close()
+
+
+def test_finalize_tolerates_timing_defects_the_pipeline_itself_produced(
+    tmp_path: Path,
+) -> None:
+    # Whisper can emit overlapping cues; the review is not what broke them.
+    job = _review_job(
+        tmp_path,
+        [Cue("1", 0, 2, "one", "T:one"), Cue("2", 1, 3, "two", "T:two")],
+    )
+    staged = job.work_dir / "movie.en-zh-cn.srt"
+    staged.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nT:one\none\n"
+        "\n"
+        "2\n00:00:01,000 --> 00:00:03,000\nT:two\ntwo\n",
+        encoding="utf-8",
+    )
+    job.outputs = [staged]
+
+    published = job.finalize_artifacts()
+
+    assert published == [tmp_path / "out" / staged.name]
     job.close()
 
 
@@ -830,8 +922,8 @@ def test_overlapping_translation_does_not_add_an_empty_progress_stage(
         json.loads(prompt.split("INPUT:\n", 1)[1]) for prompt in backend.prompts
     ]
     payload_by_cue = {payload["cues"][0]["id"]: payload for payload in payloads}
-    assert [cue["id"] for cue in payload_by_cue["1"]["context"]] == []
-    assert [cue["id"] for cue in payload_by_cue["2"]["context"]] == ["1"]
+    assert [cue["id"] for cue in payload_by_cue["1"]["preceding_context"]] == []
+    assert [cue["id"] for cue in payload_by_cue["2"]["preceding_context"]] == ["1"]
     job.close()
 
 
@@ -1036,6 +1128,7 @@ def test_missing_translations_are_sent_as_contiguous_agent_batches(
         output_dir=tmp_path,
         translation_batch_size=2,
         translation_context=2,
+        translation_following_context=2,
     )
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFF-audio")
@@ -1059,10 +1152,19 @@ def test_missing_translations_are_sent_as_contiguous_agent_batches(
         ["5", "6"],
         ["7"],
     ]
-    assert [[cue["id"] for cue in payload["context"]] for payload in payloads] == [
+    assert [
+        [cue["id"] for cue in payload["preceding_context"]] for payload in payloads
+    ] == [
         ["1"],
         ["3", "4"],
         ["5", "6"],
+    ]
+    assert [
+        [cue["id"] for cue in payload["following_context"]] for payload in payloads
+    ] == [
+        ["4", "5"],
+        ["7"],
+        [],
     ]
     assert all(cue.translated for cue in result)
     job.close()

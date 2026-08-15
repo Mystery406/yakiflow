@@ -240,13 +240,16 @@ def test_agent_retry_settings_are_validated() -> None:
         validate_run_settings(settings)
 
 
-def test_negative_translation_context_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "field", ["translation_context", "translation_following_context"]
+)
+def test_negative_translation_context_is_rejected(field: str) -> None:
     settings = load_settings(
         {
             "source_language": "auto",
             "target_language": "zh-CN",
             "translation_backend": "codex",
-            "translation_context": -1,
+            field: -1,
         },
         user_file=Path("/missing"),
         project_file=Path("/missing"),

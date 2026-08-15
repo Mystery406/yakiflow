@@ -32,7 +32,17 @@ from .memory import MemoryDestinationConflict, MemoryFileSnapshot, MemoryStore
 from .models import AgentTraceEvent, Cue, JobEvent, JobStatus, TranscriptEvent
 from .process import CommandRunner
 from .progress import ProgressPlan, StageTimeEstimator, make_progress_plan
-from .srt import publish_outputs, write_srt_atomic
+from .srt import (
+    SrtBlock,
+    alignment_problems,
+    output_modes,
+    parse_srt_blocks,
+    publish_outputs,
+    render_srt,
+    renumbered_srt,
+    srt_problems,
+    write_srt_atomic,
+)
 from .transcription import (
     WhisperCliTranscriber,
     WhisperServerTranscriber,
@@ -626,12 +636,15 @@ class YakiFlowJob:
         pipeline = self._translation_pipeline()
 
         async def translate_ready(
-            batch: list[Cue], preceding_context: Sequence[Cue] = ()
+            batch: list[Cue],
+            preceding_context: Sequence[Cue] = (),
+            following_context: Sequence[Cue] = (),
         ) -> None:
             updated = await pipeline.translate_draft(
                 batch,
                 lambda all_cues: self._write_partial(partial_path, all_cues),
                 preceding_context=preceding_context,
+                following_context=following_context,
             )
             translated_ids = {cue.id for cue in batch}
             await self._emit_agent_cues(cue for cue in updated if cue.id in translated_ids)
@@ -680,10 +693,10 @@ class YakiFlowJob:
         # Agent batch completed. Catch those translations up immediately while
         # Whisper resumes, instead of waiting until the whole remaining audio
         # has been transcribed.
-        for batch, context in self._missing_translation_batches(resume_from):
+        for batch, context, following in self._missing_translation_batches(resume_from):
             scheduled_translation_ids.update(cue.id for cue in batch)
             translation_tasks.append(
-                asyncio.create_task(translate_ready(batch, context))
+                asyncio.create_task(translate_ready(batch, context, following))
             )
 
         transcription_succeeded = False
@@ -774,11 +787,12 @@ class YakiFlowJob:
                     lambda all_cues: self._write_partial(partial_path, all_cues),
                     translation_progress,
                     preceding_context=context,
+                    following_context=following,
                 )
-                for batch, context in batches
+                for batch, context, following in batches
             ))
             translated_ids = {
-                cue.id for batch, _context in batches for cue in batch
+                cue.id for batch, _context, _following in batches for cue in batch
             }
             await self._emit_agent_cues(
                 cue
@@ -802,11 +816,17 @@ class YakiFlowJob:
         cues: Sequence[Cue],
         *,
         excluded_ids: set[str] | None = None,
-    ) -> list[tuple[list[Cue], list[Cue]]]:
-        """Return contiguous missing-translation batches with preceding context."""
+    ) -> list[tuple[list[Cue], list[Cue], list[Cue]]]:
+        """Return contiguous missing-translation batches with their context.
+
+        Each batch carries the cues around it on both sides: a sentence that
+        runs past the end of a batch is otherwise invisible to the Agent
+        translating it.
+        """
         batch_size = self.settings.translation_batch_size
         context_size = self.settings.translation_context
-        batches: list[tuple[list[Cue], list[Cue]]] = []
+        following_size = self.settings.translation_following_context
+        batches: list[tuple[list[Cue], list[Cue], list[Cue]]] = []
         run_start: int | None = None
 
         def append_run(start: int, end: int) -> None:
@@ -816,6 +836,7 @@ class YakiFlowJob:
                 batches.append((
                     list(cues[batch_start:batch_end]),
                     list(cues[context_start:batch_start]),
+                    list(cues[batch_end:batch_end + following_size]),
                 ))
 
         excluded_ids = excluded_ids or set()
@@ -953,13 +974,14 @@ class YakiFlowJob:
                     lambda all_cues: self._write_partial(partial_path, all_cues),
                     translation_progress,
                     preceding_context=context,
+                    following_context=following,
                     translate_only=True,
                 )
-                for batch, context in batches
+                for batch, context, following in batches
             )
         )
         translated_ids = {
-            cue.id for batch, _context in batches for cue in batch
+            cue.id for batch, _context, _following in batches for cue in batch
         }
         await self._emit_agent_cues(
             cue
@@ -1030,6 +1052,45 @@ class YakiFlowJob:
             )
         return outputs
 
+    def _validate_review_outputs(self) -> None:
+        """Refuse to publish subtitle files the review left structurally broken.
+
+        Cue numbering is repaired in place because it is purely mechanical.
+        Everything else is only reported when the pipeline's own rendering of
+        the same cues is free of that defect, so a quirk YakiFlow produced
+        itself never fails a job at the finish line.
+        """
+        cues = self.db.list_cues(stable_only=True)
+        if not cues:
+            return
+        tolerated = {
+            problem.kind
+            for mode in output_modes(self.settings.output_mode)
+            for problem in srt_problems(render_srt(cues, mode))
+        }
+        problems: list[str] = []
+        artifacts: list[tuple[str, Sequence[SrtBlock]]] = []
+        for staged in self.outputs:
+            text = staged.read_text(encoding="utf-8", errors="replace")
+            repaired = renumbered_srt(text)
+            if repaired is not None:
+                staged.write_text(repaired, encoding="utf-8", newline="\n")
+                text = repaired
+            blocks, _unparsed = parse_srt_blocks(text)
+            artifacts.append((staged.name, blocks))
+            problems.extend(
+                f"{staged.name}: {problem.message}"
+                for problem in srt_problems(text)
+                if problem.kind not in tolerated
+            )
+        problems.extend(problem.message for problem in alignment_problems(artifacts))
+        if problems:
+            detail = "\n".join(f"  - {problem}" for problem in problems)
+            raise RuntimeError(
+                "reviewed subtitles are not publishable; fix the staged files in "
+                f"{self.work_dir} and resume the job:\n{detail}"
+            )
+
     def finalize_artifacts(self) -> list[Path]:
         """Move Agent-editable staging artifacts to their configured targets."""
         self._check_memory_destination_unchanged()
@@ -1037,6 +1098,7 @@ class YakiFlowJob:
         if missing:
             detail = ", ".join(str(path) for path in missing)
             raise RuntimeError(f"cannot finalize missing staged subtitle files: {detail}")
+        self._validate_review_outputs()
         destinations: list[Path] = []
         destination_base = self._output_destination_base
         if destination_base is not None:

@@ -65,6 +65,142 @@ def test_interactive_prompt_scopes_review_to_final_output(
     assert "00:01:23,456 --> 00:01:25,000" in normalized
 
 
+@pytest.mark.parametrize(
+    ("output_mode", "expects_phrasing_scope"),
+    [
+        ("source", False),
+        ("translated", True),
+        ("bilingual", True),
+        ("all", True),
+    ],
+)
+def test_interactive_prompt_requires_natural_target_phrasing(
+    tmp_path: Path,
+    output_mode: str,
+    expects_phrasing_scope: bool,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            output_mode=output_mode,
+        ),
+        tmp_path,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert ("Phrasing quality for the target language" in normalized) is expects_phrasing_scope
+    assert ("as if it had been written in that language" in normalized) is expects_phrasing_scope
+    assert ("other translationese" in normalized) is expects_phrasing_scope
+    assert ("wording a native speaker would actually use" in normalized) is expects_phrasing_scope
+    assert ("Do not change the meaning, speaker intent, or tone" in normalized) is expects_phrasing_scope
+
+
+@pytest.mark.parametrize(
+    ("output_mode", "expects_merge_scope", "expects_mirroring"),
+    [
+        ("source", False, False),
+        ("translated", True, False),
+        ("bilingual", True, True),
+        ("all", True, True),
+    ],
+)
+def test_interactive_prompt_allows_merging_cues_a_translation_cannot_split(
+    tmp_path: Path,
+    output_mode: str,
+    expects_merge_scope: bool,
+    expects_mirroring: bool,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            output_mode=output_mode,
+        ),
+        tmp_path,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert ("Merging cues the target language cannot keep apart" in normalized) is expects_merge_scope
+    assert ("no single translated cue can carry a complete" in normalized) is expects_merge_scope
+    assert ("they belong to the same sentence" in normalized) is expects_merge_scope
+    assert ("read comfortably within its on-screen time" in normalized) is expects_merge_scope
+    assert ("not separated by a long pause or a speaker change" in normalized) is expects_merge_scope
+    assert ("from the first cue's start to the last cue's end" in normalized) is expects_merge_scope
+    assert ("Merging is the exception, not the default" in normalized) is expects_merge_scope
+    assert ("Apply every merge to the source side" in normalized) is expects_mirroring
+
+
+@pytest.mark.parametrize("output_mode", ["source", "translated", "bilingual", "all"])
+def test_interactive_prompt_states_the_srt_invariants_and_the_publish_check(
+    tmp_path: Path,
+    output_mode: str,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            output_mode=output_mode,
+        ),
+        tmp_path,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "cue numbers running 1..N with no gaps or repeats" in normalized
+    assert "never end before they start" in normalized
+    assert "no cue left without text" in normalized
+    assert "Renumber the whole file after any merge" in normalized
+    assert "re-read every staged file end to end" in normalized
+    assert "refuses to publish a file that breaks them" in normalized
+    assert (
+        "All three artifacts must also keep the same cue count" in normalized
+    ) is (output_mode == "all")
+
+
+def test_interactive_prompt_keeps_everything_but_subtitles_and_memory_read_only(
+    tmp_path: Path,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(source_language="en", target_language="zh-CN"),
+        tmp_path,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "Exactly two kinds of file are yours to edit" in normalized
+    assert str(tmp_path / "memory.md") in normalized
+    assert "read-only evidence" in normalized
+    assert "can corrupt the job's resume state" in normalized
+    assert "treat a missing one as empty memory" in normalized
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        (Settings(source_language="ja", target_language="zh-CN"), "zh-CN"),
+        (Settings(source_language="ja", output_mode="source"), "ja"),
+    ],
+)
+def test_interactive_prompt_defaults_the_conversation_to_the_target_language(
+    tmp_path: Path,
+    settings: Settings,
+    expected: str,
+) -> None:
+    prompt = build_interactive_prompt(settings, tmp_path)
+
+    normalized = " ".join(prompt.split())
+    assert f"Write to the user in {expected}, including the opening review report" in normalized
+    assert "switch to that language and keep using it" in normalized
+
+
+def test_interactive_prompt_falls_back_to_the_user_language_without_configured_languages(
+    tmp_path: Path,
+) -> None:
+    prompt = build_interactive_prompt(Settings(output_mode="source"), tmp_path)
+
+    normalized = " ".join(prompt.split())
+    assert "Write to the user in whatever language they use" in normalized
+
+
 def test_interactive_prompt_requires_proactive_novel_memory_candidates(
     tmp_path: Path,
 ) -> None:

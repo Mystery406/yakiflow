@@ -263,6 +263,7 @@ YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因�
 | `final_claude_options` | — | `[]` | 传给 Claude 交互式审校和记忆冲突会话的额外 argv token |
 | `translation_batch_size` | — | `20` | 每次草稿请求最多发送的字幕条数 |
 | `translation_context` | — | `10` | 作为翻译上下文提供的前文字幕条数 |
+| `translation_following_context` | — | `5` | 作为翻译上下文提供的后文字幕条数，使跨越批次末尾的句子仍然可见（流式批次此时还没有后文） |
 | `draft_agent_timeout_seconds` | `--draft-agent-timeout-seconds` | `600` | 每次草稿 Agent 尝试的超时时间 |
 | `agent_max_attempts` | `--agent-max-attempts` | `3` | 草稿请求失败后的最大尝试次数 |
 | `agent_retry_delay_seconds` | `--agent-retry-delay-seconds` | `1` | 草稿请求两次尝试之间的等待秒数 |
@@ -314,6 +315,11 @@ yt-dlp；需要参数值的选项，要把选项名和值分别写成两个字�
 从终端运行时，YakiFlow 会在批量翻译后启动交互式审校。Agent 会检查完整字幕，
 应用双方确认的修改，并可建议复用人名、术语或风格偏好。只有在你同意后，它才会
 更新记忆文件。
+
+审校 Agent 默认用目标语言与你交流，你换用其他语言时它也会跟着切换。当目标语言
+无法沿用原文的断句时，它可以合并相关字幕条，并把同样的合并同步到所有配置的产物
+中。发布之前，YakiFlow 会重新检查每个暂存文件：字幕编号会自动修复，而时间轴损坏
+或各产物字幕不再一致的情况会被报告而不是发布，任务仍可继续恢复。
 
 默认情况下，YakiFlow 会尽量通过 `tmux` 在 Agent 旁显示只读字幕窗格。在该窗格
 按 `O`，可以用 `mpv` 打开媒体并加载当前字幕。要使用其他播放器：

@@ -280,6 +280,7 @@ command-line usage.
 | `final_claude_options` | — | `[]` | Extra Claude argv tokens for interactive review and memory-conflict sessions |
 | `translation_batch_size` | — | `20` | Maximum subtitle cues sent in each draft request |
 | `translation_context` | — | `10` | Number of preceding cues supplied as translation context |
+| `translation_following_context` | — | `5` | Number of following cues supplied as translation context, so a sentence that continues past the batch stays visible (streaming batches have none yet) |
 | `draft_agent_timeout_seconds` | `--draft-agent-timeout-seconds` | `600` | Timeout for each draft Agent attempt |
 | `agent_max_attempts` | `--agent-max-attempts` | `3` | Maximum attempts for a failed draft request |
 | `agent_retry_delay_seconds` | `--agent-retry-delay-seconds` | `1` | Delay between draft request attempts |
@@ -334,6 +335,14 @@ When run from a terminal, YakiFlow starts an interactive review after batch
 translation. The Agent checks the complete subtitle file, applies agreed edits,
 and can propose reusable names, terminology, or style preferences. Memory is
 only updated after you approve a proposal.
+
+The review Agent writes to you in the target language and switches if you write
+in another one. When the target language cannot keep one sentence split the way
+the source was, it may merge those cues, mirroring the merge across every
+configured artifact. Before publishing, YakiFlow re-checks each staged file: cue
+numbering is repaired automatically, while broken timing or artifacts that no
+longer share the same cues are reported instead of published, leaving the job
+resumable.
 
 By default YakiFlow uses `tmux` to show a read-only subtitle pane next to the
 Agent when possible. In that pane, press `O` to open the media with the current

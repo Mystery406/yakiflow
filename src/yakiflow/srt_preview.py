@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -9,47 +8,23 @@ from textual.binding import Binding
 
 from .media_player import open_media
 from .models import Cue
+from .srt import parse_srt_blocks
 from .tui import SubtitleTable
 
 
-_TIMING = re.compile(
-    r"^(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+"
-    r"(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})"
-)
-
-
-def _seconds(value: str) -> float:
-    hours, minutes, rest = value.replace(",", ".").split(":")
-    seconds, fraction = rest.split(".")
-    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + float(f"0.{fraction}")
-
-
 def read_srt(path: Path) -> list[Cue]:
+    """Read a subtitle file for preview, skipping any block that cannot parse."""
     if not path.is_file():
         return []
-    blocks = path.read_text(encoding="utf-8", errors="replace").split("\n\n")
+    blocks, _problems = parse_srt_blocks(
+        path.read_text(encoding="utf-8", errors="replace")
+    )
     cues: list[Cue] = []
     for block in blocks:
-        lines = [line.rstrip("\r") for line in block.splitlines()]
-        if len(lines) < 3:
-            continue
-        match = _TIMING.match(lines[1])
-        if not match:
-            continue
-        text = [line for line in lines[2:] if line]
-        if len(text) > 1:
-            translated, source = text[0], "\n".join(text[1:])
-        else:
-            translated, source = None, (text[0] if text else "")
-        cues.append(
-            Cue(
-                lines[0],
-                _seconds(match.group("start")),
-                _seconds(match.group("end")),
-                source,
-                translated,
-            )
-        )
+        first, *rest = block.text
+        translated = first if rest else None
+        source = "\n".join(rest) if rest else first
+        cues.append(Cue(block.number, block.start, block.end, source, translated))
     return cues
 
 

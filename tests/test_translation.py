@@ -46,6 +46,25 @@ class FakeBackend(AgentBackend):
         return response
 
 
+class EchoBackend(AgentBackend):
+    """Translate whatever cues the prompt actually asked for."""
+
+    name = "echo"
+
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    async def invoke_with_trace(self, prompt, *, model, effort, schema, on_event=None):
+        self.prompts.append(prompt)
+        payload = json.loads(prompt.split("INPUT:\n", 1)[1])
+        return {
+            "cues": [
+                {"id": cue["id"], "source": cue["source"], "translated": f"T:{cue['id']}"}
+                for cue in payload["cues"]
+            ],
+        }
+
+
 class SequenceBackend(AgentBackend):
     name = "sequence"
 
@@ -274,12 +293,74 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
     assert "do not guess from context" in backend.prompts[0]
     assert "Follow all applicable terminology and style constraints in MEMORY" in backend.prompts[0]
     assert "not as evidence for changing the source text" in backend.prompts[0]
+    assert "rather than as a word-by-word rendering" in backend.prompts[0]
+    assert "calqued idioms and other translationese" in backend.prompts[0]
+    assert "never add, drop, or embellish content" in backend.prompts[0]
     payload = json.loads(backend.prompts[0].split("INPUT:\n", 1)[1])
     assert set(payload["cues"][0]) == {"id", "source", "translated"}
     assert set(backend.schemas[0]["properties"]) == {"cues"}
     assert backend.schemas[0]["title"] == "DraftTranslationResponse"
     item_schema = backend.schemas[0]["properties"]["cues"]["items"]
     assert set(item_schema["properties"]) == {"id", "source", "translated"}
+    db.close()
+
+
+def test_draft_batches_see_the_cues_on_both_sides(tmp_path: Path) -> None:
+    settings = Settings(
+        target_language="zh-CN",
+        translation_backend="codex",
+        draft_model="draft",
+        translation_batch_size=1,
+        translation_context=1,
+        translation_following_context=2,
+    )
+    db = JobDatabase(tmp_path / "db.sqlite3")
+    cues = [Cue(str(index), index, index + 1, f"s{index}") for index in range(1, 5)]
+    db.upsert_cues(cues)
+    backend = EchoBackend()
+    pipeline = TranslationPipeline(settings, backend, db, "")
+
+    asyncio.run(pipeline.translate_draft(db.list_cues()))
+
+    payloads = {
+        json.loads(prompt.split("INPUT:\n", 1)[1])["cues"][0]["id"]:
+            json.loads(prompt.split("INPUT:\n", 1)[1])
+        for prompt in backend.prompts
+    }
+    assert [cue["id"] for cue in payloads["1"]["preceding_context"]] == []
+    assert [cue["id"] for cue in payloads["1"]["following_context"]] == ["2", "3"]
+    assert [cue["id"] for cue in payloads["3"]["preceding_context"]] == ["2"]
+    assert [cue["id"] for cue in payloads["3"]["following_context"]] == ["4"]
+    assert [cue["id"] for cue in payloads["4"]["following_context"]] == []
+    assert "never translate them and never return them" in backend.prompts[0]
+    assert "translate only the part that belongs to `cues`" in backend.prompts[0]
+    db.close()
+
+
+def test_streaming_batches_have_no_following_context(tmp_path: Path) -> None:
+    # Nothing after the newest cue has been transcribed yet.
+    settings = Settings(
+        target_language="zh-CN",
+        translation_backend="codex",
+        draft_model="draft",
+        translation_batch_size=2,
+        translation_following_context=5,
+    )
+    db = JobDatabase(tmp_path / "db.sqlite3")
+    batch = [Cue("3", 2, 3, "s3"), Cue("4", 3, 4, "s4")]
+    db.upsert_cues([Cue("1", 0, 1, "s1"), Cue("2", 1, 2, "s2"), *batch])
+    backend = EchoBackend()
+    pipeline = TranslationPipeline(settings, backend, db, "")
+
+    asyncio.run(
+        pipeline.translate_draft(
+            batch, preceding_context=[Cue("2", 1, 2, "s2")]
+        )
+    )
+
+    payload = json.loads(backend.prompts[0].split("INPUT:\n", 1)[1])
+    assert [cue["id"] for cue in payload["preceding_context"]] == ["2"]
+    assert payload["following_context"] == []
     db.close()
 
 
