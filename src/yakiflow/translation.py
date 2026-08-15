@@ -574,11 +574,40 @@ class TranslationPipeline:
         return {
             "source_language": self.settings.source_language,
             "target_language": self.settings.target_language,
-            "memory": self.memory,
             "preceding_context": [cue_payload(cue) for cue in context],
             "following_context": [cue_payload(cue) for cue in following],
             "cues": [cue_payload(cue) for cue in batch],
         }
+
+    def _memory_section(self, *, translate_only: bool) -> str:
+        """Render MEMORY as its own raw-Markdown block.
+
+        Carried as a string field inside the input JSON, the memory reached the
+        Agent escaped onto a single line, stripped of the heading and list
+        structure that makes its terminology entries legible, and surrounded by
+        the task data rather than by the rules that govern it.
+        """
+        memory = self.memory.strip()
+        if not memory:
+            return ""
+        rule = (
+            "MEMORY is translation guidance only here: leave the source text "
+            "unchanged even where it contradicts MEMORY, but still render a "
+            "source line that is a recognizable misrecognition of something "
+            "MEMORY records the way MEMORY renders it."
+            if translate_only
+            else (
+                "Use MEMORY as the evidence for the source corrections "
+                "described above."
+            )
+        )
+        return (
+            "MEMORY is the durable terminology, naming, and style record kept "
+            "for this material:\n"
+            f"<memory>\n{memory}\n</memory>\n"
+            "Follow every applicable terminology, naming, and style constraint "
+            f"in MEMORY when writing the translations below. {rule}\n"
+        )
 
     def _draft_prompt(
         self,
@@ -588,6 +617,19 @@ class TranslationPipeline:
         *,
         translate_only: bool = False,
     ) -> str:
+        # An ASR pass mangles exactly the proper nouns MEMORY exists to pin
+        # down, and MEMORY is the only thing that can make such a correction
+        # high-confidence; without it the Agent has nothing but the audio-free
+        # transcript to judge a name against.
+        memory_evidence = (
+            " A name, term, or spelling recorded in MEMORY is exactly this "
+            "kind of evidence: when the recognized wording reads as a "
+            "plausible misrecognition of something MEMORY records, restore "
+            "MEMORY's form, including when the two are written with different "
+            "characters or scripts, as long as they are pronounced alike."
+            if self.memory.strip()
+            else ""
+        )
         source_rule = (
             "Keep the source text exactly as given: do not modify, correct, "
             "merge, or split the source text."
@@ -596,7 +638,9 @@ class TranslationPipeline:
                 "Correct the source text only for highly certain "
                 "ASR/transcription errors, and only when the correction remains "
                 "phonetically very close to the recognized wording (such as an "
-                "obvious homophone or minor recognition mistake). If there is "
+                "obvious homophone or minor recognition mistake)."
+                + memory_evidence
+                + " If there is "
                 "any doubt, preserve the source text exactly; do not guess from "
                 "context or change it for grammar, style, or plausibility, and "
                 "never rewrite it into wording with substantially different "
@@ -617,16 +661,14 @@ class TranslationPipeline:
             "idioms and other translationese with natural wording. Keep the "
             "meaning, speaker intent, and tone unchanged while doing so, and "
             "never add, drop, or embellish content to make a line read better.\n"
-            "Follow all applicable terminology and style constraints in MEMORY "
-            "when writing translations. Treat MEMORY as translation guidance, "
-            "not as evidence for changing the source text.\n"
             "`preceding_context` and `following_context` are the neighbouring "
             "cues, supplied so you can see how a sentence continues on either "
             "side of this batch. Use them for continuity only: never translate "
             "them and never return them. When a sentence starts before `cues` or "
             "runs past its end, translate only the part that belongs to `cues` "
             "and keep it consistent with the rest of that sentence.\n"
-            "INPUT:\n"
+            + self._memory_section(translate_only=translate_only)
+            + "INPUT:\n"
             + json.dumps(
                 self._payload(batch, context, following), ensure_ascii=False
             )

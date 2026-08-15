@@ -18,6 +18,13 @@ from yakiflow.translation import (
 )
 
 
+MEMORY = """## 人名
+
+- ちゅんるん → 麻圆
+  - ASR 纠错：純潤/旬論 → ちゅんるん
+"""
+
+
 class RecordingAwaitable:
     def __init__(self, values: list, value: object) -> None:
         self.values = values
@@ -282,7 +289,7 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "user source")])
     backend = FakeBackend()
-    pipeline = TranslationPipeline(settings, backend, db, "")
+    pipeline = TranslationPipeline(settings, backend, db, MEMORY)
     result = asyncio.run(pipeline.translate_draft(db.list_cues()))
     assert result[0].source == "agent source"
     assert result[0].translated == "代理译文"
@@ -291,12 +298,20 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
     assert "phonetically very close" in backend.prompts[0]
     assert "preserve the source text exactly" in backend.prompts[0]
     assert "do not guess from context" in backend.prompts[0]
-    assert "Follow all applicable terminology and style constraints in MEMORY" in backend.prompts[0]
-    assert "not as evidence for changing the source text" in backend.prompts[0]
+    assert (
+        "Follow every applicable terminology, naming, and style constraint in MEMORY"
+        in backend.prompts[0]
+    )
     assert "rather than as a word-by-word rendering" in backend.prompts[0]
     assert "calqued idioms and other translationese" in backend.prompts[0]
     assert "never add, drop, or embellish content" in backend.prompts[0]
-    payload = json.loads(backend.prompts[0].split("INPUT:\n", 1)[1])
+    # MEMORY reaches the Agent as its own raw-Markdown block rather than as a
+    # JSON-escaped string field buried among the task data.
+    assert f"<memory>\n{MEMORY.strip()}\n</memory>" in backend.prompts[0]
+    assert "Use MEMORY as the evidence for the source corrections" in backend.prompts[0]
+    assert "plausible misrecognition of something MEMORY records" in backend.prompts[0]
+    payload = json.loads(backend.prompts[0].rsplit("\nINPUT:\n", 1)[1])
+    assert "memory" not in payload
     assert set(payload["cues"][0]) == {"id", "source", "translated"}
     assert set(backend.schemas[0]["properties"]) == {"cues"}
     assert backend.schemas[0]["title"] == "DraftTranslationResponse"
@@ -382,6 +397,42 @@ def test_post_alignment_translation_ignores_agent_source_edits(tmp_path: Path) -
     assert result[0].source == "forced-aligned sentence"
     assert result[0].translated == "代理译文"
     assert "do not modify, correct, merge, or split the source text" in backend.prompts[0]
+    db.close()
+
+
+def test_draft_prompt_omits_memory_rules_without_memory(tmp_path: Path) -> None:
+    settings = Settings(
+        target_language="zh-CN", translation_backend="codex", draft_model="draft",
+    )
+    db = JobDatabase(tmp_path / "db.sqlite3")
+    db.upsert_cues([Cue("c1", 0, 1, "user source")])
+    backend = FakeBackend()
+    pipeline = TranslationPipeline(settings, backend, db, "   \n")
+
+    asyncio.run(pipeline.translate_draft(db.list_cues()))
+
+    # A rule pointing at guidance that was never supplied is noise the Agent
+    # has to resolve on its own.
+    assert "MEMORY" not in backend.prompts[0]
+    assert "highly certain ASR/transcription errors" in backend.prompts[0]
+    db.close()
+
+
+def test_post_alignment_memory_rule_keeps_the_source_frozen(tmp_path: Path) -> None:
+    settings = Settings(
+        target_language="zh-CN", translation_backend="codex", draft_model="draft",
+    )
+    db = JobDatabase(tmp_path / "db.sqlite3")
+    db.upsert_cues([Cue("c1", 0, 1, "forced-aligned sentence")])
+    backend = FakeBackend()
+    pipeline = TranslationPipeline(settings, backend, db, MEMORY)
+
+    asyncio.run(pipeline.translate_draft(db.list_cues(), translate_only=True))
+
+    prompt = backend.prompts[0]
+    assert f"<memory>\n{MEMORY.strip()}\n</memory>" in prompt
+    assert "leave the source text unchanged even where it contradicts MEMORY" in prompt
+    assert "Use MEMORY as the evidence for the source corrections" not in prompt
     db.close()
 
 
