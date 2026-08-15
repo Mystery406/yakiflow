@@ -326,3 +326,22 @@ def test_stream_durations_are_validated(values: dict[str, int], message: str) ->
 
     with pytest.raises(ValueError, match=message):
         validate_run_settings(settings)
+
+
+def test_misspelled_configuration_key_is_reported(tmp_path: Path) -> None:
+    project = tmp_path / "project.toml"
+    project.write_text('targt_language="zh"\n')
+    with pytest.raises(ValueError, match="unknown setting 'targt_language'"):
+        load_settings({}, project_file=project, user_file=tmp_path / "absent.toml")
+
+
+def test_misspelled_profile_key_is_reported(tmp_path: Path) -> None:
+    project = tmp_path / "project.toml"
+    project.write_text('[profiles.stream]\nagent_wrkers=2\n')
+    with pytest.raises(ValueError, match="unknown setting 'agent_wrkers'"):
+        load_settings(
+            {},
+            project_file=project,
+            user_file=tmp_path / "absent.toml",
+            profile="stream",
+        )

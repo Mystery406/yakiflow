@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-import wave
 from dataclasses import asdict
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Sequence
@@ -22,12 +21,19 @@ from .alignment import (
     AlignmentResult,
     PcmVolumeStartRefiner,
     adjust_cue_starts_for_long_vad_silences,
+    clear_pcm_level_cache,
     extend_cue_ends,
     make_alignment_backend,
 )
 from .config import Settings
 from .database import JobDatabase
-from .media import MediaAcquirer, MediaArtifact, MediaSource, default_output_base
+from .media import (
+    MediaAcquirer,
+    MediaArtifact,
+    MediaSource,
+    default_output_base,
+    pcm_audio_duration,
+)
 from .memory import MemoryDestinationConflict, MemoryFileSnapshot, MemoryStore
 from .models import AgentTraceEvent, Cue, JobEvent, JobStatus, TranscriptEvent
 from .process import CommandRunner
@@ -54,6 +60,10 @@ from .translation import AgentBackend, TranslationPipeline, make_backend
 EventListener = Callable[[JobEvent], Awaitable[None] | None]
 
 _DRAFT_PARTIAL_SUFFIX = ".draft.incomplete.srt"
+
+
+class _ModelDownloadAbandoned(Exception):
+    """Unwind the model-download worker after its awaiting task went away."""
 
 
 def _temporary_workdir() -> Path:
@@ -216,6 +226,11 @@ class YakiFlowJob:
             shutil.copy2(source, destination)
             copied.append(destination)
         return tuple(copied)
+
+    @property
+    def is_finished(self) -> bool:
+        """True when this work directory holds an already-reviewed job."""
+        return self._resume_status is JobStatus.COMPLETE
 
     @property
     def media_path(self) -> Path | None:
@@ -392,23 +407,13 @@ class YakiFlowJob:
         """Return the unprocessed share of a resumable PCM WAV file."""
         if audio is None or not resume_from:
             return 1.0
-        duration = cls._pcm_audio_duration(audio)
+        duration = pcm_audio_duration(audio)
         if duration is None:
             return 1.0
         processed = max(cue.end for cue in resume_from)
         # Retain a small non-zero span for finalization when the last durable
         # cue reaches the apparent end of the file.
         return max(0.01, min(1.0, (duration - processed) / duration))
-
-    @staticmethod
-    def _pcm_audio_duration(audio: Path) -> float | None:
-        try:
-            with wave.open(str(audio), "rb") as source:
-                rate = source.getframerate()
-                duration = source.getnframes() / rate if rate > 0 else 0.0
-        except (EOFError, OSError, wave.Error):
-            return None
-        return duration if duration > 0 else None
 
     async def _report_progress(
         self,
@@ -455,6 +460,15 @@ class YakiFlowJob:
         )
 
     async def run(self) -> list[Path]:
+        if self._resume_status is JobStatus.COMPLETE:
+            # Review edits live in the published subtitle files, never in the
+            # database, so re-publishing from the stored cues would silently
+            # overwrite them with the pre-review text. Refuse outside the
+            # try/except below so the finished job keeps its COMPLETE status.
+            raise RuntimeError(
+                f"job in {self.work_dir} is already complete; its subtitles were "
+                "published and reviewed, so there is nothing to resume"
+            )
         try:
             if self._resume_status is JobStatus.REVIEWING:
                 self.outputs = self._restore_review_outputs()
@@ -507,9 +521,15 @@ class YakiFlowJob:
         loop = asyncio.get_running_loop()
         last_percent = -1
         last_unknown_report = 0
+        abandoned = False
 
         def progress(received: int, total: int | None) -> None:
             nonlocal last_percent, last_unknown_report
+            if abandoned:
+                # The awaiting task is gone, so scheduling onto its loop would
+                # block this worker thread forever and interpreter shutdown
+                # would wait out the whole remaining download.
+                raise _ModelDownloadAbandoned
             if total:
                 percent = min(100, int(received * 100 / total))
                 if percent <= last_percent:
@@ -529,7 +549,11 @@ class YakiFlowJob:
             )
             future.result()
 
-        await asyncio.to_thread(fetch_model, model, progress)
+        try:
+            await asyncio.to_thread(fetch_model, model, progress)
+        except BaseException:
+            abandoned = True
+            raise
         await self._finish_stage("model", "Whisper model ready")
 
     async def _media_stage(self) -> MediaArtifact:
@@ -550,8 +574,16 @@ class YakiFlowJob:
                 "acquire", fraction, f"acquiring media · {round(fraction * 100)}%"
             )
 
+        async def media_warning(message: str) -> None:
+            await self.emit("warning", message)
+
         acquirer = MediaAcquirer(
-            self.settings, self.work_dir, self.db, self.runner, on_progress=media_progress
+            self.settings,
+            self.work_dir,
+            self.db,
+            self.runner,
+            on_progress=media_progress,
+            on_warning=media_warning,
         )
         if not self.settings.stream:
             artifact = await acquirer.acquire(source)
@@ -743,7 +775,10 @@ class YakiFlowJob:
 
     async def _write_partial(self, path: Path, cues: Sequence[Cue]) -> None:
         mode = self.settings.output_mode if self.settings.output_mode != "all" else "bilingual"
-        write_srt_atomic(path, cues, mode)
+        # write_srt_atomic renders every cue and fsyncs, and this runs once per
+        # Whisper line. Keeping it off the event loop stops it from stalling the
+        # subprocess pipe readers, the TUI, and the concurrent Agent batches.
+        await asyncio.to_thread(write_srt_atomic, path, list(cues), mode)
 
     async def _translation_stage(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Cue]:
         self.db.set_status(JobStatus.TRANSLATING)
@@ -910,14 +945,17 @@ class YakiFlowJob:
             on_progress=alignment_progress,
             on_model_failure=self.alignment_model_failure_listener,
         )
-        self.alignment_result.cues = await PcmVolumeStartRefiner().refine(
-            artifact.audio_path,
-            self.alignment_result.cues,
-            on_warning=lambda message: self.emit("warning", message),
-        )
+        try:
+            self.alignment_result.cues = await PcmVolumeStartRefiner().refine(
+                artifact.audio_path,
+                self.alignment_result.cues,
+                on_warning=lambda message: self.emit("warning", message),
+            )
+        finally:
+            clear_pcm_level_cache()
         self.alignment_result.cues = extend_cue_ends(
             self.alignment_result.cues,
-            duration=self._pcm_audio_duration(artifact.audio_path),
+            duration=pcm_audio_duration(artifact.audio_path),
         )
         self.db.replace_aligned_timeline(self.alignment_result.cues)
         await self.emit("timeline-replaced", "aligned subtitle timeline replaced")
@@ -1003,6 +1041,10 @@ class YakiFlowJob:
         return self.db.list_cues(stable_only=True)
 
     def _publish(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Path]:
+        if not cues:
+            raise RuntimeError(
+                "no subtitles were produced; refusing to publish empty files"
+            )
         destination_base = default_output_base(artifact, self.settings, self.work_dir)
         self._output_destination_base = destination_base
         staging_base = self.work_dir / destination_base.name
@@ -1010,12 +1052,19 @@ class YakiFlowJob:
             staging_base,
             cues,
             self.settings.output_mode,
-            source_language=self.settings.source_language,
+            source_language=self._published_source_language(),
             target_language=self.settings.target_language,
         )
         self.db.checkpoint("review_outputs", [str(path) for path in outputs])
         self.db.checkpoint("output_destination_base", str(destination_base))
         return outputs
+
+    def _published_source_language(self) -> str | None:
+        """Name bilingual outputs after the real language, not ``auto``."""
+        configured = self.settings.source_language
+        if normalize_source_language(configured) is not None:
+            return configured
+        return self.db.get_checkpoint("detected_source_language") or configured
 
     def _restore_review_outputs(self) -> list[Path]:
         """Restore Agent-editable files without overwriting their reviewed text."""
@@ -1109,6 +1158,11 @@ class YakiFlowJob:
                     shutil.move(str(staged), str(destination))
                 destinations.append(destination)
             self.outputs = destinations
+            # The staged paths recorded at publish time no longer exist. Record
+            # where the files went before anything else can fail, so a job that
+            # still has to merge memory stays restorable instead of resuming
+            # into "reviewing job is missing staged subtitle files".
+            self.db.checkpoint("review_outputs", [str(path) for path in destinations])
             # Remove the corresponding draft snapshot from the configured
             # output directory once the finished subtitle has been published.
             draft_name = f"{destination_base.name}{_DRAFT_PARTIAL_SUFFIX}"

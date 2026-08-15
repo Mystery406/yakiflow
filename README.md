@@ -345,7 +345,7 @@ longer share the same cues are reported instead of published, leaving the job
 resumable.
 
 By default YakiFlow uses `tmux` to show a read-only subtitle pane next to the
-Agent when possible. In that pane, press `O` to open the media with the current
+Agent when possible. In that pane, press `o` to open the media with the current
 subtitles in `mpv`. To use another player:
 
 ```toml

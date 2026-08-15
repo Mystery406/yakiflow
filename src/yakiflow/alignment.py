@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Sequence
 
 from .models import Cue
+from .transcription import merge_vad_intervals
 
 
 WarningListener = Callable[[str], Awaitable[None] | None]
@@ -55,7 +56,41 @@ def _pcm_window_levels(
     The window size in frames and the declared sample rate are returned
     alongside the levels so that only callers needing a wall-clock step divide
     by the rate; a header declaring a zero rate stays readable otherwise.
+
+    The alignment stage scans the same reference audio at the same window size
+    from both the VAD backend and the volume refiner, so the last result is
+    kept: the scan costs a full read of the file plus an RMS per 20 ms.
     """
+    stat = audio.stat()
+    key = (str(audio), stat.st_mtime_ns, stat.st_size, window_seconds)
+    cached = _PCM_LEVEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    levels_and_shape = _read_pcm_window_levels(audio, window_seconds, requirement)
+    _PCM_LEVEL_CACHE.clear()
+    _PCM_LEVEL_CACHE[key] = levels_and_shape
+    return levels_and_shape
+
+
+_PCM_LEVEL_CACHE: dict[
+    tuple[str, int, int, float], tuple[list[float], int, int]
+] = {}
+
+
+def clear_pcm_level_cache() -> None:
+    """Release the cached RMS envelope once the alignment stage is done.
+
+    One entry is several megabytes for a feature-length file, and nothing after
+    alignment reads it again.
+    """
+    _PCM_LEVEL_CACHE.clear()
+
+
+def _read_pcm_window_levels(
+    audio: Path,
+    window_seconds: float,
+    requirement: str,
+) -> tuple[list[float], int, int]:
     with wave.open(str(audio), "rb") as wav:
         if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
             raise ValueError(requirement)
@@ -450,15 +485,9 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
         cls,
         intervals: Sequence[tuple[float, float]],
     ) -> list[tuple[float, float]]:
-        result: list[tuple[float, float]] = []
-        for start, end in sorted(intervals):
-            if end < start:
-                continue
-            if result and start <= result[-1][1] + cls._TIMESTAMP_TOLERANCE:
-                result[-1] = (result[-1][0], max(result[-1][1], end))
-            else:
-                result.append((start, end))
-        return result
+        # Alignment deliberately coalesces at the wider timestamp tolerance:
+        # Whisper's millisecond rounding must not look like a speech gap here.
+        return merge_vad_intervals(intervals, cls._TIMESTAMP_TOLERANCE)
 
     @classmethod
     def _pcm_intervals(cls, audio: Path) -> list[tuple[float, float]]:
@@ -1273,9 +1302,16 @@ class WhisperXAlignmentBackend(AlignmentBackend):
             # Agent source and its translation remain authoritative.
             output[0].source = cue.source
             output[0].translated = cue.translated
+        # Speech reaching a window edge means the window was cut too tight and
+        # a wider retry is worth trying — but the file's own start and end are
+        # not edges that widening can move, so a cue there would otherwise fail
+        # both attempts and always fall back to VAD timings.
         touches = (
-            all_words[0]["start"] <= window_start + cls.BOUNDARY_TOLERANCE
-            or all_words[-1]["end"] >= window_end - cls.BOUNDARY_TOLERANCE
+            window_start > cls.BOUNDARY_TOLERANCE
+            and all_words[0]["start"] <= window_start + cls.BOUNDARY_TOLERANCE
+        ) or (
+            window_end < duration - cls.BOUNDARY_TOLERANCE
+            and all_words[-1]["end"] >= window_end - cls.BOUNDARY_TOLERANCE
         )
         return output, touches
 

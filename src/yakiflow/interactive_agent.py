@@ -110,8 +110,14 @@ async def start_agent_file_display(
             raise ValueError(
                 "review_open_command is required for open or both display mode"
             )
-        command = review_open_argv(command_text, file_path, work_dir)
-        await asyncio.create_subprocess_exec(*command, cwd=work_dir)
+        # An optional preview must never turn into a failed review: a missing
+        # viewer here would otherwise abort before the interactive Agent runs
+        # and before the staged subtitles are finalized.
+        try:
+            command = review_open_argv(command_text, file_path, work_dir)
+            await asyncio.create_subprocess_exec(*command, cwd=work_dir)
+        except (OSError, IndexError, ValueError):
+            pass
         if settings.review_display_mode == "open":
             return AgentFileDisplay()
 

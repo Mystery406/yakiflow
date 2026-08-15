@@ -1217,3 +1217,41 @@ def test_transcription_failure_cancels_draft_agent_tasks(
 
     asyncio.run(run_stage())
     job.close()
+
+
+def test_resuming_a_finished_job_does_not_republish_over_reviewed_files(
+    tmp_path: Path,
+) -> None:
+    """Review edits live only in the published files, never in the database."""
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(b"media")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    work_dir = tmp_path / "work"
+    output_dir = tmp_path / "out"
+    settings = Settings(
+        source_language="auto",
+        target_language="zh-CN",
+        translation_backend="codex",
+        whisper_model=model,
+        memory=tmp_path / "memory.md",
+        output_dir=output_dir,
+        work_dir=work_dir,
+    )
+    job = YakiFlowJob(
+        str(media), settings, runner=PipelineRunner(), backend=PipelineBackend()
+    )
+    reviewed = "1\n00:00:00,000 --> 00:00:01,000\nreviewed by Agent\n"
+    staged = asyncio.run(job.run())[0]
+    staged.write_text(reviewed, encoding="utf-8")
+    published = job.finalize_artifacts()[0]
+    job.finish_review()
+    job.close()
+
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+    assert resumed.is_finished
+    with pytest.raises(RuntimeError, match="already complete"):
+        asyncio.run(resumed.run())
+    assert published.read_text(encoding="utf-8") == reviewed
+    assert resumed.db.job()["status"] == "complete"
+    resumed.close()

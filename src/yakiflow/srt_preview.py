@@ -20,11 +20,18 @@ def read_srt(path: Path) -> list[Cue]:
         path.read_text(encoding="utf-8", errors="replace")
     )
     cues: list[Cue] = []
-    for block in blocks:
+    # Number by position rather than by the file's own numbering, which an
+    # in-progress Agent edit can leave duplicated. Duplicates would collide as
+    # subtitle-table row keys, and publish-time validation renumbers the file
+    # anyway. Timings are clamped for the same reason: a cue that ends before
+    # it starts is reported at publish time, not crashed on here.
+    for position, block in enumerate(blocks, 1):
         first, *rest = block.text
         translated = first if rest else None
         source = "\n".join(rest) if rest else first
-        cues.append(Cue(block.number, block.start, block.end, source, translated))
+        cues.append(
+            Cue(str(position), block.start, max(block.start, block.end), source, translated)
+        )
     return cues
 
 

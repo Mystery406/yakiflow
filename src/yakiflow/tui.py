@@ -21,9 +21,18 @@ from textual.widgets import Button, DataTable, Footer, Header, ProgressBar, Rich
 
 
 def format_start_time(seconds: float) -> str:
+    """Render a cue start that always fits the fixed-width Start column.
+
+    Past an hour the centiseconds are dropped rather than the low digits: an
+    ``MM:SS.CC`` value would overflow the column and be cropped, so two cues a
+    minute apart could render identically.
+    """
     centiseconds = max(0, round(seconds * 100))
     minutes, remainder = divmod(centiseconds, 6_000)
     secs, fraction = divmod(remainder, 100)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}.{fraction:02d}"
 
 

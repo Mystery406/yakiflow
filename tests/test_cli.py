@@ -121,6 +121,11 @@ def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> No
     class FakeJob:
         def __init__(self) -> None:
             self.work_dir = work_dir
+            self.settings = Settings(
+                source_language="en",
+                target_language="zh",
+                translation_backend="codex",
+            )
 
     monkeypatch.setattr(
         cli.YakiFlowJob,

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .config import load_settings, validate_run_settings
+from .config import default_model_path, load_settings, validate_run_settings
 from .doctor import run_doctor
 from .job import YakiFlowJob
 from .models import JobEvent
@@ -103,6 +103,10 @@ def _settings(namespace: argparse.Namespace):
     values = vars(namespace).copy()
     config = values.pop("config", None)
     profile = values.pop("profile", None)
+    if config is not None and not config.is_file():
+        # An unreadable config path would otherwise fall back to the defaults
+        # and silently run with a different backend, model, or output location.
+        raise ValueError(f"configuration file does not exist: {config}")
     for key in ("command", "input", "workdir", "models_command"):
         values.pop(key, None)
     return load_settings(values, project_file=config, profile=profile)
@@ -186,13 +190,14 @@ async def _complete_job(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    job: YakiFlowJob | None = None
     try:
         if args.command == "models":
             settings = _settings(args)
             def progress(done: int, total: int | None) -> None:
                 suffix = f"/{total}" if total else ""
                 print(f"\rDownloading {done}{suffix} bytes", end="", file=sys.stderr)
-            path = fetch_model(settings.whisper_model, progress)
+            path = fetch_model(settings.whisper_model or default_model_path(), progress)
             print(f"\n{path}")
             return 0
         if args.command == "doctor":
@@ -203,6 +208,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if all(check.ok for check in checks) else 1
         if args.command == "resume":
             job = YakiFlowJob.from_workdir(args.workdir, listener=_print_event)
+            # The stored configuration bypasses argparse, so re-check it here
+            # instead of failing deep inside a resumed stage.
+            validate_run_settings(job.settings)
         else:
             settings = _settings(args)
             validate_run_settings(settings)
@@ -221,6 +229,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_run_job(job))
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         print(f"yakiflow: {exc}", file=sys.stderr)
+        if job is not None and not job.is_finished:
+            print(
+                f"Job preserved. Resume with: {_resume_command(job.work_dir)}",
+                file=sys.stderr,
+            )
         return 2
 
 

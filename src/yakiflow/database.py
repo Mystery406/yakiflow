@@ -10,6 +10,11 @@ from .models import Cue, JobStatus, utc_now
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
+-- Every process-log line and progress checkpoint is its own committed
+-- transaction, and under WAL the default FULL setting makes each one an fsync
+-- on the event loop. NORMAL still survives a crash of this process, which is
+-- the failure the resume machinery is built for.
+PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY, input TEXT NOT NULL, status TEXT NOT NULL,
@@ -84,6 +89,13 @@ class JobDatabase:
         return Path(row[0]) if row else None
 
     def upsert_cues(self, cues: Sequence[Cue], *, stable: bool = True, reset_order: bool = False) -> None:
+        with self.connection:
+            self._upsert_cues(cues, stable=stable, reset_order=reset_order)
+
+    def _upsert_cues(
+        self, cues: Sequence[Cue], *, stable: bool = True, reset_order: bool = False
+    ) -> None:
+        """Write cues inside the caller's transaction."""
         sql = """
         INSERT INTO cues(id,ordinal,start,end,source,translated,
           timing_confidence,metadata_json,stable)
@@ -95,33 +107,44 @@ class JobDatabase:
           timing_confidence=excluded.timing_confidence,metadata_json=excluded.metadata_json,
           stable=excluded.stable
         """
-        existing = {
-            row["id"]: row["ordinal"]
-            for row in self.connection.execute("SELECT id,ordinal FROM cues").fetchall()
-        }
-        next_ordinal = max(existing.values(), default=-1) + 1
-        ordinals = [
-            i if reset_order else existing.get(cue.id, next_ordinal + i)
-            for i, cue in enumerate(cues)
-        ]
-        with self.connection:
-            self.connection.executemany(
-                sql,
-                [
-                    (
-                        cue.id,
-                        ordinal,
-                        cue.start,
-                        cue.end,
-                        cue.source,
-                        cue.translated,
-                        cue.timing_confidence,
-                        json.dumps(cue.metadata),
-                        stable,
-                    )
-                    for ordinal, cue in zip(ordinals, cues, strict=True)
-                ],
-            )
+        if reset_order:
+            ordinals = list(range(len(cues)))
+        else:
+            # Look up only the cues being written. Reading every row here made
+            # the incremental one-cue-at-a-time transcription path quadratic.
+            ids = [cue.id for cue in cues]
+            placeholders = ",".join("?" * len(ids))
+            existing = {
+                row["id"]: row["ordinal"]
+                for row in self.connection.execute(
+                    f"SELECT id,ordinal FROM cues WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+            } if ids else {}
+            highest = self.connection.execute(
+                "SELECT MAX(ordinal) FROM cues"
+            ).fetchone()[0]
+            next_ordinal = (highest if highest is not None else -1) + 1
+            ordinals = [
+                existing.get(cue.id, next_ordinal + i) for i, cue in enumerate(cues)
+            ]
+        self.connection.executemany(
+            sql,
+            [
+                (
+                    cue.id,
+                    ordinal,
+                    cue.start,
+                    cue.end,
+                    cue.source,
+                    cue.translated,
+                    cue.timing_confidence,
+                    json.dumps(cue.metadata),
+                    stable,
+                )
+                for ordinal, cue in zip(ordinals, cues, strict=True)
+            ],
+        )
 
     def replace_transcript(self, cues: Sequence[Cue]) -> None:
         """Replace provisional cues with an authoritative transcript."""
@@ -148,9 +171,12 @@ class JobDatabase:
                 cue.timing_confidence,
                 metadata,
             ))
+        # Retiring the old rows and installing the merged transcript must be one
+        # transaction: a crash in between would leave no durable timeline at
+        # all, so a resume would re-transcribe the whole file from zero.
         with self.connection:
             self.connection.execute("UPDATE cues SET stable=0, ordinal=ordinal+1000000")
-        self.upsert_cues(merged, stable=True, reset_order=True)
+            self._upsert_cues(merged, stable=True, reset_order=True)
 
     def discard_provisional_transcript(self) -> None:
         """Hide live cues and their translations before the authoritative pass."""
@@ -205,13 +231,16 @@ class JobDatabase:
         rows = self.connection.execute(f"SELECT * FROM cues{where} ORDER BY ordinal").fetchall()
         return [self._cue(row) for row in rows]
 
-    def cues_by_id(self, ids: Sequence[str]) -> dict[str, Cue]:
+    def cues_by_id(
+        self, ids: Sequence[str], *, stable_only: bool = False
+    ) -> dict[str, Cue]:
         """Return only the requested cues, keyed by ID."""
         if not ids:
             return {}
         placeholders = ",".join("?" * len(ids))
+        stable = " AND stable=1" if stable_only else ""
         rows = self.connection.execute(
-            f"SELECT * FROM cues WHERE id IN ({placeholders})", tuple(ids)
+            f"SELECT * FROM cues WHERE id IN ({placeholders}){stable}", tuple(ids)
         ).fetchall()
         return {row["id"]: self._cue(row) for row in rows}
 

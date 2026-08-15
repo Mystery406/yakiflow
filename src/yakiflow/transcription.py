@@ -6,14 +6,17 @@ import re
 import socket
 import uuid
 from abc import ABC, abstractmethod
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import Awaitable, Callable
+from math import inf
 from pathlib import Path
+from time import monotonic
 from typing import Any, Sequence
 
 from .config import Settings
 from .database import JobDatabase
 from .models import Cue, TranscriptEvent, cue_id
-from .process import CommandRunner, ProcessError
+from .process import CommandRunner, ProcessError, terminate_process
 
 
 EventCallback = Callable[[TranscriptEvent], Awaitable[None]]
@@ -26,6 +29,12 @@ VAD_SEGMENT_RE = re.compile(
     r"VAD segment \d+: start = (?P<start>\d+(?:\.\d+)?), "
     r"end = (?P<end>\d+(?:\.\d+)?)"
 )
+_PIPE_CHUNK_BYTES = 64 * 1024
+# How far before the last durable cue a crashed run restarts, and how far apart
+# two renderings of the same speech may start before they stop looking equal.
+RECOVERY_OVERLAP_SECONDS = 5.0
+_DUPLICATE_START_TOLERANCE = 2.5
+_VAD_CHECKPOINT_INTERVAL_SECONDS = 2.0
 
 
 def normalize_source_language(language: object) -> str | None:
@@ -71,18 +80,45 @@ def parse_vad_segment(value: str, *, offset: float = 0.0) -> tuple[float, float]
     return (round(start, 3), round(end, 3)) if end >= start else None
 
 
+INGEST_VAD_MERGE_TOLERANCE = 0.01
+
+
 def merge_vad_intervals(
     intervals: Sequence[tuple[float, float]],
+    tolerance: float = INGEST_VAD_MERGE_TOLERANCE,
 ) -> list[tuple[float, float]]:
+    """Coalesce speech spans that are separated by at most ``tolerance``."""
     merged: list[tuple[float, float]] = []
     for start, end in sorted(intervals):
         if end < start:
             continue
-        if merged and start <= merged[-1][1] + 0.01:
+        if merged and start <= merged[-1][1] + tolerance:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
             merged.append((start, end))
     return merged
+
+
+def append_vad_interval(
+    merged: list[tuple[float, float]],
+    interval: tuple[float, float],
+    tolerance: float = INGEST_VAD_MERGE_TOLERANCE,
+) -> None:
+    """Insert one interval into an already-merged list, in place.
+
+    whisper.cpp reports its speech spans in order, so the common case costs a
+    comparison instead of re-sorting and re-merging everything seen so far.
+    """
+    start, end = interval
+    if end < start:
+        return
+    if not merged or start > merged[-1][1] + tolerance:
+        merged.append(interval)
+    elif start >= merged[-1][0]:
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    else:
+        # Out of order: fall back to the full merge.
+        merged[:] = merge_vad_intervals([*merged, interval], tolerance)
 
 
 def parse_json_full(data: dict[str, Any], *, offset: float = 0.0, ordinal_offset: int = 0) -> list[Cue]:
@@ -118,21 +154,36 @@ def parse_json_full(data: dict[str, Any], *, offset: float = 0.0, ordinal_offset
     return cues
 
 
+def _start_order(cue: Cue) -> tuple[float, float]:
+    return (cue.start, cue.end)
+
+
 def merge_overlap(existing: list[Cue], incoming: list[Cue]) -> list[Cue]:
     """Merge recovery/stream results without duplicating an overlap window."""
-    result = list(existing)
+    result = sorted(existing, key=_start_order)
     for cue in incoming:
         normalized = " ".join(cue.source.casefold().split())
-        duplicate = next(
-            (old for old in reversed(result[-8:]) if abs(old.start - cue.start) < 2.5 and
-             " ".join(old.source.casefold().split()) == normalized),
-            None,
+        # Compare against every cue whose start is close in time, rather than
+        # against a fixed number of trailing cues: dense speech packs far more
+        # cues into the re-transcribed overlap than any fixed count covers, and
+        # a duplicate outside that count would be appended a second time.
+        first = bisect_left(
+            result, (cue.start - _DUPLICATE_START_TOLERANCE, -inf), key=_start_order
+        )
+        last = bisect_right(
+            result, (cue.start + _DUPLICATE_START_TOLERANCE, inf), key=_start_order
+        )
+        duplicate = any(
+            " ".join(old.source.casefold().split()) == normalized
+            for old in result[first:last]
         )
         if duplicate:
             continue
-        ordinal = len(result)
-        result.append(Cue(cue_id(ordinal), cue.start, cue.end, cue.source, metadata=cue.metadata))
-    result.sort(key=lambda item: (item.start, item.end))
+        merged = Cue(
+            cue_id(len(result)), cue.start, cue.end, cue.source, metadata=cue.metadata
+        )
+        # Keep the list ordered so the next lookup can bisect it.
+        insort(result, merged, key=_start_order)
     return result
 
 
@@ -181,7 +232,7 @@ class WhisperCliTranscriber(Transcriber):
             # Whisper's stdout cues are complete segments. Restart at the end
             # of the last durable segment so their IDs, text, and translations
             # remain attached to the same timeline prefix.
-            input_offset = preserved[-1].end
+            input_offset = max(cue.end for cue in preserved)
             input_audio = self.work_dir / "whisper-resume.wav"
             await self._extract_tail(audio, input_offset, input_audio)
             prefix = self.work_dir / "whisper-resume"
@@ -194,14 +245,23 @@ class WhisperCliTranscriber(Transcriber):
         )
         self.db.checkpoint("whisper_vad_intervals", vad_intervals)
 
+        last_vad_checkpoint = monotonic()
+
         def record_vad(value: str, *, offset: float) -> None:
+            nonlocal last_vad_checkpoint
             interval = parse_vad_segment(value, offset=offset)
             if interval is None:
                 return
-            vad_intervals.append(interval)
-            vad_intervals[:] = merge_vad_intervals(vad_intervals)
+            append_vad_interval(vad_intervals, interval)
             # VAD is computed before decoding. Persist it incrementally so an
-            # interrupted Whisper run can resume without losing the timeline.
+            # interrupted Whisper run can resume without losing the timeline,
+            # but a committed write per line means one commit per speech span;
+            # a short interval bounds that, and the end of ``transcribe``
+            # writes the final list either way.
+            now = monotonic()
+            if now - last_vad_checkpoint < _VAD_CHECKPOINT_INTERVAL_SECONDS:
+                return
+            last_vad_checkpoint = now
             self.db.checkpoint("whisper_vad_intervals", vad_intervals)
 
         async def line(stream: str, value: str) -> None:
@@ -219,34 +279,30 @@ class WhisperCliTranscriber(Transcriber):
             cue = Cue(
                 cue_id(len(preserved) + len(incremental)),
                 start,
-                end,
+                # whisper.cpp can print an inverted span when VAD remaps a
+                # segment onto the original timeline. Clamp it exactly as the
+                # JSON path does: a callback exception aborts the whole run.
+                max(start, end),
                 match.group("text").strip(),
             )
             incremental.append(cue)
             if on_event:
                 await on_event(TranscriptEvent(cue, final=False))
 
-        args = [
-            self.settings.whisper_cli, "-m", self.settings.whisper_model,
-            "-f", input_audio, "-mc", "0", "--print-progress",
-            "--output-json-full", "--output-file", prefix,
-        ]
-        args += whisper_language_and_vad_args(self.settings)
         try:
-            await self.runner.run(args, on_line=line)
+            await self.runner.run(self._cli_args(input_audio, prefix), on_line=line)
         except ProcessError:
             # Resume from five seconds before the last stable cue and merge the
             # overlap. This retry remains a single full-model invocation.
             if not incremental:
                 raise
             durable = preserved + incremental
-            resume_at = max(0.0, durable[-1].end - 5.0)
+            resume_at = max(
+                0.0, max(cue.end for cue in durable) - RECOVERY_OVERLAP_SECONDS
+            )
             recovered = self.work_dir / "recovery.wav"
             await self._extract_tail(audio, resume_at, recovered)
             recovery_prefix = self.work_dir / "whisper-recovery"
-            recovery_args = list(args)
-            recovery_args[recovery_args.index("-f") + 1] = recovered
-            recovery_args[recovery_args.index("--output-file") + 1] = recovery_prefix
 
             async def recovery_line(stream: str, value: str) -> None:
                 self.db.log("whisper-cli-recovery", stream, value)
@@ -254,7 +310,7 @@ class WhisperCliTranscriber(Transcriber):
                     record_vad(value, offset=resume_at)
 
             await self.runner.run(
-                recovery_args,
+                self._cli_args(recovered, recovery_prefix),
                 on_line=recovery_line,
             )
             recovered_cues = self._load_json(
@@ -280,6 +336,16 @@ class WhisperCliTranscriber(Transcriber):
                 await on_event(TranscriptEvent(cue, final=True))
         return cues
 
+    def _cli_args(self, input_audio: Path, prefix: Path) -> list[str | Path]:
+        """Build one whisper-cli invocation for an input file and output prefix."""
+        args: list[str | Path] = [
+            self.settings.whisper_cli, "-m", self.settings.whisper_model,
+            "-f", input_audio, "-mc", "0", "--print-progress",
+            "--output-json-full", "--output-file", prefix,
+        ]
+        args += whisper_language_and_vad_args(self.settings)
+        return args
+
     async def _extract_tail(self, audio: Path, start: float, destination: Path) -> None:
         """Write 16 kHz mono PCM covering ``audio`` from ``start`` onwards."""
         await self.runner.run([
@@ -293,7 +359,10 @@ class WhisperCliTranscriber(Transcriber):
         return prefix.with_suffix(".json")
 
     def _load_json(self, prefix: Path, *, offset: float = 0.0, ordinal_offset: int = 0) -> list[Cue]:
-        with self._json_path(prefix).open(encoding="utf-8") as fh:
+        # whisper.cpp writes byte-level token text verbatim, so a multi-byte
+        # character split across tokens can leave invalid UTF-8 in the file.
+        # Every other read of external-tool output here is equally lenient.
+        with self._json_path(prefix).open(encoding="utf-8", errors="replace") as fh:
             data = json.load(fh)
         language = detected_source_language(data)
         if language:
@@ -339,10 +408,24 @@ class WhisperServerTranscriber:
         self.process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
+
         async def drain(reader: asyncio.StreamReader, stream: str) -> None:
-            while raw := await reader.readline():
-                self.db.log("whisper-server", stream, raw.decode(errors="replace"))
+            # StreamReader.readline() raises once a line exceeds its 64 KiB
+            # limit, which would silently kill this drainer and let the
+            # undrained pipe block whisper-server. Frame the lines ourselves.
+            pending = bytearray()
+            while raw := await reader.read(_PIPE_CHUNK_BYTES):
+                pending.extend(raw)
+                while (newline := pending.find(b"\n")) >= 0:
+                    line = bytes(pending[:newline])
+                    del pending[:newline + 1]
+                    self.db.log("whisper-server", stream, line.decode(errors="replace"))
+            if pending:
+                self.db.log(
+                    "whisper-server", stream, bytes(pending).decode(errors="replace")
+                )
         self._log_tasks = [
             asyncio.create_task(drain(self.process.stdout, "stdout")),
             asyncio.create_task(drain(self.process.stderr, "stderr")),
@@ -429,12 +512,9 @@ class WhisperServerTranscriber:
         return json.loads(body)
 
     async def close(self) -> None:
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), 5)
-            except TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        if self.process is not None:
+            # Share the project's single escalation policy so any helper
+            # whisper-server spawned dies with it and stops holding the port.
+            await terminate_process(self.process)
         if self._log_tasks:
             await asyncio.gather(*self._log_tasks, return_exceptions=True)

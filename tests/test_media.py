@@ -3,6 +3,7 @@ from pathlib import Path
 
 from yakiflow.config import Settings
 from yakiflow.database import JobDatabase
+from yakiflow import media
 from yakiflow.media import MediaAcquirer, MediaSource, _drain_stream_chunks
 from yakiflow.process import ProcessResult
 
@@ -107,10 +108,10 @@ def test_stream_download_ignores_files_from_previous_jobs(
             Path(values[-1]).write_bytes(b"wav")
             return ProcessResult(tuple(values), 0, "", "")
 
-    async def no_complete_chunk(_self, _audio: Path) -> float:
-        return 0
+    def no_complete_chunk(_audio: Path) -> float:
+        return 0.0
 
-    monkeypatch.setattr(MediaAcquirer, "_duration", no_complete_chunk)
+    monkeypatch.setattr(media, "pcm_audio_duration", no_complete_chunk)
     runner = StreamRunner()
     db = JobDatabase(tmp_path / "db.sqlite3")
     artifact = asyncio.run(

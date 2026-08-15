@@ -281,3 +281,17 @@ def test_whisper_server_rejects_a_listener_without_its_request_path(
     with pytest.raises(RuntimeError, match="unexpected listener"):
         asyncio.run(server._wait_until_ready(timeout=1))
     db.close()
+
+
+def test_overlap_deduplication_covers_the_whole_recovery_window() -> None:
+    """Dense speech packs more cues into the 5 s overlap than a fixed count."""
+    durable = [
+        Cue(str(index + 1), index * 0.4, index * 0.4 + 0.4, f"line {index}")
+        for index in range(30)
+    ]
+    resume_at = durable[-1].end - 5.0
+    repeated = [cue for cue in durable if cue.end > resume_at]
+    assert len(repeated) > 8
+    merged = merge_overlap(durable, repeated)
+    assert len(merged) == len(durable)
+    assert [cue.source for cue in merged] == [cue.source for cue in durable]

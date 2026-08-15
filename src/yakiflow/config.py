@@ -146,12 +146,25 @@ def _read_toml(
     return data, profiles
 
 
-def _clean(values: Mapping[str, Any]) -> dict[str, Any]:
+def _clean(
+    values: Mapping[str, Any], *, source: str | None = None
+) -> dict[str, Any]:
+    """Normalize one settings mapping.
+
+    ``source`` names a configuration file. Naming one makes unknown keys an
+    error, so a misspelled setting is reported instead of silently leaving the
+    default in place; mappings rebuilt from a saved job stay permissive so an
+    older work directory can still be resumed.
+    """
     valid = {f.name for f in fields(Settings)}
     result: dict[str, Any] = {}
     for key, value in values.items():
         key = key.replace("-", "_")
-        if key not in valid or value is None:
+        if key not in valid:
+            if source is not None:
+                raise ValueError(f"unknown setting {key!r} in {source}")
+            continue
+        if value is None:
             continue
         if key in PATH_FIELDS:
             result[key] = Path(value).expanduser()
@@ -193,12 +206,24 @@ def load_settings(
         and profile not in project_profiles
     ):
         raise ValueError(f"unknown profile {profile!r}")
+    # Precedence, lowest first: user base, project base, user profile, project
+    # profile, explicit CLI values.
     merged = asdict(Settings())
-    merged.update(_clean(user_base))
-    merged.update(_clean(project_base))
+    merged.update(_clean(user_base, source=str(user_file)))
+    merged.update(_clean(project_base, source=str(project_file)))
     if profile is not None:
-        merged.update(_clean(user_profiles.get(profile, {})))
-        merged.update(_clean(project_profiles.get(profile, {})))
+        merged.update(
+            _clean(
+                user_profiles.get(profile, {}),
+                source=f"profile {profile!r} in {user_file}",
+            )
+        )
+        merged.update(
+            _clean(
+                project_profiles.get(profile, {}),
+                source=f"profile {profile!r} in {project_file}",
+            )
+        )
     merged.update(_clean(cli or {}))
     return Settings(**merged).resolved()
 

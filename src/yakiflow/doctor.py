@@ -76,7 +76,16 @@ def run_doctor(settings: Settings) -> list[Check]:
             continue
         auth_command = [name, "login", "status"] if name == "codex" else [name, "auth", "status"]
         try:
-            result = subprocess.run(auth_command, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                auth_command,
+                capture_output=True,
+                text=True,
+                # The locale encoding would raise on a non-ASCII account name
+                # under LC_ALL=C and abort every remaining check.
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
             detail = (result.stdout or result.stderr).strip().splitlines()
             checks.append(Check(f"{name} auth", result.returncode == 0, detail[-1] if detail else f"exit {result.returncode}"))
         except (OSError, subprocess.SubprocessError) as exc:

@@ -20,6 +20,7 @@ ProgressCallback = Callable[[int, int], Awaitable[None]]
 RetryCallback = Callable[[str], Awaitable[None]]
 AgentTraceCallback = Callable[[AgentTraceEvent], Awaitable[None] | None]
 _AGENT_OUTPUT_DETAIL_LIMIT = 100_000
+_MAX_RETRY_BACKOFF_SECONDS = 8.0
 
 
 @dataclass(slots=True)
@@ -675,14 +676,21 @@ class TranslationPipeline:
                     translate_only=translate_only,
                 )
             async with self._write_lock:
-                current = self.db.cues_by_id([cue.id for cue in batch])
+                # An authoritative transcript can retire cues while this batch
+                # is still in flight; writing them back would resurrect the
+                # provisional text at its stale timing.
+                current = self.db.cues_by_id(
+                    [cue.id for cue in batch], stable_only=True
+                )
+                live = [cue for cue in batch if cue.id in current]
                 updated = self._apply(
-                    batch,
+                    live,
                     result,
                     current,
                     allow_source_edits=not translate_only,
                 )
-                self.db.upsert_cues(updated)
+                if updated:
+                    self.db.upsert_cues(updated)
                 if on_batch:
                     await on_batch(self.db.list_cues(stable_only=True))
                 completed += 1
@@ -841,7 +849,10 @@ class TranslationPipeline:
                         f"retrying {attempt + 1}/{attempts}"
                     )
                 delay = self.settings.agent_retry_delay_seconds
-                await asyncio.sleep(min(delay * 2 ** (attempt - 1), 8))
+                # Never wait less than the configured delay: someone who sets a
+                # long delay is backing off a rate-limited backend on purpose.
+                cap = max(_MAX_RETRY_BACKOFF_SECONDS, delay)
+                await asyncio.sleep(min(delay * 2 ** (attempt - 1), cap))
         raise RuntimeError("unreachable Agent retry state")
 
     @staticmethod

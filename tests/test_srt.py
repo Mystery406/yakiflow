@@ -1,3 +1,4 @@
+import stat
 from pathlib import Path
 
 from yakiflow.models import Cue
@@ -8,11 +9,22 @@ from yakiflow.srt import (
     render_srt,
     renumbered_srt,
     srt_problems,
+    write_srt_atomic,
 )
 
 
 def _srt(*blocks: str) -> str:
     return "\n\n".join(blocks) + "\n"
+
+
+def test_published_subtitles_are_readable_by_other_users(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.txt"
+    reference.write_text("x")
+    published = tmp_path / "movie.srt"
+    write_srt_atomic(published, [Cue("1", 0.0, 1.0, "hello")], "source")
+    assert stat.S_IMODE(published.stat().st_mode) == stat.S_IMODE(
+        reference.stat().st_mode
+    )
 
 
 def test_timestamp_rounding_and_bilingual_order() -> None:
@@ -115,3 +127,20 @@ def test_alignment_problems_detects_a_merge_applied_to_only_one_artifact() -> No
         problem.kind
         for problem in alignment_problems([("a.srt", merged), ("b.srt", retimed)])
     ] == ["artifact_mismatch"]
+
+
+def test_preview_reads_a_file_an_agent_edit_left_broken(tmp_path: Path) -> None:
+    """The live preview must survive the defects publish-time validation reports."""
+    from yakiflow.srt_preview import read_srt
+
+    broken = tmp_path / "staged.srt"
+    broken.write_text(
+        _srt(
+            "1\n00:00:05,000 --> 00:00:03,000\nends before it starts",
+            "1\n00:00:06,000 --> 00:00:07,000\nduplicate number",
+        ),
+        encoding="utf-8",
+    )
+    cues = read_srt(broken)
+    assert [cue.id for cue in cues] == ["1", "2"]
+    assert all(cue.end >= cue.start for cue in cues)

@@ -10,6 +10,23 @@ from typing import Iterable, Sequence
 from .models import Cue, OutputMode
 
 
+def _probe_default_file_mode() -> int:
+    """Read the process umask once, at import, on the main thread.
+
+    ``os.umask`` can only be read by setting it, so calling this concurrently
+    would leave the process umask at 0 for whichever thread lost the race.
+    """
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+# ``tempfile.mkstemp`` deliberately creates private 0600 files and ``os.replace``
+# keeps that mode, so an atomically written artifact would otherwise be
+# unreadable by the media players, subtitle servers, and other users who need it.
+DEFAULT_FILE_MODE = _probe_default_file_mode()
+
+
 _LANGUAGE_COMPONENT_RE = re.compile(r"[^a-z0-9-]+")
 _TIMING_RE = re.compile(
     r"^(?P<start>\d{2,}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*"
@@ -187,6 +204,7 @@ def write_srt_atomic(path: Path, cues: Iterable[Cue], mode: OutputMode | str) ->
             fh.write(render_srt(cues, mode))
             fh.flush()
             os.fsync(fh.fileno())
+        os.chmod(temp_name, DEFAULT_FILE_MODE)
         os.replace(temp_name, path)
     finally:
         if os.path.exists(temp_name):

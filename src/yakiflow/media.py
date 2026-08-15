@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
+import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from time import time
+from typing import Awaitable, Callable, Iterable
 from urllib.parse import urlparse
 
 from .config import Settings
@@ -38,7 +40,40 @@ class MediaArtifact:
 
 ChunkCallback = Callable[[Path, float], Awaitable[None]]
 ProgressCallback = Callable[[float], Awaitable[None]]
+WarningCallback = Callable[[str], Awaitable[None]]
 DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?:~\s*)?(?P<percent>\d+(?:\.\d+)?)%")
+
+
+def _sizes(paths: Iterable[Path]) -> list[tuple[Path, int]]:
+    """Pair each existing non-empty file with its size, tolerating races.
+
+    yt-dlp renames and removes its fragment files while the directory is being
+    polled, so a path can vanish between the glob and the ``stat``.
+    """
+    sized: list[tuple[Path, int]] = []
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > 0 and path.is_file():
+            sized.append((path, size))
+    return sized
+
+
+def pcm_audio_duration(audio: Path) -> float | None:
+    """Return the playable duration of a PCM WAV file, or ``None`` when unusable.
+
+    Streaming snapshots and interrupted extractions can leave a truncated or
+    zero-rate header behind, so every caller wants the guarded answer.
+    """
+    try:
+        with wave.open(str(audio), "rb") as source:
+            rate = source.getframerate()
+            duration = source.getnframes() / rate if rate > 0 else 0.0
+    except (EOFError, OSError, wave.Error):
+        return None
+    return duration if duration > 0 else None
 
 
 async def _drain_stream_chunks(
@@ -63,12 +98,14 @@ class MediaAcquirer:
         db: JobDatabase,
         runner: CommandRunner | None = None,
         on_progress: ProgressCallback | None = None,
+        on_warning: WarningCallback | None = None,
     ):
         self.settings = settings
         self.work_dir = work_dir
         self.db = db
         self.runner = runner or CommandRunner()
         self.on_progress = on_progress
+        self.on_warning = on_warning
 
     async def _progress(self, fraction: float) -> None:
         if self.on_progress:
@@ -113,12 +150,20 @@ class MediaAcquirer:
         args.extend(self.settings.yt_dlp_options)
         args.append(source.value)
 
+        started = time()
         result = await self.runner.run(args, on_line=self._download_log)
         candidates = [Path(line.strip()) for line in result.stdout.splitlines() if line.strip()]
         for candidate in reversed(candidates):
             if candidate.is_file():
                 return candidate.resolve()
-        files = [p for p in target_dir.iterdir() if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
+        # A configured download_dir is shared with the user's own downloads, so
+        # only files this run wrote may stand in for the printed path.
+        files = [
+            p for p in target_dir.iterdir()
+            if p.is_file()
+            and not p.name.endswith((".part", ".ytdl"))
+            and p.stat().st_mtime >= started - 1
+        ]
         if not files:
             raise RuntimeError("yt-dlp completed without producing a media file")
         return max(files, key=lambda p: p.stat().st_mtime).resolve()
@@ -158,23 +203,24 @@ class MediaAcquirer:
         args.append(source.value)
         task = asyncio.create_task(self.runner.run(args, on_line=self._download_log))
         result = None
+        interrupted = False
         emitted_duration = 0.0
         snapshot_index = 0
         try:
             while not task.done():
                 await asyncio.sleep(1)
-                files = [
-                    p for p in target_dir.glob(f"{download_stem}.*")
-                    if p.is_file() and p.stat().st_size > 0
-                ]
-                if not files or snapshot_index and snapshot_index % self.settings.stream_chunk_seconds:
+                sized = _sizes(target_dir.glob(f"{download_stem}.*"))
+                if not sized or snapshot_index and snapshot_index % self.settings.stream_chunk_seconds:
                     snapshot_index += 1
                     continue
-                growing = max(files, key=lambda p: p.stat().st_size)
+                growing = max(sized, key=lambda item: item[1])[0]
                 snapshot = self.work_dir / "stream-snapshot.wav"
                 try:
                     await self.extract_audio(growing, snapshot)
-                    duration = await self._duration(snapshot)
+                    duration = await asyncio.to_thread(pcm_audio_duration, snapshot)
+                    if duration is None:
+                        snapshot_index += 1
+                        continue
                     emitted_duration = await _drain_stream_chunks(
                         snapshot,
                         duration,
@@ -183,10 +229,16 @@ class MediaAcquirer:
                         on_chunk,
                     )
                 except Exception as exc:
+                    # A snapshot that cannot be read yet is expected, but a
+                    # failing transcriber or Agent would otherwise repeat
+                    # silently for the whole download.
                     self.db.log("stream-extract", "stderr", str(exc))
+                    if self.on_warning:
+                        await self.on_warning(f"stream chunk skipped: {exc}")
                 snapshot_index += 1
             result = await task
         except asyncio.CancelledError:
+            interrupted = True
             task.cancel()
             try:
                 await task
@@ -209,28 +261,23 @@ class MediaAcquirer:
                 p for p in target_dir.glob(f"{download_stem}.*")
                 if p.is_file() and not p.name.endswith((".part", ".ytdl"))
             ]
-        if not files:
+        sized = _sizes(files) if files else []
+        if not sized:
             # A graceful first interrupt may leave a useful partial file.
-            files = [
-                p for p in target_dir.glob(f"{download_stem}.*")
-                if p.is_file() and p.stat().st_size > 0
-            ]
-        if not files:
+            sized = _sizes(target_dir.glob(f"{download_stem}.*"))
+        if not sized:
+            if interrupted:
+                # Nothing had been written when the interrupt arrived. Report
+                # the interruption so the job is preserved as resumable rather
+                # than recorded as a hard failure.
+                raise asyncio.CancelledError
             raise RuntimeError("stream ended without usable media")
-        media_path = max(files, key=lambda p: p.stat().st_size)
+        media_path = max(sized, key=lambda item: item[1])[0]
         audio_path = self.work_dir / "reference.wav"
         await self.extract_audio(media_path, audio_path)
         self.db.add_artifact("reference_audio", audio_path)
         self.db.add_artifact("source_media", media_path)
         return MediaArtifact(source, audio_path, media_path, self.settings.download_dir is not None)
-
-    async def _duration(self, audio: Path) -> float:
-        # Wave is deterministic and avoids an additional ffprobe dependency.
-        import wave
-        def read() -> float:
-            with wave.open(str(audio), "rb") as wav:
-                return wav.getnframes() / wav.getframerate()
-        return await asyncio.to_thread(read)
 
 
 def default_output_base(artifact: MediaArtifact, settings: Settings, work_dir: Path) -> Path:
