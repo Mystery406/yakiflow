@@ -48,6 +48,7 @@ from .srt import (
     renumbered_srt,
     srt_problems,
     write_srt_atomic,
+    write_text_atomic,
 )
 from .transcription import (
     WhisperCliTranscriber,
@@ -198,6 +199,7 @@ class YakiFlowJob:
         self._translation_batches_completed = 0
         self._translation_batches_total = 0
         self._artifact: MediaArtifact | None = None
+        self._partial_write_lock = asyncio.Lock()
 
     def _staged_context_files(self) -> tuple[Path, ...]:
         context_dir = self.work_dir / "context"
@@ -778,7 +780,11 @@ class YakiFlowJob:
         # write_srt_atomic renders every cue and fsyncs, and this runs once per
         # Whisper line. Keeping it off the event loop stops it from stalling the
         # subprocess pipe readers, the TUI, and the concurrent Agent batches.
-        await asyncio.to_thread(write_srt_atomic, path, list(cues), mode)
+        # The lock restores what running inline used to guarantee: the Whisper
+        # writer and the draft-batch writer share this path, and an older
+        # snapshot must not be the one that lands last.
+        async with self._partial_write_lock:
+            await asyncio.to_thread(write_srt_atomic, path, list(cues), mode)
 
     async def _translation_stage(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Cue]:
         self.db.set_status(JobStatus.TRANSLATING)
@@ -937,15 +943,18 @@ class YakiFlowJob:
 
         vad_intervals = self.db.get_checkpoint("whisper_vad_intervals", [])
         cues = adjust_cue_starts_for_long_vad_silences(cues, vad_intervals)
-        self.alignment_result = await backend.align(
-            artifact.audio_path,
-            cues,
-            vad_intervals=vad_intervals,
-            on_warning=lambda message: self.emit("warning", message),
-            on_progress=alignment_progress,
-            on_model_failure=self.alignment_model_failure_listener,
-        )
         try:
+            # The VAD backend fills the same cache the refiner reads, so the
+            # release has to cover both: a failure inside align() would
+            # otherwise strand the whole RMS envelope for the process lifetime.
+            self.alignment_result = await backend.align(
+                artifact.audio_path,
+                cues,
+                vad_intervals=vad_intervals,
+                on_warning=lambda message: self.emit("warning", message),
+                on_progress=alignment_progress,
+                on_model_failure=self.alignment_model_failure_listener,
+            )
             self.alignment_result.cues = await PcmVolumeStartRefiner().refine(
                 artifact.audio_path,
                 self.alignment_result.cues,
@@ -1105,34 +1114,64 @@ class YakiFlowJob:
         """Refuse to publish subtitle files the review left structurally broken.
 
         Cue numbering is repaired in place because it is purely mechanical.
-        Everything else is only reported when the pipeline's own rendering of
-        the same cues is free of that defect, so a quirk YakiFlow produced
-        itself never fails a job at the finish line.
+        Structural defects are only reported when the pipeline's own rendering
+        of the same cues is free of that defect, so a quirk YakiFlow produced
+        itself never fails a job at the finish line. A file that lost its cues
+        or its encoding is always refused: publishing it would overwrite the
+        user's subtitles with something worse than the pre-review text.
         """
         cues = self.db.list_cues(stable_only=True)
         if not cues:
             return
-        tolerated = {
-            problem.kind
+        rendered = [
+            render_srt(cues, mode)
             for mode in output_modes(self.settings.output_mode)
-            for problem in srt_problems(render_srt(cues, mode))
+        ]
+        tolerated = {
+            problem.kind for text in rendered for problem in srt_problems(text)
         }
+        if alignment_problems([
+            (str(index), parse_srt_blocks(text)[0])
+            for index, text in enumerate(rendered)
+        ]):
+            # The pipeline's own artifacts already disagree, so the review
+            # neither caused this nor can fix it.
+            tolerated.add("artifact_mismatch")
         problems: list[str] = []
         artifacts: list[tuple[str, Sequence[SrtBlock]]] = []
         for staged in self.outputs:
-            text = staged.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = staged.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                # Decoding leniently here and writing the result back below
+                # would bake the replacement characters into the published
+                # subtitle, so report the encoding instead of destroying it.
+                problems.append(
+                    f"{staged.name}: is not valid UTF-8 at byte {exc.start}"
+                )
+                continue
             repaired = renumbered_srt(text)
             if repaired is not None:
-                staged.write_text(repaired, encoding="utf-8", newline="\n")
+                write_text_atomic(staged, repaired)
                 text = repaired
             blocks, _unparsed = parse_srt_blocks(text)
+            if not blocks:
+                # An emptied file passes every structural check below, and
+                # publishing it would overwrite the user's subtitles with
+                # nothing.
+                problems.append(f"{staged.name}: contains no subtitle cues")
+                continue
             artifacts.append((staged.name, blocks))
             problems.extend(
                 f"{staged.name}: {problem.message}"
                 for problem in srt_problems(text)
                 if problem.kind not in tolerated
             )
-        problems.extend(problem.message for problem in alignment_problems(artifacts))
+        problems.extend(
+            problem.message
+            for problem in alignment_problems(artifacts)
+            if problem.kind not in tolerated
+        )
         if problems:
             detail = "\n".join(f"  - {problem}" for problem in problems)
             raise RuntimeError(
@@ -1151,18 +1190,23 @@ class YakiFlowJob:
         destinations: list[Path] = []
         destination_base = self._output_destination_base
         if destination_base is not None:
-            for staged in self.outputs:
+            staged_outputs = list(self.outputs)
+            for index, staged in enumerate(staged_outputs):
                 destination = destination_base.parent / staged.name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if staged.resolve() != destination.resolve():
                     shutil.move(str(staged), str(destination))
                 destinations.append(destination)
+                # A moved staged path no longer exists. Record where each file
+                # went as it moves, so a failure part-way through — or later,
+                # while merging memory — still resumes instead of reporting
+                # "reviewing job is missing staged subtitle files".
+                self.db.checkpoint(
+                    "review_outputs",
+                    [str(path) for path in destinations]
+                    + [str(path) for path in staged_outputs[index + 1:]],
+                )
             self.outputs = destinations
-            # The staged paths recorded at publish time no longer exist. Record
-            # where the files went before anything else can fail, so a job that
-            # still has to merge memory stays restorable instead of resuming
-            # into "reviewing job is missing staged subtitle files".
-            self.db.checkpoint("review_outputs", [str(path) for path in destinations])
             # Remove the corresponding draft snapshot from the configured
             # output directory once the finished subtitle has been published.
             draft_name = f"{destination_base.name}{_DRAFT_PARTIAL_SUFFIX}"

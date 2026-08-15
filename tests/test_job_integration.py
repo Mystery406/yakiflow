@@ -881,6 +881,71 @@ def test_finalize_tolerates_timing_defects_the_pipeline_itself_produced(
     job.close()
 
 
+def test_finalize_refuses_a_staged_file_the_review_emptied(tmp_path: Path) -> None:
+    job = _review_job(
+        tmp_path,
+        [Cue("1", 0, 1, "one", "T:one"), Cue("2", 1, 2, "two", "T:two")],
+    )
+    staged = job.work_dir / "movie.en-zh-cn.srt"
+    staged.write_text("", encoding="utf-8")
+    job.outputs = [staged]
+    destination = tmp_path / "out" / staged.name
+    destination.parent.mkdir(parents=True)
+    destination.write_text("published subtitles\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="contains no subtitle cues"):
+        job.finalize_artifacts()
+
+    assert destination.read_text(encoding="utf-8") == "published subtitles\n"
+    job.close()
+
+
+def test_finalize_refuses_a_staged_file_saved_in_another_encoding(
+    tmp_path: Path,
+) -> None:
+    job = _review_job(tmp_path, [Cue("1", 0, 1, "one", "T:字幕")])
+    staged = job.work_dir / "movie.en-zh-cn.srt"
+    original = "1\n00:00:00,000 --> 00:00:01,000\nT:字幕\n".encode("gbk")
+    staged.write_bytes(original)
+    job.outputs = [staged]
+
+    with pytest.raises(RuntimeError, match="not valid UTF-8"):
+        job.finalize_artifacts()
+
+    # Reading leniently and writing the result back would have replaced the
+    # reviewed text with U+FFFD before anyone could re-save it.
+    assert staged.read_bytes() == original
+    job.close()
+
+
+def test_finalize_tolerates_artifact_drift_the_pipeline_itself_produced(
+    tmp_path: Path,
+) -> None:
+    # A cue Whisper left without source text renders as an empty block, which
+    # only the source-language artifact drops. The review did not cause that.
+    job = _review_job(
+        tmp_path,
+        [Cue("1", 0, 1, "one", "T:one"), Cue("2", 1, 2, "", "T:two")],
+        output_mode="all",
+    )
+    names = ("movie.source.srt", "movie.translated.srt", "movie.en-zh-cn.srt")
+    staged = [job.work_dir / name for name in names]
+    staged[0].write_text("1\n00:00:00,000 --> 00:00:01,000\none\n", encoding="utf-8")
+    for path in staged[1:]:
+        path.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nT:one\n"
+            "\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nT:two\n",
+            encoding="utf-8",
+        )
+    job.outputs = staged
+
+    published = job.finalize_artifacts()
+
+    assert published == [tmp_path / "out" / name for name in names]
+    job.close()
+
+
 def test_overlapping_translation_does_not_add_an_empty_progress_stage(
     tmp_path: Path,
 ) -> None:

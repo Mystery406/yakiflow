@@ -119,8 +119,9 @@ def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> No
     work_dir = tmp_path / "preserved job"
 
     class FakeJob:
-        def __init__(self) -> None:
+        def __init__(self, *, is_finished: bool = False) -> None:
             self.work_dir = work_dir
+            self.is_finished = is_finished
             self.settings = Settings(
                 source_language="en",
                 target_language="zh",
@@ -143,6 +144,17 @@ def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> No
     assert capsys.readouterr().err == (
         f"Job preserved. Resume with: yakiflow resume '{work_dir}'\n"
     )
+
+    monkeypatch.setattr(
+        cli.YakiFlowJob,
+        "from_workdir",
+        lambda *args, **kwargs: FakeJob(is_finished=True),
+    )
+
+    # A finished job refuses to run again, so repeating its resume command
+    # could only repeat the same failure.
+    assert cli.main(["resume", str(work_dir)]) == 2
+    assert capsys.readouterr().err == ""
 
 
 def test_memory_conflict_agent_retries_when_destination_changes_again(

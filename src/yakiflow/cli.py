@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .config import default_model_path, load_settings, validate_run_settings
+from .config import load_settings, validate_run_settings
 from .doctor import run_doctor
 from .job import YakiFlowJob
 from .models import JobEvent
@@ -24,6 +24,20 @@ from .memory import MemoryDestinationConflict
 
 def _resume_command(work_dir: Path) -> str:
     return shlex.join(("yakiflow", "resume", str(work_dir)))
+
+
+def _print_preserved(job: YakiFlowJob) -> None:
+    """Point at the resume command, unless there is nothing left to resume.
+
+    A job that already published and was reviewed refuses to run again, so
+    offering its resume command would only repeat the same failure.
+    """
+    if job.is_finished:
+        return
+    print(
+        f"Job preserved. Resume with: {_resume_command(job.work_dir)}",
+        file=sys.stderr,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -197,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             def progress(done: int, total: int | None) -> None:
                 suffix = f"/{total}" if total else ""
                 print(f"\rDownloading {done}{suffix} bytes", end="", file=sys.stderr)
-            path = fetch_model(settings.whisper_model or default_model_path(), progress)
+            path = fetch_model(settings.whisper_model, progress)
             print(f"\n{path}")
             return 0
         if args.command == "doctor":
@@ -220,20 +234,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             succeeded = tui.run(job)
             if not succeeded:
-                print(
-                    f"Job preserved. Resume with: {_resume_command(job.work_dir)}",
-                    file=sys.stderr,
-                )
+                _print_preserved(job)
                 return 2
             return asyncio.run(_complete_job(job, job.outputs))
         return asyncio.run(_run_job(job))
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         print(f"yakiflow: {exc}", file=sys.stderr)
-        if job is not None and not job.is_finished:
-            print(
-                f"Job preserved. Resume with: {_resume_command(job.work_dir)}",
-                file=sys.stderr,
-            )
+        if job is not None:
+            _print_preserved(job)
         return 2
 
 

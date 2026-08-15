@@ -112,12 +112,22 @@ async def start_agent_file_display(
             )
         # An optional preview must never turn into a failed review: a missing
         # viewer here would otherwise abort before the interactive Agent runs
-        # and before the staged subtitles are finalized.
+        # and before the staged subtitles are finalized. Report it, though — a
+        # silently unusable review_open_command leaves nothing to diagnose.
         try:
             command = review_open_argv(command_text, file_path, work_dir)
-            await asyncio.create_subprocess_exec(*command, cwd=work_dir)
-        except (OSError, IndexError, ValueError):
-            pass
+            await asyncio.create_subprocess_exec(
+                *command,
+                cwd=work_dir,
+                # The viewer shares the Agent's terminal otherwise, where its
+                # own output overwrites the rendering, and the user's Ctrl-C
+                # would reach it instead of only the Agent.
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except (OSError, IndexError, ValueError) as exc:
+            print(f"yakiflow: review_open_command failed: {exc}", file=sys.stderr)
         if settings.review_display_mode == "open":
             return AgentFileDisplay()
 

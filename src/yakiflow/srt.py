@@ -28,9 +28,12 @@ DEFAULT_FILE_MODE = _probe_default_file_mode()
 
 
 _LANGUAGE_COMPONENT_RE = re.compile(r"[^a-z0-9-]+")
+# Trailing text after the end timestamp is legal SRT: players carry display
+# coordinates (``X1:40 X2:600 Y1:20 Y2:50``) there. Rejecting it would drop the
+# cue from the preview and refuse to publish a file YakiFlow never wrote.
 _TIMING_RE = re.compile(
-    r"^(?P<start>\d{2,}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*"
-    r"(?P<end>\d{2,}:\d{2}:\d{2}[,.]\d{3})\s*$"
+    r"^(?P<start>\d+:\d{2}:\d{2}[,.]\d{3})\s*-->\s*"
+    r"(?P<end>\d+:\d{2}:\d{2}[,.]\d{3})(?:\s.*)?$"
 )
 
 
@@ -196,12 +199,17 @@ def render_srt(cues: Iterable[Cue], mode: OutputMode | str = OutputMode.BILINGUA
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
-def write_srt_atomic(path: Path, cues: Iterable[Cue], mode: OutputMode | str) -> None:
+def write_text_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` only once the new content is durably on disk.
+
+    Every subtitle artifact is the sole copy of work that cannot be regenerated
+    — a reviewed file most of all — so no writer may truncate one in place.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(render_srt(cues, mode))
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(temp_name, DEFAULT_FILE_MODE)
@@ -209,6 +217,10 @@ def write_srt_atomic(path: Path, cues: Iterable[Cue], mode: OutputMode | str) ->
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def write_srt_atomic(path: Path, cues: Iterable[Cue], mode: OutputMode | str) -> None:
+    write_text_atomic(path, render_srt(cues, mode))
 
 
 def _language_component(language: str) -> str:

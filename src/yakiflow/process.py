@@ -101,12 +101,15 @@ class CommandRunner:
                 try:
                     process.stdin.write(stdin)
                     await process.stdin.drain()
-                    process.stdin.close()
                 except (BrokenPipeError, ConnectionResetError):
                     # The child rejected the input and exited. Keep draining so
                     # its own diagnostic on stderr survives as a ProcessError
                     # instead of being replaced by a bare pipe error.
                     pass
+                finally:
+                    # Close either way: the child still waiting on EOF must get
+                    # it, and the write transport must not outlive this call.
+                    process.stdin.close()
             # A callback failure stops its pipe consumer. Notice that failure
             # while the child is still alive, before the undrained pipe can
             # fill and deadlock the child.

@@ -74,6 +74,16 @@ def test_parse_srt_blocks_reads_windows_line_endings_and_reports_bad_blocks() ->
     assert [problem.kind for problem in problems] == ["unparsable"]
 
 
+def test_parse_srt_blocks_keeps_a_timing_line_carrying_display_coordinates() -> None:
+    text = "1\n00:00:00,000 --> 00:00:01,000 X1:40 X2:600 Y1:20 Y2:50\nhello\n"
+
+    blocks, problems = parse_srt_blocks(text)
+
+    assert [block.text for block in blocks] == [("hello",)]
+    assert (blocks[0].start, blocks[0].end) == (0.0, 1.0)
+    assert problems == []
+
+
 def test_srt_problems_finds_timing_defects() -> None:
     text = _srt(
         "1\n00:00:02,000 --> 00:00:01,000\nbackwards",

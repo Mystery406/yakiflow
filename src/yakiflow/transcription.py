@@ -256,8 +256,8 @@ class WhisperCliTranscriber(Transcriber):
             # VAD is computed before decoding. Persist it incrementally so an
             # interrupted Whisper run can resume without losing the timeline,
             # but a committed write per line means one commit per speech span;
-            # a short interval bounds that, and the end of ``transcribe``
-            # writes the final list either way.
+            # a short interval bounds that, and ``transcribe`` flushes the final
+            # list either way.
             now = monotonic()
             if now - last_vad_checkpoint < _VAD_CHECKPOINT_INTERVAL_SECONDS:
                 return
@@ -330,7 +330,12 @@ class WhisperCliTranscriber(Transcriber):
                 else incremental
             )
             cues = preserved + completed
-        self.db.checkpoint("whisper_vad_intervals", vad_intervals)
+        finally:
+            # whisper.cpp prints its whole VAD pass in one burst before it
+            # starts decoding, so every throttled write above can fall inside a
+            # single interval. Flush unconditionally: an interrupt during the
+            # much longer decode is exactly what the incremental persist is for.
+            self.db.checkpoint("whisper_vad_intervals", vad_intervals)
         for cue in cues:
             if on_event:
                 await on_event(TranscriptEvent(cue, final=True))

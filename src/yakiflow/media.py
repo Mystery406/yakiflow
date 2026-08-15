@@ -6,6 +6,7 @@ import uuid
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from time import time
 from typing import Awaitable, Callable, Iterable
 from urllib.parse import urlparse
@@ -53,11 +54,11 @@ def _sizes(paths: Iterable[Path]) -> list[tuple[Path, int]]:
     sized: list[tuple[Path, int]] = []
     for path in paths:
         try:
-            size = path.stat().st_size
+            info = path.stat()
         except OSError:
             continue
-        if size > 0 and path.is_file():
-            sized.append((path, size))
+        if info.st_size > 0 and S_ISREG(info.st_mode):
+            sized.append((path, info.st_size))
     return sized
 
 
@@ -157,16 +158,21 @@ class MediaAcquirer:
             if candidate.is_file():
                 return candidate.resolve()
         # A configured download_dir is shared with the user's own downloads, so
-        # only files this run wrote may stand in for the printed path.
-        files = [
-            p for p in target_dir.iterdir()
-            if p.is_file()
-            and not p.name.endswith((".part", ".ytdl"))
-            and p.stat().st_mtime >= started - 1
-        ]
+        # only files this run wrote may stand in for the printed path. Stat once
+        # and tolerate a vanishing entry: the directory is not ours alone.
+        files: list[tuple[Path, float]] = []
+        for path in target_dir.iterdir():
+            if path.name.endswith((".part", ".ytdl")):
+                continue
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if S_ISREG(info.st_mode) and info.st_mtime >= started - 1:
+                files.append((path, info.st_mtime))
         if not files:
             raise RuntimeError("yt-dlp completed without producing a media file")
-        return max(files, key=lambda p: p.stat().st_mtime).resolve()
+        return max(files, key=lambda item: item[1])[0].resolve()
 
     async def extract_audio(self, media_path: Path, output: Path) -> None:
         args = [self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
@@ -219,8 +225,12 @@ class MediaAcquirer:
                     await self.extract_audio(growing, snapshot)
                     duration = await asyncio.to_thread(pcm_audio_duration, snapshot)
                     if duration is None:
-                        snapshot_index += 1
-                        continue
+                        # Route this through the handler below rather than
+                        # skipping quietly: a snapshot that never becomes
+                        # readable produces no chunks for the whole download.
+                        raise ValueError(
+                            f"{snapshot.name} has no readable PCM duration yet"
+                        )
                     emitted_duration = await _drain_stream_chunks(
                         snapshot,
                         duration,

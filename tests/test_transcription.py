@@ -85,6 +85,38 @@ def test_parse_whisper_vad_segment_uses_original_timeline() -> None:
     assert parse_vad_segment("vad time = 10 ms") is None
 
 
+def test_interrupted_run_keeps_the_whole_vad_timeline(tmp_path: Path) -> None:
+    # whisper.cpp prints its VAD pass in one burst, well inside the checkpoint
+    # interval, and only then decodes for minutes. An interrupt during that
+    # decode must not lose the timeline the incremental persist exists for.
+    class BurstThenInterruptRunner:
+        @staticmethod
+        async def run(args, *, on_line=None, **kwargs):
+            for index in range(3):
+                await on_line(
+                    "stderr",
+                    f"whisper_vad_segments_from_probs: VAD segment {index}: "
+                    f"start = {index * 10}.00, end = {index * 10 + 5}.00",
+                )
+            raise asyncio.CancelledError
+
+    audio = tmp_path / "reference.wav"
+    audio.write_bytes(b"RIFF-fake")
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    settings = Settings(vad_model=tmp_path / "vad.bin")
+    transcriber = WhisperCliTranscriber(
+        settings, tmp_path, db, runner=BurstThenInterruptRunner()
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(transcriber.transcribe(audio))
+
+    assert db.get_checkpoint("whisper_vad_intervals") == [
+        [0.0, 5.0], [10.0, 15.0], [20.0, 25.0]
+    ]
+    db.close()
+
+
 def test_stream_auto_language_is_sent_on_every_chunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bodies: list[bytes] = []
     paths: list[str] = []

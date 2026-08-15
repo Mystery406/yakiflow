@@ -339,10 +339,7 @@ only updated after you approve a proposal.
 The review Agent writes to you in the target language and switches if you write
 in another one. When the target language cannot keep one sentence split the way
 the source was, it may merge those cues, mirroring the merge across every
-configured artifact. Before publishing, YakiFlow re-checks each staged file: cue
-numbering is repaired automatically, while broken timing or artifacts that no
-longer share the same cues are reported instead of published, leaving the job
-resumable.
+configured artifact.
 
 By default YakiFlow uses `tmux` to show a read-only subtitle pane next to the
 Agent when possible. In that pane, press `o` to open the media with the current
