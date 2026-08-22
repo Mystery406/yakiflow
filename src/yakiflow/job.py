@@ -597,16 +597,36 @@ class YakiFlowJob:
         pipeline = self._translation_pipeline()
         partial_path = self._live_partial_path(source)
         completed_chunks = 0
+        translation_tasks: list[asyncio.Task[None]] = []
+        scheduled_translation_ids: set[str] = set()
 
-        async def chunk(snapshot: Path, emitted: float) -> None:
+        async def translate_live(
+            batch: list[Cue],
+            preceding_context: Sequence[Cue],
+            following_context: Sequence[Cue],
+        ) -> None:
+            try:
+                updated = await pipeline.translate_draft(
+                    batch,
+                    lambda all_cues: self._write_partial(partial_path, all_cues),
+                    preceding_context=preceding_context,
+                    following_context=following_context,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # These cues are provisional: the authoritative pass discards
+                # and retranslates them. One failed preview batch must not end a
+                # stream that may still have hours left to run, which is what
+                # the acquisition loop already does with a failing chunk.
+                self.db.log("stream-translate", "stderr", str(exc))
+                await self.emit("warning", f"live translation skipped: {exc}")
+                return
+            translated_ids = {cue.id for cue in batch}
+            await self._emit_agent_cues(cue for cue in updated if cue.id in translated_ids)
+
+        async def chunk(excerpt: Path, start: float) -> None:
             nonlocal completed_chunks
-            start = max(0.0, emitted - self.settings.stream_context_seconds)
-            excerpt = self.work_dir / "stream-chunk.wav"
-            await self.runner.run([
-                self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(start), "-t", str(self.settings.stream_chunk_seconds + self.settings.stream_context_seconds),
-                "-i", snapshot, "-ac", "1", "-ar", "16000", excerpt,
-            ])
             existing_ids = {cue.id for cue in server.cues}
             await server.submit(excerpt, start)
             new_cues = [cue for cue in server.cues if cue.id not in existing_ids]
@@ -615,12 +635,22 @@ class YakiFlowJob:
             await self._write_partial(partial_path, timeline)
             for cue in new_cues:
                 await self.emit("transcript", "Whisper subtitle", cue=cue)
-            pending = [cue for cue in timeline if not cue.translated]
-            if pending:
-                updated = await pipeline.translate_draft(pending)
-                translated_ids = {cue.id for cue in pending}
-                await self._write_partial(partial_path, updated)
-                await self._emit_agent_cues(cue for cue in updated if cue.id in translated_ids)
+            # An Agent round trip runs an order of magnitude longer than the
+            # Whisper call above. Awaiting it here would leave the transcriber
+            # idle until it returned, so let the next chunk start while this
+            # one is still being translated. Finished previews are dropped:
+            # ``translate_live`` reports its own failures, and a stream can run
+            # for hours at one batch per chunk.
+            translation_tasks[:] = [
+                task for task in translation_tasks if not task.done()
+            ]
+            for batch, context, following in self._missing_translation_batches(
+                timeline, excluded_ids=scheduled_translation_ids
+            ):
+                scheduled_translation_ids.update(cue.id for cue in batch)
+                translation_tasks.append(
+                    asyncio.create_task(translate_live(batch, context, following))
+                )
             completed_chunks += 1
             await self._report_progress(
                 "acquire",
@@ -629,10 +659,19 @@ class YakiFlowJob:
             )
             await self.emit("stream", f"updated {partial_path}")
 
+        stream_succeeded = False
         try:
             artifact = await acquirer.acquire_stream(source, chunk)
+            stream_succeeded = True
         finally:
             await server.close()
+            if translation_tasks:
+                if not stream_succeeded:
+                    for task in translation_tasks:
+                        task.cancel()
+                # On success, let the outstanding previews land so the partial
+                # file on disk matches the transcript the stream ended with.
+                await asyncio.gather(*translation_tasks, return_exceptions=True)
         await self._finish_stage("acquire", "stream acquisition complete")
         return artifact
 

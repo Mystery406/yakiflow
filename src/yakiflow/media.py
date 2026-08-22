@@ -7,7 +7,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
-from time import time
+from time import monotonic, time
 from typing import Awaitable, Callable, Iterable
 from urllib.parse import urlparse
 
@@ -39,10 +39,25 @@ class MediaArtifact:
     persistent: bool = False
 
 
+# Receives one ready-to-transcribe excerpt and the original-timeline second it
+# starts at.
 ChunkCallback = Callable[[Path, float], Awaitable[None]]
 ProgressCallback = Callable[[float], Awaitable[None]]
 WarningCallback = Callable[[str], Awaitable[None]]
 DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?:~\s*)?(?P<percent>\d+(?:\.\d+)?)%")
+# How far a decoded tail may fall short of the audio already processed before it
+# counts as a broken extraction rather than rounding.
+TAIL_SHORTFALL_TOLERANCE = 0.25
+STREAM_POLL_SECONDS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class StreamTail:
+    """One decoded PCM window of a growing download, placed on the timeline."""
+
+    path: Path
+    start: float
+    end: float
 
 
 def _sizes(paths: Iterable[Path]) -> list[tuple[Path, int]]:
@@ -77,17 +92,43 @@ def pcm_audio_duration(audio: Path) -> float | None:
     return duration if duration > 0 else None
 
 
+def slice_pcm_wav(source: Path, destination: Path, start: float, end: float) -> None:
+    """Copy the ``[start, end)`` second window of a PCM WAV into a new one."""
+    with wave.open(str(source), "rb") as reader:
+        parameters = reader.getparams()
+        first = max(0, round(start * parameters.framerate))
+        last = min(parameters.nframes, round(end * parameters.framerate))
+        reader.setpos(first)
+        frames = reader.readframes(max(0, last - first))
+    with wave.open(str(destination), "wb") as writer:
+        writer.setnchannels(parameters.nchannels)
+        writer.setsampwidth(parameters.sampwidth)
+        writer.setframerate(parameters.framerate)
+        writer.writeframes(frames)
+
+
 async def _drain_stream_chunks(
-    snapshot: Path,
-    duration: float,
+    tail: StreamTail,
     emitted_duration: float,
     chunk_seconds: float,
+    context_seconds: float,
+    excerpt: Path,
     on_chunk: ChunkCallback,
 ) -> float:
-    """Emit every complete, not-yet-processed chunk in one audio snapshot."""
-    while duration >= emitted_duration + chunk_seconds:
-        await on_chunk(snapshot, emitted_duration)
-        emitted_duration += chunk_seconds
+    """Cut every complete, not-yet-processed chunk out of one decoded tail.
+
+    Cutting the excerpts here rather than in the callback keeps them free: the
+    tail already holds decoded PCM, so a window is a byte range instead of a
+    second ffmpeg pass over the growing download.
+    """
+    while tail.end >= emitted_duration + chunk_seconds:
+        start = max(0.0, emitted_duration - context_seconds)
+        end = emitted_duration + chunk_seconds
+        await asyncio.to_thread(
+            slice_pcm_wav, tail.path, excerpt, start - tail.start, end - tail.start
+        )
+        await on_chunk(excerpt, start)
+        emitted_duration = end
     return emitted_duration
 
 
@@ -174,16 +215,25 @@ class MediaAcquirer:
             raise RuntimeError("yt-dlp completed without producing a media file")
         return max(files, key=lambda item: item[1])[0].resolve()
 
-    async def extract_audio(self, media_path: Path, output: Path) -> None:
+    async def extract_audio(
+        self, media_path: Path, output: Path, *, start: float = 0.0
+    ) -> None:
         args = [self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        if start > 0:
+            # Input seeking: ffmpeg resumes at the keyframe before ``start`` and
+            # drops the samples ahead of it, so the window lands sample-accurate
+            # even on the partially written containers a download leaves behind.
+            args += ["-ss", str(start)]
         args += ["-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", output]
         await self.runner.run(args, on_line=lambda stream, line: self.db.log("ffmpeg", stream, line))
 
     async def acquire_stream(self, source: MediaSource, on_chunk: ChunkCallback) -> MediaArtifact:
-        """Download once and expose growing audio snapshots to a streaming transcriber.
+        """Download once, feeding the growing audio to a streaming transcriber.
 
-        Snapshot extraction is opportunistic: formats that ffmpeg cannot read while
-        growing simply become available at the next interval or finalization.
+        Each pass decodes only the audio it has not handed over yet and cuts the
+        ready chunks out of it. Extraction is opportunistic: formats that ffmpeg
+        cannot read while growing simply become available at a later pass or at
+        finalization.
         """
         self.work_dir.mkdir(parents=True, exist_ok=True)
         if not source.is_url:
@@ -211,41 +261,67 @@ class MediaAcquirer:
         result = None
         interrupted = False
         emitted_duration = 0.0
-        snapshot_index = 0
+        chunk_seconds = self.settings.stream_chunk_seconds
+        context_seconds = self.settings.stream_context_seconds
+        tail_path = self.work_dir / "stream-tail.wav"
+        excerpt = self.work_dir / "stream-chunk.wav"
+        # A wall-clock deadline, not a poll count: decoding and transcribing a
+        # chunk takes far longer than a poll, so counting polls would add a
+        # whole chunk interval on top of each chunk instead of absorbing it.
+        next_pass = monotonic()
         try:
             while not task.done():
-                await asyncio.sleep(1)
+                await asyncio.sleep(STREAM_POLL_SECONDS)
+                if monotonic() < next_pass:
+                    continue
                 sized = _sizes(target_dir.glob(f"{download_stem}.*"))
-                if not sized or snapshot_index and snapshot_index % self.settings.stream_chunk_seconds:
-                    snapshot_index += 1
+                if not sized:
                     continue
                 growing = max(sized, key=lambda item: item[1])[0]
-                snapshot = self.work_dir / "stream-snapshot.wav"
+                # Decode only what is still unprocessed. Re-decoding the whole
+                # download every pass costs time proportional to how long the
+                # stream has run, which eventually outgrows the interval itself.
+                tail_start = max(0.0, emitted_duration - context_seconds)
+                available_end = emitted_duration
                 try:
-                    await self.extract_audio(growing, snapshot)
-                    duration = await asyncio.to_thread(pcm_audio_duration, snapshot)
-                    if duration is None:
+                    await self.extract_audio(growing, tail_path, start=tail_start)
+                    duration = await asyncio.to_thread(pcm_audio_duration, tail_path)
+                    available_end = tail_start + (duration or 0.0)
+                    if not duration and emitted_duration <= 0:
                         # Route this through the handler below rather than
-                        # skipping quietly: a snapshot that never becomes
-                        # readable produces no chunks for the whole download.
+                        # skipping quietly: a download whose audio never becomes
+                        # readable produces no chunks at all.
                         raise ValueError(
-                            f"{snapshot.name} has no readable PCM duration yet"
+                            f"{tail_path.name} has no readable PCM duration yet"
+                        )
+                    # The download already held every second up to
+                    # ``emitted_duration``, so a tail that stops short of that
+                    # was decoded wrong however the failure is spelled.
+                    if available_end + TAIL_SHORTFALL_TOLERANCE < emitted_duration:
+                        raise ValueError(
+                            f"{tail_path.name} decoded only {available_end:.2f}s "
+                            f"of audio already processed to {emitted_duration:.2f}s"
                         )
                     emitted_duration = await _drain_stream_chunks(
-                        snapshot,
-                        duration,
+                        StreamTail(tail_path, tail_start, available_end),
                         emitted_duration,
-                        self.settings.stream_chunk_seconds,
+                        chunk_seconds,
+                        context_seconds,
+                        excerpt,
                         on_chunk,
                     )
                 except Exception as exc:
-                    # A snapshot that cannot be read yet is expected, but a
-                    # failing transcriber or Agent would otherwise repeat
-                    # silently for the whole download.
+                    # A tail that cannot be read yet is expected, but a failing
+                    # transcriber or Agent would otherwise repeat silently for
+                    # the whole download.
                     self.db.log("stream-extract", "stderr", str(exc))
                     if self.on_warning:
                         await self.on_warning(f"stream chunk skipped: {exc}")
-                snapshot_index += 1
+                # Wait only for the audio the next chunk is still missing. A
+                # backlog leaves this in the past and drains on the next poll.
+                next_pass = monotonic() + max(
+                    0.0, emitted_duration + chunk_seconds - available_end
+                )
             result = await task
         except asyncio.CancelledError:
             interrupted = True

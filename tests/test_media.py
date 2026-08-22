@@ -1,4 +1,5 @@
 import asyncio
+import wave
 from pathlib import Path
 
 from yakiflow.config import Settings
@@ -70,18 +71,125 @@ def test_persistent_url_downloads_once_then_extracts(tmp_path: Path) -> None:
     db.close()
 
 
-def test_stream_drain_advances_only_by_processed_chunks(tmp_path: Path) -> None:
-    starts: list[float] = []
+def _write_tone(path: Path, seconds: float, rate: int = 16000) -> None:
+    """Write a mono PCM ramp whose samples encode their own position."""
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(rate)
+        writer.writeframes(
+            b"".join(
+                (index % 30000).to_bytes(2, "little")
+                for index in range(round(seconds * rate))
+            )
+        )
 
-    async def on_chunk(_snapshot: Path, start: float) -> None:
-        starts.append(start)
+
+def _first_sample(path: Path) -> int:
+    with wave.open(str(path), "rb") as reader:
+        return int.from_bytes(reader.readframes(1), "little")
+
+
+def test_stream_drain_cuts_each_chunk_with_its_leading_context(tmp_path: Path) -> None:
+    tail = tmp_path / "tail.wav"
+    _write_tone(tail, 47)
+    excerpt = tmp_path / "chunk.wav"
+    cuts: list[tuple[float, float | None, int]] = []
+
+    async def on_chunk(path: Path, start: float) -> None:
+        cuts.append((start, media.pcm_audio_duration(path), _first_sample(path)))
 
     emitted = asyncio.run(
-        _drain_stream_chunks(tmp_path / "snapshot.wav", 47, 0, 15, on_chunk)
+        _drain_stream_chunks(
+            media.StreamTail(tail, 0.0, 47.0), 0.0, 15, 5, excerpt, on_chunk
+        )
     )
 
-    assert starts == [0, 15, 30]
+    # The first chunk has no earlier audio to prepend; the rest carry five
+    # seconds of it, and every cut starts where the samples say it should.
+    assert cuts == [(0, 15, 0), (10, 20, 10 * 16000 % 30000), (25, 20, 25 * 16000 % 30000)]
     assert emitted == 45
+
+
+def test_stream_drain_indexes_chunks_against_the_tail_offset(tmp_path: Path) -> None:
+    tail = tmp_path / "tail.wav"
+    # A tail decoded from 25s onwards, as the loop requests once it has emitted
+    # 30 seconds with five seconds of context.
+    _write_tone(tail, 22)
+    excerpt = tmp_path / "chunk.wav"
+    starts: list[float] = []
+    firsts: list[int] = []
+
+    async def on_chunk(path: Path, start: float) -> None:
+        starts.append(start)
+        firsts.append(_first_sample(path))
+
+    emitted = asyncio.run(
+        _drain_stream_chunks(
+            media.StreamTail(tail, 25.0, 47.0), 30.0, 15, 5, excerpt, on_chunk
+        )
+    )
+
+    assert starts == [25]
+    # The chunk begins at the very start of the tail, not 25 seconds into it.
+    assert firsts == [0]
+    assert emitted == 45
+
+
+def test_stream_decodes_only_the_audio_it_has_not_processed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(media, "STREAM_POLL_SECONDS", 0.01)
+
+    class GrowingRunner:
+        """A download that gains 30 seconds of audio between decoding passes."""
+
+        def __init__(self) -> None:
+            self.tail_seeks: list[float] = []
+            self.downloaded = 14.99
+            self.finished = asyncio.Event()
+
+        async def run(self, args, **kwargs):
+            values = [str(value) for value in args]
+            output = Path(values[-1])
+            if values[0] == "yt-dlp":
+                template = values[values.index("-o") + 1]
+                path = Path(template.replace("%(ext)s", "mkv"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+                await self.finished.wait()
+                return ProcessResult(tuple(values), 0, f"{path}\n", "")
+            start = float(values[values.index("-ss") + 1]) if "-ss" in values else 0.0
+            if output.name == "stream-tail.wav":
+                self.tail_seeks.append(start)
+                self.downloaded = min(74.99, self.downloaded + 30)
+            _write_tone(output, self.downloaded - start, rate=200)
+            return ProcessResult(tuple(values), 0, "", "")
+
+    runner = GrowingRunner()
+    starts: list[float] = []
+
+    async def on_chunk(_path: Path, start: float) -> None:
+        starts.append(start)
+        if len(starts) == 4:
+            runner.finished.set()
+
+    db = JobDatabase(tmp_path / "db.sqlite3")
+    asyncio.run(
+        MediaAcquirer(
+            Settings(download_dir=tmp_path / "downloads"),
+            tmp_path / "work",
+            db,
+            runner,
+        ).acquire_stream(MediaSource.parse("https://example.test/live"), on_chunk)
+    )
+
+    assert starts == [0, 10, 25, 40]
+    # Each pass resumes five seconds before the audio it still owes instead of
+    # decoding the whole download over again.
+    assert runner.tail_seeks[:2] == [0.0, 25.0]
+    assert all(seek > 0 for seek in runner.tail_seeks[1:])
+    db.close()
 
 
 def test_stream_download_ignores_files_from_previous_jobs(
