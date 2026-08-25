@@ -10,7 +10,8 @@ from textual.widgets import DataTable, RichLog
 from yakiflow.database import JobDatabase
 from yakiflow.memory import MemoryStore
 from yakiflow.models import AgentTraceEvent, Cue, JobEvent
-from yakiflow.srt_preview import SrtPreviewApp
+from yakiflow.subtitle_preview import SubtitlePreviewApp
+from yakiflow.subtitles import render_ass
 from yakiflow.tui import (
     AgentConversationLog,
     AgentInspector,
@@ -21,11 +22,14 @@ from yakiflow.tui import (
 )
 
 
-def _srt(cues: list[str]) -> str:
-    return "\n\n".join(
-        f"{index}\n00:00:{index:02d},000 --> 00:00:{index:02d},900\n{text}"
-        for index, text in enumerate(cues)
-    ) + "\n"
+def _subtitle(cues: list[str]) -> str:
+    return render_ass(
+        [
+            Cue(str(index + 1), float(index), index + 0.9, text)
+            for index, text in enumerate(cues)
+        ],
+        "source",
+    )
 
 
 def test_pipeline_progress_bar_keeps_explicit_eta_on_refresh() -> None:
@@ -166,14 +170,14 @@ def test_subtitle_tail_follow_tracks_user_intent() -> None:
     asyncio.run(exercise())
 
 
-def test_live_srt_reload_preserves_user_scroll_position(tmp_path) -> None:
-    subtitle = tmp_path / "review.srt"
+def test_live_subtitle_reload_preserves_user_scroll_position(tmp_path) -> None:
+    subtitle = tmp_path / "review.ass"
     marker = tmp_path / "done"
     cues = [f"cue {index}" for index in range(40)]
-    subtitle.write_text(_srt(cues), encoding="utf-8")
+    subtitle.write_text(_subtitle(cues), encoding="utf-8")
 
     async def exercise() -> None:
-        app = SrtPreviewApp(subtitle, marker)
+        app = SubtitlePreviewApp(subtitle, marker)
         async with app.run_test(size=(80, 20)) as pilot:
             await pilot.pause()
             table = app.query_one("#recent", SubtitleTable)
@@ -184,7 +188,7 @@ def test_live_srt_reload_preserves_user_scroll_position(tmp_path) -> None:
             assert not table.follow_tail
 
             cues[20] = "updated cue 20 with a longer Agent correction"
-            subtitle.write_text(_srt(cues), encoding="utf-8")
+            subtitle.write_text(_subtitle(cues), encoding="utf-8")
             app._refresh()
             await pilot.pause()
 

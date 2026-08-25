@@ -8,34 +8,40 @@ from textual.binding import Binding
 
 from .media_player import open_media
 from .models import Cue
-from .srt import parse_srt_blocks
+from .subtitles import parse_ass
 from .tui import SubtitleTable
 
 
-def read_srt(path: Path) -> list[Cue]:
-    """Read a subtitle file for preview, skipping any block that cannot parse."""
+def read_subtitle(path: Path) -> list[Cue]:
+    """Read a subtitle file for preview, skipping any event that cannot parse."""
     if not path.is_file():
         return []
-    blocks, _problems = parse_srt_blocks(
+    events, _problems = parse_ass(
         path.read_text(encoding="utf-8", errors="replace")
     )
     cues: list[Cue] = []
-    # Number by position rather than by the file's own numbering, which an
-    # in-progress Agent edit can leave duplicated. Duplicates would collide as
-    # subtitle-table row keys, and publish-time validation renumbers the file
-    # anyway. Timings are clamped for the same reason: a cue that ends before
-    # it starts is reported at publish time, not crashed on here.
-    for position, block in enumerate(blocks, 1):
-        first, *rest = block.text
+    # Number by position: an in-progress Agent edit has no stable IDs to key
+    # on, and the subtitle table only needs unique row keys. Timings are
+    # clamped for the same reason: an event that ends before it starts is
+    # reported at publish time, not crashed on here.
+    for position, event in enumerate(events, 1):
+        first, *rest = event.text_lines
         translated = first if rest else None
         source = "\n".join(rest) if rest else first
         cues.append(
-            Cue(str(position), block.start, max(block.start, block.end), source, translated)
+            Cue(
+                str(position),
+                event.start,
+                max(event.start, event.end),
+                source,
+                translated,
+                speaker=event.name or None,
+            )
         )
     return cues
 
 
-class SrtPreviewApp(App[None]):
+class SubtitlePreviewApp(App[None]):
     CSS = """
     Screen { padding: 0; }
     #recent { width: 1fr; height: 1fr; }
@@ -96,7 +102,7 @@ class SrtPreviewApp(App[None]):
         previous_y = table.scroll_y
         follow_tail = table.follow_tail
         table.clear()
-        for cue in read_srt(self.path):
+        for cue in read_subtitle(self.path):
             table.add_subtitle(cue)
         # Rebuilding the DataTable resets its virtual scroll extent. Keep
         # the user's viewport stable across Agent edits, while preserving
@@ -108,7 +114,7 @@ def main() -> int:
         return 2
     media = Path(sys.argv[3]) if sys.argv[3] else None
     command = sys.argv[4] or None
-    SrtPreviewApp(Path(sys.argv[1]), Path(sys.argv[2]), media, command).run()
+    SubtitlePreviewApp(Path(sys.argv[1]), Path(sys.argv[2]), media, command).run()
     return 0
 
 

@@ -21,22 +21,22 @@ from yakiflow.process import ProcessResult
     [
         (
             "source",
-            "final deliverable is a source-language monolingual SRT",
+            "final deliverable is a source-language monolingual subtitle",
             "Do not add a translation or a second language line",
         ),
         (
             "translated",
-            "final deliverable is a target-language monolingual SRT",
+            "final deliverable is a target-language monolingual subtitle",
             "do not add source-language lines",
         ),
         (
             "bilingual",
-            "final deliverable is a bilingual SRT",
+            "final deliverable is a bilingual subtitle",
             "Fix both clear source transcription problems and target translation problems",
         ),
         (
             "all",
-            "final deliverables include source-language monolingual, target-language monolingual, and bilingual SRTs",
+            "final deliverables include source-language monolingual, target-language monolingual, and bilingual subtitles",
             "Mirror every applicable text and timing correction across all three artifacts",
         ),
     ],
@@ -54,7 +54,7 @@ def test_interactive_prompt_scopes_review_to_final_output(
             output_mode=output_mode,
         ),
         tmp_path,
-        [tmp_path / "movie.srt"],
+        [tmp_path / "movie.ass"],
     )
 
     normalized = " ".join(prompt.split())
@@ -62,8 +62,8 @@ def test_interactive_prompt_scopes_review_to_final_output(
     assert required_detail in normalized
     assert "source/translation evidence applicable to the output-specific scope" in normalized
     assert "Whenever you point out or discuss a specific subtitle" in normalized
-    assert "include its SRT start and end timestamp" in normalized
-    assert "00:01:23,456 --> 00:01:25,000" in normalized
+    assert "include its start and end timestamp" in normalized
+    assert "0:01:23.45 - 0:01:25.00" in normalized
 
 
 @pytest.mark.parametrize(
@@ -124,16 +124,22 @@ def test_interactive_prompt_allows_merging_cues_a_translation_cannot_split(
     normalized = " ".join(prompt.split())
     assert ("Merging cues the target language cannot keep apart" in normalized) is expects_merge_scope
     assert ("no single translated cue can carry a complete" in normalized) is expects_merge_scope
-    assert ("they belong to the same sentence" in normalized) is expects_merge_scope
+    assert ("they belong to the same sentence and the same speaker" in normalized) is expects_merge_scope
     assert ("read comfortably within its on-screen time" in normalized) is expects_merge_scope
-    assert ("not separated by a long pause or a speaker change" in normalized) is expects_merge_scope
-    assert ("from the first cue's start to the last cue's end" in normalized) is expects_merge_scope
+    assert ("they are not separated by a long pause" in normalized) is expects_merge_scope
+    assert (
+        "extend one Dialogue event's times to cover the whole span and delete the other Dialogue line"
+        in normalized
+    ) is expects_merge_scope
     assert ("Merging is the exception, not the default" in normalized) is expects_merge_scope
     assert ("Apply every merge to the source side" in normalized) is expects_mirroring
+    # Renumbering is meaningless in ASS and must not be prescribed anymore.
+    assert "Renumber" not in prompt
+    assert "renumber" not in prompt
 
 
 @pytest.mark.parametrize("output_mode", ["source", "translated", "bilingual", "all"])
-def test_interactive_prompt_states_the_srt_invariants_and_the_publish_check(
+def test_interactive_prompt_states_the_ass_format_contract(
     tmp_path: Path,
     output_mode: str,
 ) -> None:
@@ -147,15 +153,96 @@ def test_interactive_prompt_states_the_srt_invariants_and_the_publish_check(
     )
 
     normalized = " ".join(prompt.split())
-    assert "cue numbers running 1..N with no gaps or repeats" in normalized
-    assert "never end before they start" in normalized
-    assert "no cue left without text" in normalized
-    assert "Renumber the whole file after any merge" in normalized
-    assert "re-read every staged file end to end" in normalized
-    assert "refuses to publish a file that breaks them" in normalized
+    assert "ASS (Advanced SubStation Alpha) documents" in normalized
+    assert "editing surface is the `Dialogue:` lines in the `[Events]` section" in normalized
+    assert "regenerated wholesale at publish time" in normalized
+    assert "Name field is the diarized speaker label" in normalized
+    assert "leave it unchanged unless the user asks" in normalized
+    assert "written as `\\N` in the Text field" in normalized
     assert (
-        "All three artifacts must also keep the same cue count" in normalized
+        "translation first and source second, separated by `\\N`" in normalized
+    ) is (output_mode in {"bilingual", "all"})
+    assert (
+        "All three artifacts must keep the same event count and identical event timings and Name fields"
+        in normalized
     ) is (output_mode == "all")
+
+
+@pytest.mark.parametrize("output_mode", ["source", "translated", "bilingual", "all"])
+def test_interactive_prompt_leaves_mechanical_rules_to_publish_validation(
+    tmp_path: Path,
+    output_mode: str,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            output_mode=output_mode,
+        ),
+        tmp_path,
+        [tmp_path / "movie.ass"],
+    )
+
+    # Publish-time validation code is the sole authority for the mechanical
+    # invariants, so the prompt must not restate them.
+    assert "cue numbers running 1..N" not in prompt
+    assert "Renumber the whole file" not in prompt
+    assert "HH:MM:SS,mmm" not in prompt
+    assert "never end before they start" not in prompt
+    assert "no cue left without text" not in prompt
+    # The deliverable is no longer described as SRT anywhere.
+    assert "SRT" not in prompt
+
+
+@pytest.mark.parametrize("output_mode", ["source", "translated", "bilingual", "all"])
+def test_interactive_prompt_permits_cross_speaker_overlaps(
+    tmp_path: Path,
+    output_mode: str,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(
+            source_language="en",
+            target_language="zh-CN",
+            output_mode=output_mode,
+        ),
+        tmp_path,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "Cues of two different named speakers may legitimately overlap in time" in normalized
+    assert "simultaneous speech, not an error" in normalized
+    assert "never merge, delete, or retime cues just to remove such an overlap" in normalized
+
+
+def test_interactive_prompt_lists_previous_problems_verbatim(tmp_path: Path) -> None:
+    problems = (
+        "cue 12 ends before it starts (0:01:10.00 - 0:01:08.50)",
+        "empty Dialogue text at 0:03:44.10",
+    )
+
+    prompt = build_interactive_prompt(
+        Settings(source_language="en", target_language="zh-CN"),
+        tmp_path,
+        previous_problems=problems,
+    )
+
+    normalized = " ".join(prompt.split())
+    assert "previous review session left these publish-blocking defects" in normalized
+    assert "YakiFlow will re-check them when it publishes" in normalized
+    for problem in problems:
+        assert f"- {problem}" in prompt
+
+
+def test_interactive_prompt_omits_previous_problems_section_when_empty(
+    tmp_path: Path,
+) -> None:
+    prompt = build_interactive_prompt(
+        Settings(source_language="en", target_language="zh-CN"),
+        tmp_path,
+    )
+
+    assert "publish-blocking defects" not in prompt
+    assert "previous review session" not in prompt
 
 
 def test_interactive_prompt_keeps_everything_but_subtitles_and_memory_read_only(
@@ -283,20 +370,22 @@ def test_review_open_command_expands_job_path_placeholders(tmp_path: Path) -> No
     ]
 
 
-@pytest.mark.parametrize("srt_placeholder", ["{file}", "{srt_file}"])
-def test_review_open_command_supports_srt_aliases_without_appending(
-    tmp_path: Path, srt_placeholder: str
+@pytest.mark.parametrize(
+    "subtitle_placeholder", ["{subtitle}", "{srt}", "{file}", "{srt_file}"]
+)
+def test_review_open_command_supports_subtitle_aliases_without_appending(
+    tmp_path: Path, subtitle_placeholder: str
 ) -> None:
-    subtitle = tmp_path / "movie.srt"
+    subtitle = tmp_path / "movie.ass"
 
-    assert review_open_argv(f"editor {srt_placeholder}", subtitle, tmp_path) == [
+    assert review_open_argv(f"editor {subtitle_placeholder}", subtitle, tmp_path) == [
         "editor",
         str(subtitle),
     ]
 
 
 def test_review_open_command_supports_memory_file_alias(tmp_path: Path) -> None:
-    subtitle = tmp_path / "movie.srt"
+    subtitle = tmp_path / "movie.ass"
 
     assert review_open_argv("editor {memory_file}", subtitle, tmp_path) == [
         "editor",
@@ -305,10 +394,10 @@ def test_review_open_command_supports_memory_file_alias(tmp_path: Path) -> None:
     ]
 
 
-def test_review_open_command_appends_srt_when_no_srt_placeholder(
+def test_review_open_command_appends_subtitle_when_no_subtitle_placeholder(
     tmp_path: Path,
 ) -> None:
-    subtitle = tmp_path / "movie.srt"
+    subtitle = tmp_path / "movie.ass"
 
     assert review_open_argv("editor {workdir}", subtitle, tmp_path) == [
         "editor",
@@ -354,6 +443,7 @@ def test_both_display_mode_opens_external_command_and_tmux_preview(
 
     assert calls[0][0] == ("editor", str(subtitle))
     assert calls[1][0][:2] == ("tmux", "split-window")
+    assert "yakiflow.subtitle_preview" in calls[1][0]
     assert display.marker == tmp_path / ".agent-display-done"
 
 
@@ -481,3 +571,32 @@ def test_interactive_agent_does_not_auto_open_video_by_default(
     )
 
     assert not opened
+
+
+def test_interactive_agent_forwards_previous_problems_into_the_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TMUX", "test")
+    monkeypatch.setattr(interactive_agent, "_source_media", lambda _work_dir: None)
+    problems = ("cue 7 has no text", "cue 9 ends before it starts")
+    prompts: list[str] = []
+
+    class Runner:
+        async def run_interactive(self, command, *, cwd=None):
+            prompts.append(command[-1])
+            return ProcessResult(tuple(command), 0, "", "")
+
+    asyncio.run(
+        interactive_agent.run_interactive_agent(
+            make_settings(agent={"final": {"backend": "codex"}}),
+            tmp_path,
+            [tmp_path / "movie.ass"],
+            previous_problems=problems,
+            runner=Runner(),
+        )
+    )
+
+    assert len(prompts) == 1
+    assert "publish-blocking defects" in prompts[0]
+    for problem in problems:
+        assert f"- {problem}" in prompts[0]

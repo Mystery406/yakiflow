@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import DEFAULT_MODEL_NAME, default_model_path
-from .srt import DEFAULT_FILE_MODE
+from .subtitles import DEFAULT_FILE_MODE
 
 
 MODEL_URL = f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{DEFAULT_MODEL_NAME}"

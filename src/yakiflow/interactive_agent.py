@@ -45,7 +45,7 @@ def _preview_command(
     return [
         sys.executable,
         "-m",
-        "yakiflow.srt_preview",
+        "yakiflow.subtitle_preview",
         str(file_path),
         str(marker),
         str(media_path) if media_path else "",
@@ -64,10 +64,13 @@ def _source_media(work_dir: Path) -> Path | None:
 def review_open_argv(command: str, file_path: Path, work_dir: Path) -> list[str]:
     """Expand a review-display command without invoking a shell."""
     has_srt = any(
-        placeholder in command for placeholder in ("{srt}", "{file}", "{srt_file}")
+        placeholder in command
+        for placeholder in ("{subtitle}", "{srt}", "{file}", "{srt_file}")
     )
     memory_file = work_dir / "memory.md"
     replacements = {
+        "{subtitle}": file_path,
+        # The srt spellings predate the ASS output and keep working.
         "{srt}": file_path,
         "{file}": file_path,
         "{srt_file}": file_path,
@@ -160,6 +163,7 @@ def build_interactive_prompt(
     work_dir: Path,
     outputs: Sequence[Path] = (),
     context_files: Sequence[Path] = (),
+    previous_problems: Sequence[str] = (),
 ) -> str:
     output_list = "\n".join(f"- {path}" for path in outputs) or (
         "- inspect the published subtitle files in the work directory"
@@ -175,6 +179,14 @@ Additional reference files were copied into the work directory for this review:
 Read these files when they are useful as supporting context. They are reference
 material only: do not edit or publish them.
 """
+    previous_problems_section = ""
+    if previous_problems:
+        problem_list = "\n".join(f"- {problem}" for problem in previous_problems)
+        previous_problems_section = f"""
+The previous review session left these publish-blocking defects behind, and
+YakiFlow will re-check them when it publishes. Fix them first:
+{problem_list}
+"""
     output_mode = OutputMode(settings.output_mode)
     conversation_language = settings.target_language or settings.source_language
     language_rule = (
@@ -186,21 +198,21 @@ and keep using it for the rest of the session."""
 it for the rest of the session."""
     )
     review_scope = {
-        OutputMode.SOURCE: f"""The final deliverable is a source-language monolingual SRT ({settings.source_language or 'the detected source language'}).
+        OutputMode.SOURCE: f"""The final deliverable is a source-language monolingual subtitle ({settings.source_language or 'the detected source language'}).
 Fix clear ASR/transcription errors, source-text omissions or duplication,
 punctuation, segmentation, formatting, timing, and source-term consistency.
-Do not add a translation or a second language line to the final SRT.""",
-        OutputMode.TRANSLATED: f"""The final deliverable is a target-language monolingual SRT ({settings.target_language or 'the configured target language'}).
+Do not add a translation or a second language line to the final subtitle.""",
+        OutputMode.TRANSLATED: f"""The final deliverable is a target-language monolingual subtitle ({settings.target_language or 'the configured target language'}).
 Fix mistranslations, missing or duplicated meaning, unnatural phrasing,
 terminology/style inconsistency, target-language punctuation and formatting,
-and timing. Use source or Whisper data as evidence when needed, but keep the
-final SRT target-language-only; do not add source-language lines.""",
-        OutputMode.BILINGUAL: f"""The final deliverable is a bilingual SRT: target language ({settings.target_language or 'the configured target language'}) first and source language ({settings.source_language or 'the detected source language'}) second in each cue.
+and timing. Use source or transcription data as evidence when needed, but keep
+the final subtitle target-language-only; do not add source-language lines.""",
+        OutputMode.BILINGUAL: f"""The final deliverable is a bilingual subtitle: target language ({settings.target_language or 'the configured target language'}) first and source language ({settings.source_language or 'the detected source language'}) second in each cue.
 Fix both clear source transcription problems and target translation problems,
 including omissions, duplication, unnatural target phrasing, terminology,
 punctuation, formatting, and timing. Preserve that target-first/source-second
 layout and make each pair say the same thing.""",
-        OutputMode.ALL: f"""The final deliverables include source-language monolingual, target-language monolingual, and bilingual SRTs ({settings.source_language or 'the detected source language'} -> {settings.target_language or 'the configured target language'}).
+        OutputMode.ALL: f"""The final deliverables include source-language monolingual, target-language monolingual, and bilingual subtitles ({settings.source_language or 'the detected source language'} -> {settings.target_language or 'the configured target language'}).
 Fix both clear source transcription problems and target translation problems,
 including omissions, duplication, unnatural target phrasing, terminology,
 punctuation, formatting, and timing. Mirror every applicable text and timing
@@ -214,9 +226,16 @@ bilingual file target-first and source-second.""",
         else ""
     )
     artifact_invariant = (
-        "\nAll three artifacts must also keep the same cue count and identical"
-        "\ncue timings as each other."
+        "\nAll three artifacts must keep the same event count and identical"
+        "\nevent timings and Name fields as each other."
         if output_mode is OutputMode.ALL
+        else ""
+    )
+    bilingual_layout = (
+        """
+Bilingual layout: each Dialogue event carries both languages in one Text
+field, translation first and source second, separated by `\\N`."""
+        if output_mode in {OutputMode.BILINGUAL, OutputMode.ALL}
         else ""
     )
     phrasing_scope = "" if output_mode is OutputMode.SOURCE else f"""
@@ -233,12 +252,12 @@ Merging cues the target language cannot keep apart:
 One sentence is often split across several cues, and the target language may
 reorder or regroup it so that no single translated cue can carry a complete,
 self-contained meaning on its own. Merge those cues into one when all of the
-following hold: they belong to the same sentence, the merged text is still short
-enough to read comfortably within its on-screen time, and they are not separated
-by a long pause or a speaker change. The merged cue runs from the first cue's
-start to the last cue's end. Merging is the exception, not the default: when
-each cue can stand on its own after a natural rewrite, keep the original split
-and timing.{merge_mirroring}
+following hold: they belong to the same sentence and the same speaker, the
+merged text is still short enough to read comfortably within its on-screen
+time, and they are not separated by a long pause. To merge in ASS, extend one
+Dialogue event's times to cover the whole span and delete the other Dialogue
+line. Merging is the exception, not the default: when each cue can stand on
+its own after a natural rewrite, keep the original split and timing.{merge_mirroring}
 """
     return f"""You are the interactive YakiFlow subtitle editor.
 
@@ -246,10 +265,10 @@ Work directly in {work_dir}. The batch pipeline has finished and published these
 subtitle artifacts:
 {output_list}
 
-The staged SRT files in this work directory are the files to inspect and edit.
-YakiFlow will publish your edits after this session and remove the
+The staged subtitle files in this work directory are the files to inspect and
+edit. YakiFlow will publish your edits after this session and remove the
 destination-side draft snapshot.
-{context_section}
+{context_section}{previous_problems_section}
 
 The source language is {settings.source_language or 'detected automatically'} and
 the target language is {settings.target_language or 'the configured target'}.
@@ -258,25 +277,26 @@ the target language is {settings.target_language or 'the configured target'}.
 Review and editing scope for the configured final output:
 {review_scope}
 {phrasing_scope}
-Subtitle file invariants:
-Whatever you change, every staged SRT must remain a valid SRT: blocks separated
-by one blank line, cue numbers running 1..N with no gaps or repeats, timestamps
-written as `HH:MM:SS,mmm --> HH:MM:SS,mmm` that never end before they start and
-never move backwards from one cue to the next, and no cue left without text.
-Renumber the whole file after any merge. Before you tell the user you are done,
-re-read every staged file end to end and confirm all of this still holds:
-YakiFlow re-checks these invariants at publish time and refuses to publish a
-file that breaks them.{artifact_invariant}
+Subtitle file format:
+The staged files are ASS (Advanced SubStation Alpha) documents. Your editing
+surface is the `Dialogue:` lines in the `[Events]` section; the header sections
+above it are regenerated wholesale at publish time, so changing them has no
+effect on what is published. Each Dialogue's Name field is the diarized
+speaker label: leave it unchanged unless the user asks for a speaker change.
+Line breaks inside a subtitle are written as `\\N` in the Text field.{bilingual_layout}
+Cues of two different named speakers may legitimately overlap in time — that
+is simultaneous speech, not an error — so never merge, delete, or retime cues
+just to remove such an overlap.{artifact_invariant}
 
 Start immediately with an autonomous review before waiting for user input:
-inspect every staged SRT and {memory}, follow the output-specific scope above,
-and check the complete timeline for relevant text, timing, formatting, and
-cross-cue consistency problems. Report the initial findings in the terminal and
-apply only clearly safe mechanical fixes before asking the user questions.
+inspect every staged subtitle and {memory}, follow the output-specific scope
+above, and check the complete timeline for relevant text, timing, formatting,
+and cross-cue consistency problems. Report the initial findings in the terminal
+and apply only clearly safe mechanical fixes before asking the user questions.
 If a cue or timing is genuinely ambiguous, you may occasionally consult the raw
-Whisper artifacts in the work directory (for example `whisper-*.json` or the
-`process_logs` table in `job.sqlite3`), but do not routinely reread raw output
-when the published subtitles already provide enough evidence.
+transcription artifacts in the work directory (for example transcriber JSON
+output or the `process_logs` table in `job.sqlite3`), but do not routinely
+reread raw output when the published subtitles already provide enough evidence.
 
 Then work with the user conversationally until they are satisfied. Handle all
 of the following in this one session:
@@ -285,11 +305,11 @@ of the following in this one session:
    the staged subtitles and any source/translation evidence applicable to the
    output-specific scope yourself; do not require the user to provide cue IDs
    or line numbers. Whenever you point out or discuss a specific subtitle
-   sentence/cue in the terminal, include its SRT start and end timestamp
-   (for example, `00:01:23,456 --> 00:01:25,000`).
+   sentence/cue in the terminal, include its start and end timestamp
+   (for example, `0:01:23.45 - 0:01:25.00`).
 2. Refinement: apply agreed corrections to the subtitle artifacts, preserving
-   SRT structure and any timing or formatting that does not need correction,
-   and check the complete timeline for consistency.
+   the ASS structure and any timing or formatting that does not need
+   correction, and check the complete timeline for consistency.
 3. Memory: proactively extract knowledge that will remain useful for future
    subtitle jobs and is not already in {memory}. That file may not exist yet:
    treat a missing one as empty memory and create it when you have an approved
@@ -317,11 +337,11 @@ of the following in this one session:
    all necessary subtitle corrections in the same session (mirroring them
    across the configured output artifacts); do not stop after editing memory.
 
-Exactly two kinds of file are yours to edit: the staged SRT artifacts listed
-above and {memory}. Everything else in the work directory is read-only evidence,
-including `job.sqlite3` and the Whisper artifacts: editing them changes nothing
-about what YakiFlow publishes and can corrupt the job's resume state. Keep the
-staged subtitle outputs and memory internally consistent.
+Exactly two kinds of file are yours to edit: the staged subtitle artifacts
+listed above and {memory}. Everything else in the work directory is read-only
+evidence, including `job.sqlite3` and the transcriber artifacts: editing them
+changes nothing about what YakiFlow publishes and can corrupt the job's resume
+state. Keep the staged subtitle outputs and memory internally consistent.
 When the user says the session is complete, summarize the changes and exit.
 """
 
@@ -400,11 +420,14 @@ async def run_interactive_agent(
     outputs: Sequence[Path] = (),
     *,
     context_files: Sequence[Path] = (),
+    previous_problems: Sequence[str] = (),
     runner: CommandRunner | None = None,
 ) -> ProcessResult:
     """Hand the terminal to the configured interactive Agent CLI."""
     runner = runner or CommandRunner()
-    prompt = build_interactive_prompt(settings, work_dir, outputs, context_files)
+    prompt = build_interactive_prompt(
+        settings, work_dir, outputs, context_files, previous_problems
+    )
     command = build_interactive_command(settings, prompt)
     if settings.review.auto_open_video and outputs:
         open_media(

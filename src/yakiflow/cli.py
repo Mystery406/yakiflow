@@ -275,6 +275,9 @@ async def _complete_job(
                 job.work_dir,
                 outputs,
                 context_files=job.context_files,
+                # What stopped the previous publish attempt is the first thing
+                # the next review session needs to know.
+                previous_problems=job.db.get_checkpoint("review_problems", []),
                 runner=job.runner,
             )
         finally:

@@ -38,16 +38,17 @@ from .memory import MemoryDestinationConflict, MemoryFileSnapshot, MemoryStore
 from .models import AgentTraceEvent, Cue, JobEvent, JobStatus, TranscriptEvent
 from .process import CommandRunner
 from .progress import ProgressPlan, StageTimeEstimator, make_progress_plan
-from .srt import (
-    SrtBlock,
+from .subtitles import (
+    AssEvent,
     alignment_problems,
+    ass_problems,
+    canonicalized_ass,
+    event_problems,
     output_modes,
-    parse_srt_blocks,
+    parse_ass,
     publish_outputs,
-    render_srt,
-    renumbered_srt,
-    srt_problems,
-    write_srt_atomic,
+    render_ass,
+    write_ass_atomic,
     write_text_atomic,
 )
 from .transcription import (
@@ -60,7 +61,7 @@ from .translation import AgentBackend, TranslationPipeline, make_backend
 
 EventListener = Callable[[JobEvent], Awaitable[None] | None]
 
-_DRAFT_PARTIAL_SUFFIX = ".draft.incomplete.srt"
+_DRAFT_PARTIAL_SUFFIX = ".draft.incomplete.ass"
 
 
 class _ModelDownloadAbandoned(Exception):
@@ -248,7 +249,7 @@ class YakiFlowJob:
         if self._artifact is not None:
             return self._draft_partial_path(self._artifact)
         candidates = sorted(
-            self.work_dir.glob("*.srt"), key=lambda path: path.stat().st_mtime_ns
+            self.work_dir.glob("*.ass"), key=lambda path: path.stat().st_mtime_ns
         )
         return candidates[-1] if candidates else None
 
@@ -833,14 +834,14 @@ class YakiFlowJob:
 
     async def _write_partial(self, path: Path, cues: Sequence[Cue]) -> None:
         mode = self.settings.output_mode if self.settings.output_mode != "all" else "bilingual"
-        # write_srt_atomic renders every cue and fsyncs, and this runs once per
+        # write_ass_atomic renders every cue and fsyncs, and this runs once per
         # Whisper line. Keeping it off the event loop stops it from stalling the
         # subprocess pipe readers, the TUI, and the concurrent Agent batches.
         # The lock restores what running inline used to guarantee: the Whisper
         # writer and the draft-batch writer share this path, and an older
         # snapshot must not be the one that lands last.
         async with self._partial_write_lock:
-            await asyncio.to_thread(write_srt_atomic, path, list(cues), mode)
+            await asyncio.to_thread(write_ass_atomic, path, list(cues), mode)
 
     async def _translation_stage(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Cue]:
         self.db.set_status(JobStatus.TRANSLATING)
@@ -969,7 +970,7 @@ class YakiFlowJob:
     def _live_partial_path(self, source: MediaSource) -> Path:
         directory = self.work_dir
         base_name = Path(source.value).stem if not source.is_url else "source"
-        return directory / f"{base_name}.live.incomplete.srt"
+        return directory / f"{base_name}.live.incomplete.ass"
 
     async def _alignment_stage(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Cue]:
         self.db.set_status(JobStatus.ALIGNING)
@@ -1141,8 +1142,8 @@ class YakiFlowJob:
             # were checkpointed. Incomplete snapshots are never final outputs.
             outputs = sorted(
                 path
-                for path in self.work_dir.glob("*.srt")
-                if not path.name.endswith(".incomplete.srt")
+                for path in self.work_dir.glob("*.ass")
+                if not path.name.endswith(".incomplete.ass")
             )
         missing = [path for path in outputs if not path.is_file()]
         if not outputs or missing:
@@ -1169,32 +1170,35 @@ class YakiFlowJob:
     def _validate_review_outputs(self) -> None:
         """Refuse to publish subtitle files the review left structurally broken.
 
-        Cue numbering is repaired in place because it is purely mechanical.
+        Mechanically repairable drift — header edits, event ordering,
+        timestamp format — is rewritten in place by ``canonicalized_ass``.
         Structural defects are only reported when the pipeline's own rendering
         of the same cues is free of that defect, so a quirk YakiFlow produced
         itself never fails a job at the finish line. A file that lost its cues
         or its encoding is always refused: publishing it would overwrite the
         user's subtitles with something worse than the pre-review text.
+        The surviving problem list is checkpointed so the next review session
+        starts from what stopped this one, and cleared once publishing passes.
         """
         cues = self.db.list_cues(stable_only=True)
         if not cues:
             return
         rendered = [
-            render_srt(cues, mode)
+            render_ass(cues, mode)
             for mode in output_modes(self.settings.output_mode)
         ]
         tolerated = {
-            problem.kind for text in rendered for problem in srt_problems(text)
+            problem.kind for text in rendered for problem in ass_problems(text)
         }
         if alignment_problems([
-            (str(index), parse_srt_blocks(text)[0])
+            (str(index), parse_ass(text)[0])
             for index, text in enumerate(rendered)
         ]):
             # The pipeline's own artifacts already disagree, so the review
             # neither caused this nor can fix it.
             tolerated.add("artifact_mismatch")
         problems: list[str] = []
-        artifacts: list[tuple[str, Sequence[SrtBlock]]] = []
+        artifacts: list[tuple[str, Sequence[AssEvent]]] = []
         for staged in self.outputs:
             try:
                 text = staged.read_bytes().decode("utf-8")
@@ -1206,21 +1210,21 @@ class YakiFlowJob:
                     f"{staged.name}: is not valid UTF-8 at byte {exc.start}"
                 )
                 continue
-            repaired = renumbered_srt(text)
+            repaired = canonicalized_ass(text)
             if repaired is not None:
                 write_text_atomic(staged, repaired)
                 text = repaired
-            blocks, _unparsed = parse_srt_blocks(text)
-            if not blocks:
+            events, parse_problems = parse_ass(text)
+            if not events:
                 # An emptied file passes every structural check below, and
                 # publishing it would overwrite the user's subtitles with
                 # nothing.
                 problems.append(f"{staged.name}: contains no subtitle cues")
                 continue
-            artifacts.append((staged.name, blocks))
+            artifacts.append((staged.name, events))
             problems.extend(
                 f"{staged.name}: {problem.message}"
-                for problem in srt_problems(text)
+                for problem in [*parse_problems, *event_problems(events)]
                 if problem.kind not in tolerated
             )
         problems.extend(
@@ -1229,11 +1233,13 @@ class YakiFlowJob:
             if problem.kind not in tolerated
         )
         if problems:
+            self.db.checkpoint("review_problems", problems)
             detail = "\n".join(f"  - {problem}" for problem in problems)
             raise RuntimeError(
                 "reviewed subtitles are not publishable; fix the staged files in "
                 f"{self.work_dir} and resume the job:\n{detail}"
             )
+        self.db.checkpoint("review_problems", [])
 
     def finalize_artifacts(self) -> list[Path]:
         """Move Agent-editable staging artifacts to their configured targets."""
