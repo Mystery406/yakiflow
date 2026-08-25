@@ -522,3 +522,408 @@ class ElevenLabsTranscriber(Transcriber):
             max_cue_chars=self.settings.subtitles.max_cue_chars,
         )
         return self._chunk_timeline.add(incoming)
+
+
+# --- realtime (Scribe v2 Realtime WebSocket) ---
+
+# How far before the last durable word a broken realtime session resumes, and
+# how far apart two hearings of the same word may start and still be one word.
+RECONNECT_OVERLAP_SECONDS = 5.0
+_WORD_MERGE_TOLERANCE = 0.6
+_MAX_RECONNECTS = 3
+# How much fed-but-uncommitted audio may be in flight before the feeder waits
+# for the server to catch up.
+_FLOW_CONTROL_WINDOW_SECONDS = 30.0
+_EVENT_QUIET_TIMEOUT_SECONDS = 30.0
+
+
+def merge_streamed_words(
+    existing: Sequence[Word],
+    incoming: Sequence[Word],
+    tolerance: float = _WORD_MERGE_TOLERANCE,
+) -> list[Word]:
+    """Merge words from a re-fed overlap without duplicating any of them.
+
+    A reconnect re-feeds a few seconds the previous session already
+    transcribed; the same speech renders as words with nearly the same start
+    and the same text, and those duplicates are dropped. The merge is
+    strictly append-only: a differing hearing that would land *between*
+    already-durable words loses to them, because word ordinals are the
+    currency of dispatched agent batches and finished cue coverage — a
+    renumbering would silently corrupt both.
+    """
+    result = list(existing)
+    last_start = result[-1].start if result else float("-inf")
+    for word in incoming:
+        normalized = word.text.strip().casefold()
+        duplicate = any(
+            abs(candidate.start - word.start) <= tolerance
+            and candidate.text.strip().casefold() == normalized
+            for candidate in result[-80:]
+        )
+        if duplicate or word.start < last_start:
+            continue
+        word.ordinal = len(result)
+        result.append(word)
+        last_start = word.start
+    return result
+
+
+class _SessionEnded(Exception):
+    """The realtime session ended before the audio did (limit or disconnect)."""
+
+
+class _RealtimeSession:
+    """Thin transport adapter over the SDK's realtime connection.
+
+    Owns only open/send/commit/close and a queue of received events; every
+    piece of timeline math lives in the transcriber, so an SDK interface
+    change touches exactly this class. Should the pinned SDK lose its
+    realtime client, an equivalent hand-written ``websockets`` client can
+    stand in behind this same seam.
+    """
+
+    _ERROR_EVENTS = (
+        "error", "auth_error", "quota_exceeded", "transcriber_error",
+        "input_error", "invalid_request", "queue_overflow",
+        "resource_exhausted", "chunk_size_exceeded", "rate_limited",
+        "unaccepted_terms",
+    )
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._connection: Any = None
+        self._events: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self._first_send = True
+        self._previous_text = ""
+
+    async def open(self, previous_text: str = "") -> None:
+        try:
+            from elevenlabs.client import AsyncElevenLabs
+        except ImportError as exc:
+            raise RuntimeError(
+                "the elevenlabs SDK is not installed; install "
+                "yakiflow[elevenlabs] to use the ElevenLabs backends"
+            ) from exc
+        client = AsyncElevenLabs(api_key=elevenlabs_api_key(self.settings))
+        options: dict[str, Any] = {
+            "model_id": self.settings.elevenlabs.realtime_model,
+            "audio_format": "pcm_16000",
+            "sample_rate": 16000,
+            "commit_strategy": "vad",
+            "include_timestamps": True,
+        }
+        if normalize_source_language(self.settings.source_language) is not None:
+            options["language_code"] = self.settings.source_language
+        self._connection = await client.speech_to_text.realtime.connect(options)
+        self._previous_text = previous_text
+        self._first_send = True
+
+        def enqueue(kind: str):
+            def handler(*args: Any) -> None:
+                self._events.put_nowait((kind, args[0] if args else None))
+            return handler
+
+        self._connection.on(
+            "committed_transcript_with_timestamps", enqueue("words")
+        )
+        self._connection.on(
+            "session_time_limit_exceeded", enqueue("session_limit")
+        )
+        self._connection.on("close", enqueue("closed"))
+        for event in self._ERROR_EVENTS:
+            self._connection.on(event, enqueue("error"))
+
+    async def send_pcm(self, pcm: bytes) -> None:
+        import base64
+
+        payload: dict[str, Any] = {
+            "audio_base_64": base64.b64encode(pcm).decode("ascii"),
+        }
+        if self._first_send and self._previous_text:
+            payload["previous_text"] = self._previous_text
+        self._first_send = False
+        await self._connection.send(payload)
+
+    async def commit(self) -> None:
+        await self._connection.commit()
+
+    def pending_events(self) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
+        while True:
+            try:
+                events.append(self._events.get_nowait())
+            except asyncio.QueueEmpty:
+                return events
+
+    async def next_event(self, timeout: float) -> tuple[str, Any] | None:
+        try:
+            return await asyncio.wait_for(self._events.get(), timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    async def close(self) -> None:
+        if self._connection is not None:
+            try:
+                await self._connection.close()
+            except Exception:
+                pass
+            self._connection = None
+
+
+class ElevenLabsRealtimeTranscriber(Transcriber):
+    """Realtime Scribe transcription over one (or few) WebSocket sessions.
+
+    The only remote backend with true incremental persistence: committed
+    words land in ``transcript_words`` as they arrive, so an interrupted
+    authoritative pass resumes from the last durable word instead of zero.
+    """
+
+    name = "elevenlabs-stream"
+
+    def __init__(
+        self,
+        settings: Settings,
+        work_dir: Path,
+        db: JobDatabase,
+        runner: CommandRunner | None = None,
+        session_factory: Callable[[], Any] | None = None,
+    ):
+        super().__init__()
+        self.settings = settings
+        self.work_dir = work_dir
+        self.db = db
+        self.runner = runner
+        self._session_factory = session_factory or (
+            lambda: _RealtimeSession(settings)
+        )
+        self._session: Any = None
+        self._words: list[Word] = []
+        self._persist = False
+        self._session_base = 0.0
+        self._fed_end: float | None = None
+        self._emitted_preview_ids: set[str] = set()
+
+    # --- shared event handling ---
+
+    def _handle_events(self, events: Sequence[tuple[str, Any]]) -> bool:
+        """Fold received events into the word stream; True when words changed."""
+        changed = False
+        for kind, data in events:
+            if kind == "words":
+                incoming = words_from_response(
+                    _get(data, "words", []) or [], offset=self._session_base
+                )
+                if not incoming:
+                    continue
+                merged = merge_streamed_words(self._words, incoming)
+                if len(merged) != len(self._words):
+                    fresh = merged[len(self._words):]
+                    self._words = merged
+                    changed = True
+                    if self._persist:
+                        # Append-only merges make the delta exactly the tail.
+                        self.db.append_transcript_words(fresh)
+            elif kind in {"session_limit", "closed"}:
+                raise _SessionEnded(kind)
+            elif kind == "error":
+                raise RuntimeError(f"ElevenLabs realtime error: {data}")
+        return changed
+
+    def _preview(self) -> list[Cue]:
+        return cues_from_words(
+            self._words,
+            max_cue_seconds=self.settings.subtitles.max_cue_seconds,
+            max_cue_chars=self.settings.subtitles.max_cue_chars,
+        )
+
+    # --- chunk previews: one continuous session, new bytes only ---
+
+    async def start_chunks(self) -> None:
+        self._session = self._session_factory()
+        await self._session.open()
+
+    async def submit_chunk(self, wav: Path, offset: float) -> list[Cue]:
+        import wave
+
+        if self._session is None:
+            await self.start_chunks()
+        with wave.open(str(wav), "rb") as reader:
+            parameters = reader.getparams()
+            frames = reader.readframes(parameters.nframes)
+        bytes_per_second = (
+            parameters.framerate * parameters.sampwidth * parameters.nchannels
+        )
+        duration = parameters.nframes / parameters.framerate
+        if self._fed_end is None:
+            self._session_base = offset
+            self._fed_end = offset
+        # The excerpt re-carries a few context seconds already sent to this
+        # continuous session; only the bytes past the fed end are new.
+        skip_seconds = max(0.0, self._fed_end - offset)
+        skip_bytes = min(len(frames), round(skip_seconds * bytes_per_second))
+        fresh = frames[skip_bytes:]
+        if fresh:
+            await self._session.send_pcm(fresh)
+            self._fed_end = max(self._fed_end, offset + duration)
+        try:
+            self._handle_events(self._session.pending_events())
+        except _SessionEnded:
+            # A capped preview session simply reconnects on the next chunk;
+            # the authoritative pass owns durable delivery.
+            await self._session.close()
+            self._session = None
+            self._fed_end = None
+        preview = self._preview()
+        self._chunk_timeline.cues = preview
+        fresh_cues = [
+            cue for cue in preview if cue.id not in self._emitted_preview_ids
+        ]
+        self._emitted_preview_ids.update(cue.id for cue in fresh_cues)
+        return fresh_cues
+
+    async def close_chunks(self) -> None:
+        if self._session is None:
+            return
+        try:
+            await self._session.commit()
+        except Exception:
+            pass
+        await self._session.close()
+        self._session = None
+
+    # --- the authoritative pass ---
+
+    async def transcribe(
+        self,
+        audio: Path,
+        on_event: EventCallback | None = None,
+        on_progress: ProgressCallback | None = None,
+        *,
+        resume_from: Sequence[Cue] = (),
+    ) -> list[Cue]:
+        from .media import pcm_audio_duration
+
+        self._persist = True
+        duration = pcm_audio_duration(audio) or 0.0
+        stored = self.db.list_transcript_words()
+        if stored:
+            self._words = stored
+        reconnects = 0
+        while True:
+            if self._words:
+                start_at = max(
+                    0.0, self._words[-1].end - RECONNECT_OVERLAP_SECONDS
+                )
+                previous_text = "".join(
+                    word.text for word in self._words[-60:]
+                ).strip()[-500:]
+            else:
+                start_at = 0.0
+                previous_text = ""
+            self._session = self._session_factory()
+            self._session_base = start_at
+            await self._session.open(previous_text)
+            try:
+                await self._feed(audio, start_at, duration, on_event, on_progress)
+                break
+            except _SessionEnded:
+                await self._session.close()
+                self._session = None
+                reconnects += 1
+                if reconnects > _MAX_RECONNECTS:
+                    raise RuntimeError(
+                        "the ElevenLabs realtime session ended "
+                        f"{reconnects} times before the audio did; the words "
+                        "delivered so far are preserved, resume to continue"
+                    ) from None
+            finally:
+                if self._session is not None:
+                    await self._session.close()
+                    self._session = None
+        preview = self._preview()
+        for cue in preview:
+            if on_event:
+                await on_event(TranscriptEvent(cue, final=True))
+        return preview
+
+    async def _feed(
+        self,
+        audio: Path,
+        start_at: float,
+        duration: float,
+        on_event: EventCallback | None,
+        on_progress: ProgressCallback | None,
+    ) -> None:
+        import wave
+
+        async def note_progress(fed: float) -> None:
+            if on_progress and duration:
+                await on_progress(min(0.95, fed / duration))
+
+        async def emit_new_preview() -> None:
+            if on_event is None:
+                return
+            preview = self._preview()
+            fresh = [
+                cue
+                for cue in preview
+                if cue.id not in self._emitted_preview_ids
+            ]
+            self._emitted_preview_ids.update(cue.id for cue in fresh)
+            for cue in fresh:
+                await on_event(TranscriptEvent(cue, final=False))
+
+        with wave.open(str(audio), "rb") as reader:
+            parameters = reader.getparams()
+            bytes_per_second = (
+                parameters.framerate * parameters.sampwidth * parameters.nchannels
+            )
+            reader.setpos(
+                min(parameters.nframes, round(start_at * parameters.framerate))
+            )
+            fed = start_at
+            acked_floor = start_at
+            while True:
+                frames = reader.readframes(parameters.framerate)
+                if not frames:
+                    break
+                await self._session.send_pcm(frames)
+                fed += len(frames) / bytes_per_second
+                self._fed_end = fed
+                if self._handle_events(self._session.pending_events()):
+                    await emit_new_preview()
+                # Flow control: never run more than the window ahead of what
+                # the server has demonstrably consumed. Committed words are
+                # the only explicit acknowledgement, but silence commits
+                # nothing, so waited wall clock also counts as progress: a
+                # realtime server consumes at least in real time.
+                while (
+                    fed
+                    - max(
+                        self._words[-1].end if self._words else start_at,
+                        acked_floor,
+                    )
+                    > _FLOW_CONTROL_WINDOW_SECONDS
+                ):
+                    event = await self._session.next_event(10.0)
+                    if event is None:
+                        acked_floor += 10.0
+                        continue
+                    if self._handle_events([event]):
+                        await emit_new_preview()
+                await note_progress(fed)
+        await self._session.commit()
+        while True:
+            event = await self._session.next_event(_EVENT_QUIET_TIMEOUT_SECONDS)
+            if event is None:
+                break
+            if event[0] == "closed":
+                break
+            if event[0] == "session_limit":
+                # The audio was already fully fed; whatever was committed is
+                # in, so the session ending now is completion, not failure.
+                break
+            if self._handle_events([event]):
+                await emit_new_preview()
+        await note_progress(duration or self._fed_end or 0.0)

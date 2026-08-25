@@ -538,6 +538,7 @@ class TranslationPipeline:
         self.on_agent_event = on_agent_event
         self._write_lock = asyncio.Lock()
         self._agent_semaphore = asyncio.Semaphore(settings.agent.draft.workers)
+        self._dispatched_word_ranges: set[tuple[int, int]] = set()
 
     async def _emit_agent(
         self,
@@ -1052,6 +1053,50 @@ class TranslationPipeline:
                 split_word_batches(run, self.settings.agent.draft.word_batch_size)
             )
         return batches
+
+    def dispatch_ready_word_batches(
+        self,
+        on_batch: Callable[[list[Cue]], Awaitable[None]] | None = None,
+    ) -> list[asyncio.Task[None]]:
+        """Start agent work for word batches a running stream has completed.
+
+        Only words up to the last qualified silence are considered, and only
+        batches that reached the target size are dispatched — the tail keeps
+        growing and is held back so every dispatched batch ends on a real
+        pause. Returns the newly created tasks; the caller owns awaiting them.
+        """
+        from .elevenlabs import dispatchable_word_count
+
+        words = self.db.list_transcript_words()
+        usable = words[:dispatchable_word_count(words)]
+        if not usable:
+            return []
+        target = self.settings.agent.draft.word_batch_size
+        tasks: list[asyncio.Task[None]] = []
+        for batch in self.missing_word_batches(usable):
+            key = (batch.words[0].ordinal, batch.words[-1].ordinal)
+            if len(batch.words) < target or key in self._dispatched_word_ranges:
+                continue
+            self._dispatched_word_ranges.add(key)
+            tasks.append(
+                asyncio.create_task(
+                    self._dispatch_and_store(batch, words, on_batch)
+                )
+            )
+        return tasks
+
+    async def _dispatch_and_store(
+        self,
+        batch: WordBatch,
+        all_words: Sequence[Word],
+        on_batch: Callable[[list[Cue]], Awaitable[None]] | None,
+    ) -> None:
+        async with self._agent_semaphore:
+            cues = await self._run_word_batch(list(batch.words), all_words)
+        async with self._write_lock:
+            self.db.upsert_cues(cues, stable=True)
+            if on_batch:
+                await on_batch(self.db.list_cues(stable_only=True))
 
     async def segment_and_translate(
         self,

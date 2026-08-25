@@ -903,8 +903,26 @@ class YakiFlowJob:
         transcriber,
         partial_path: Path,
     ) -> list[Cue]:
+        pipeline = self._translation_pipeline()
+        # Only the realtime backend persists words while it still runs, so
+        # only there can finished word batches go to the draft agent while
+        # transcription continues, mirroring the in-flight draft batches of
+        # the Whisper flow.
+        incremental_dispatch = transcriber.name == "elevenlabs-stream"
+        translation_tasks: list[asyncio.Task[None]] = []
+
+        async def on_batch(_cues: Sequence[Cue]) -> None:
+            await self._write_partial(partial_path, self._word_partial_view())
+
         async def event(item: TranscriptEvent) -> None:
             await self.emit("transcript", "provisional preview subtitle", cue=item.cue)
+            if incremental_dispatch and not item.final:
+                translation_tasks[:] = [
+                    task for task in translation_tasks if not task.done()
+                ]
+                translation_tasks.extend(
+                    pipeline.dispatch_ready_word_batches(on_batch)
+                )
 
         async def word_progress(fraction: float) -> None:
             await self._report_progress(
@@ -913,15 +931,27 @@ class YakiFlowJob:
                 f"{transcriber.name} transcription · {round(fraction * 100)}%",
             )
 
-        preview = await transcriber.transcribe(
-            artifact.audio_path, event, word_progress
-        )
-        # The preview cues are provisional placeholders: the draft agent's
-        # segmentation of the stored words produces the real cues.
-        if preview:
-            self.db.upsert_cues(preview, stable=False)
-        await self._write_partial(partial_path, self._word_partial_view())
-        self.db.checkpoint("transcribed", True)
+        succeeded = False
+        try:
+            preview = await transcriber.transcribe(
+                artifact.audio_path, event, word_progress
+            )
+            # The preview cues are provisional placeholders: the draft agent's
+            # segmentation of the stored words produces the real cues.
+            if preview:
+                self.db.upsert_cues(preview, stable=False)
+            await self._write_partial(partial_path, self._word_partial_view())
+            self.db.checkpoint("transcribed", True)
+            # Land the in-flight batches before the translation stage computes
+            # what is still missing, or their ranges would be dispatched twice.
+            if translation_tasks:
+                await asyncio.gather(*translation_tasks)
+            succeeded = True
+        finally:
+            if not succeeded and translation_tasks:
+                for task in translation_tasks:
+                    task.cancel()
+                await asyncio.gather(*translation_tasks, return_exceptions=True)
         await self._finish_stage("transcribe", "word transcript ready")
         return self.db.list_cues(stable_only=True)
 
