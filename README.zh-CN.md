@@ -2,9 +2,10 @@
 
 简体中文 | [English](README.md)
 
-YakiFlow 可以把本地视频、音频、网页视频或直播流转换成 SRT 字幕。它使用
-`whisper.cpp` 转录，通过 Codex 或 Claude Code 翻译，并在保存前让你与交互式
-Agent 一起审校结果。
+YakiFlow 可以把本地视频、音频、网页视频或直播流转换成 ASS 字幕。它使用
+`whisper.cpp` 或 ElevenLabs Scribe API 转录，通过 Codex 或 Claude Code 翻译，
+并在保存前让你与交互式 Agent 一起审校结果。使用支持说话人识别的后端时，每条
+字幕都带有说话人标签，两人同时说话会成为两条时间上重叠的字幕。
 
 任务支持断点续跑：如果运行中断，YakiFlow 会保留已经完成的工作，并打印继续
 任务所需的命令。
@@ -17,12 +18,14 @@ Agent 一起审校结果。
 
 - Python 3.12 或更高版本；
 - `ffmpeg`；
-- 较新版本的 [whisper.cpp](https://github.com/ggml-org/whisper.cpp)，且能在
-  `PATH` 中找到 `whisper-cli`；
-- `codex` 或 `claude` CLI，二选一安装并登录。
+- `codex` 或 `claude` CLI，二选一安装并登录；
+- 使用默认的本地转录时，还需要较新版本的
+  [whisper.cpp](https://github.com/ggml-org/whisper.cpp)，且能在 `PATH` 中找到
+  `whisper-cli`。
 
-处理 URL 时还要安装 `yt-dlp`，处理直播流时还要有 `whisper-server`。`tmux` 和
-`mpv` 是可选工具，分别用于分屏审校和视频预览。
+处理 URL 时还要安装 `yt-dlp`。`tmux` 和 `mpv` 是可选工具，分别用于分屏审校和
+视频预览。ElevenLabs 后端不需要任何本地转录工具，参见
+[转录后端](#转录后端)。
 
 ### 2. 安装 YakiFlow
 
@@ -34,30 +37,40 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
+若要使用 ElevenLabs 后端，安装 `.[elevenlabs]`；若要把 API key 存进操作系统
+钥匙串，再加上 `.[keyring]`：
+
+```console
+python -m pip install -e '.[elevenlabs,keyring]'
+```
+
 ### 3. 保存常用设置
 
 在准备运行 YakiFlow 的目录中创建 `yakiflow.toml`：
 
 ```toml
-source_language = "auto"
-target_language = "zh-CN"
-translation_backend = "codex"
-output_dir = "./subtitles"
-output_mode = "bilingual"
+source-language = "auto"
+target-language = "zh-CN"
+output-dir = "./subtitles"
+output-mode = "bilingual"
+
+[agent]
+backend = "codex"
 ```
 
-如果使用 Claude Code，把后端改为 `translation_backend = "claude"`。也可以不创建
-配置文件，每次运行时都传入对应参数。
+如果使用 Claude Code，把后端改为 `backend = "claude"`。也可以不创建配置文件，
+每次运行时都传入对应参数。
 
 ### 4. 下载默认模型并检查环境
 
 ```console
 yakiflow models fetch
-yakiflow doctor --translation-backend codex
+yakiflow doctor -c agent.backend=codex
 ```
 
 使用 Claude Code 时把 `codex` 换成 `claude`。请修复所有与当前输入有关的
-`FAIL`；`yt-dlp` 只影响 URL，`whisper-server` 只影响 `--stream`。
+`FAIL`；`yt-dlp` 只影响 URL，whisper.cpp 相关检查只影响 Whisper 后端。
+ElevenLabs 后端不需要 `models fetch`。
 
 ### 5. 生成字幕
 
@@ -65,31 +78,118 @@ yakiflow doctor --translation-backend codex
 yakiflow run video.mp4
 ```
 
-如果没有 `yakiflow.toml`，需要明确传入三个必填设置：
+没有 `yakiflow.toml` 时，显式提供三项必需设置：
 
 ```console
 yakiflow run video.mp4 \
   --source-language auto \
   --target-language zh-CN \
-  --translation-backend codex \
+  -c agent.backend=codex \
   --output-dir ./subtitles
 ```
 
-YakiFlow 会显示转录和翻译进度。在交互式终端中，批处理结束后还会打开所选
-Agent 做最终审校。直接告诉 Agent 需要怎样修改，满意后结束审校会话。任务完成
-时，终端会打印最终字幕路径。
+YakiFlow 会显示转录和翻译进度。在交互式终端中，随后会打开所选的 Agent 进行
+最终审校。把想要的修改告诉 Agent，满意后结束审校会话。任务完成时会打印最终
+字幕文件的路径。
 
-## 常用操作
+## 命令行选项
+
+少数高频设置有专用选项：
+
+| 选项 | 设置 |
+| --- | --- |
+| `-s`、`--source-language` | 源语言代码，或 `auto` |
+| `-t`、`--target-language` | 目标语言或区域设置 |
+| `--transcription-backend` | 四种转录后端之一 |
+| `--stream` / `--no-stream` | 把 URL 作为直播流处理 |
+| `--output-dir` | 最终字幕文件的目录 |
+| `--output-mode` | `source`、`translated`、`bilingual` 或 `all` |
+| `--context-file` | 把参考文件复制进工作目录；可重复 |
+| `--work-dir` | 把可续跑的任务状态放到指定目录 |
+| `--keep-workdir` | 成功后保留中间文件 |
+| `--config-file` | 使用指定的项目配置文件 |
+| `--profile` | 选择一个 `[profiles.NAME]` 配置组 |
+
+其余所有设置都通过可重复的 `-c KEY=VALUE` 选项修改，`KEY` 是该设置的点号
+TOML 键：
+
+```console
+yakiflow run video.mp4 \
+  -c transcription.backend=elevenlabs \
+  -c agent.draft.effort=medium \
+  -c 'commands.yt-dlp-options=["--cookies-from-browser", "chrome"]'
+```
+
+值按 TOML 解析（布尔、数字、数组）；无法按 TOML 解析的值当作普通字符串。
+专用选项优先于 `-c`，`-c` 优先于所有配置文件。
+
+## 转录后端
+
+用 `transcription.backend`（或 `--transcription-backend`）选择：
+
+| 后端 | 说明 | 需要 |
+| --- | --- | --- |
+| `whisper-cli` | 本地 whisper.cpp 批量转录（默认） | `whisper-cli` 和模型文件 |
+| `whisper-server` | whisper.cpp 服务器——本地启动，或通过 `whisper.server-url` 连接已运行的实例 | `whisper-server`，或可访问的服务器 |
+| `elevenlabs` | ElevenLabs Scribe 批量 API，支持说话人识别 | `yakiflow[elevenlabs]` 和 API key |
+| `elevenlabs-stream` | ElevenLabs Scribe 实时 WebSocket API | `yakiflow[elevenlabs]` 和 API key |
+
+四种后端都同时适用于普通任务和 `--stream` 直播采集。处理直播时，
+`whisper-server` 和 `elevenlabs-stream` 的实时预览最快；`whisper-cli` 也可用，
+但每个片段都要重新加载模型，预览会明显落后于直播。
+
+`elevenlabs` 后端支持说话人识别（`elevenlabs.diarize`，默认开启）：每条字幕的
+说话人标签写入 ASS 的 `Name` 字段，同时说话会成为时间上重叠的字幕。实时 API
+不支持说话人识别。使用 ElevenLabs 后端时，字幕的分行断句和翻译由 draft Agent
+根据词级转录一并完成。
+
+连接已运行的 whisper-server 而不是本地启动：
+
+```toml
+[transcription]
+backend = "whisper-server"
+
+[whisper]
+server-url = "http://127.0.0.1:8080"
+```
+
+### ElevenLabs API key
+
+key 按以下顺序查找：
+
+1. 命令行 `-c` 传入的 `elevenlabs.api-key*` 设置；
+2. 环境变量 `ELEVENLABS_API_KEY`；
+3. 配置文件中的 `elevenlabs.api-key*` 设置；
+4. 操作系统钥匙串（需要 `yakiflow[keyring]`）。
+
+在配置文件（或 `-c`）中，三种写法只能选一种：
+
+```toml
+[elevenlabs]
+api-key = "sk-…"                  # 直接写 key
+# api-key-file = "~/.secrets/elevenlabs"   # 从文件读取 key
+# api-key-command = "pass show elevenlabs" # 运行命令，stdout 是 key
+```
+
+把 key 存进操作系统钥匙串而不写任何文件：
+
+```console
+yakiflow secret set elevenlabs
+yakiflow secret unset elevenlabs
+```
+
+`yakiflow doctor` 会报告 key 的来源，但不会打印 key 本身。
+
+## 常见任务
 
 ### 处理本地文件
 
-只要 `ffmpeg` 支持，就可以使用相应格式的音频或视频：
+任何 `ffmpeg` 支持的音视频格式都可以使用：
 
 ```console
 yakiflow run ./recordings/interview.mkv \
   --source-language en \
   --target-language zh-CN \
-  --translation-backend codex \
   --output-dir ./subtitles
 ```
 
@@ -99,13 +199,12 @@ yakiflow run ./recordings/interview.mkv \
 yakiflow run 'https://example.com/watch?v=123' \
   --source-language ja \
   --target-language en \
-  --translation-backend claude \
-  --download-dir ./downloads \
+  -c download-dir=./downloads \
   --output-dir ./subtitles
 ```
 
-`--download-dir` 会保留下载的媒体；不设置时使用临时副本。URL 任务建议设置
-`--output-dir`，以便确定字幕保存位置。YakiFlow 不会下载整个播放列表。
+`download-dir` 会保留下载的媒体文件；省略则使用临时副本。处理 URL 时建议设置
+`--output-dir`，让字幕位置可预期。不会下载播放列表。
 
 ### 处理直播流
 
@@ -114,257 +213,254 @@ yakiflow run 'https://example.com/live' \
   --stream \
   --source-language auto \
   --target-language zh-CN \
-  --translation-backend codex \
   --output-dir ./subtitles
 ```
 
-直播字幕是临时结果。采集结束后，YakiFlow 会重新转录完整录制内容，再发布最终
-SRT。在 TUI 中按 `s` 可以停止采集，并完成已经收到的内容；未使用 TUI 时按一次
-Ctrl-C。
+直播字幕是临时的。采集结束后，YakiFlow 会对完整录像重新转录，然后才发布最终
+字幕。在 TUI 中按 `s` 停止采集并把已收到的内容收尾；非 TUI 运行按一次 Ctrl-C。
 
-### 选择字幕格式
+### 选择字幕形式
 
-使用 `--output-mode`，或在 TOML 中设置 `output_mode`：
+使用 `--output-mode` 或在 TOML 中设置 `output-mode`：
 
-| 值 | 输入为 `video.mp4` 时的结果 |
+| 值 | 输入名为 `video.mp4` 时的结果 |
 | --- | --- |
-| `bilingual` | `video.en-zh-cn.srt`，每条先放译文、再放原文（默认） |
-| `source` | `video.source.srt` |
-| `translated` | `video.translated.srt` |
-| `all` | 同时生成以上三种文件 |
+| `bilingual` | `video.en-zh-cn.ass`，译文在上、原文在下（默认） |
+| `source` | `video.source.ass` |
+| `translated` | `video.translated.ass` |
+| `all` | 以上三种全部输出 |
 
-自动识别源语言时，双语文件名会使用 `auto`，例如
-`video.auto-zh-cn.srt`。
+自动检测语言时，双语文件名使用检测到的语言，例如 `video.ja-zh-cn.ass`。`mpv`
+等播放器可以直接加载 ASS 文件
+（`mpv --sub-file=video.en-zh-cn.ass video.mp4`）。
 
 ### 恢复中断的任务
 
-在 TUI 中按 `s` 会正常停止当前任务，按 Ctrl-Q 退出界面；未使用 TUI 时，第一次
-按 Ctrl-C 会正常停止采集，第二次会强制退出。任务中断或失败后，YakiFlow 会打印
-保留下来的工作目录。运行以下命令恢复：
+在 TUI 中按 `s` 干净地停止当前任务，按 Ctrl-Q 退出界面。非 TUI 运行时，第一次
+Ctrl-C 干净地停止采集，第二次 Ctrl-C 强制退出。中断或失败后，YakiFlow 会打印
+保留的工作目录。用以下命令恢复：
 
 ```console
 yakiflow resume /path/to/workdir
 ```
 
-请完整保留工作目录。`resume` 使用原来的输入和设置，不接受替换运行参数。如果
-想预先确定工作目录，可在创建任务时加上 `--work-dir ./work/video-job`。
+请保持整个工作目录完整。`resume` 使用原始输入和设置；必要时仍可用 `-c` 调整
+单项设置。旧版 YakiFlow 用不同配置结构创建的工作目录，必须用创建它的版本
+完成。要提前指定工作目录位置，启动任务时加 `--work-dir ./work/video-job`。
 
 ## 配置指南
 
-YakiFlow 按以下顺序读取配置，越靠前优先级越高：
+设置按以下顺序读取，优先级从高到低：
 
-1. 命令行参数；
-2. `--config` 指定的文件（或当前目录中的 `yakiflow.toml`）里选中的配置档；
-3. 用户配置文件里选中的配置档；
-4. 项目配置文件的基础设置；
-5. 用户配置文件的基础设置；
-6. 内置默认值。
+1. 专用命令行选项；
+2. `-c KEY=VALUE` 覆盖项；
+3. `--config-file` 指定文件（或当前目录 `yakiflow.toml`）中被选中的 profile；
+4. 用户配置文件中被选中的 profile；
+5. 项目配置文件中的基础设置；
+6. 用户配置文件中的基础设置；
+7. 内置默认值。
 
-Linux 用户配置文件位于 `~/.config/yakiflow/config.toml`（设置了
-`XDG_CONFIG_HOME` 时则在 `$XDG_CONFIG_HOME/yakiflow/config.toml`）。普通设置
-直接写在 TOML 文档根部。相对路径以启动任务时所在的目录为基准。
+在 Linux 上，用户配置文件是 `~/.config/yakiflow/config.toml`（或
+`$XDG_CONFIG_HOME/yakiflow/config.toml`）。相对路径相对于启动任务的目录解析。
 
-### 配置档
-
-可复用的变体写在 `[profiles.NAME]` 下，并在 `run`、`doctor` 或
-`models fetch` 中用 `--profile` 选择：
+设置按 TOML 表分组。包含最常用键的完整示例：
 
 ```toml
-source_language = "auto"
-target_language = "zh-CN"
-translation_backend = "codex"
+# 顶层设置
+source-language = "auto"
+target-language = "zh-CN"
+output-mode = "bilingual"        # source | translated | bilingual | all
+output-dir = "./subtitles"
+# download-dir = "./downloads"   # 保留从 URL 下载的媒体
+# memory = "./memory.md"         # 持久的术语/风格记忆文件
+# context-files = ["notes.txt"]  # 交互审校的只读参考文件
+# work-dir = "./work"            # 可续跑任务状态的位置
+# keep-workdir = false
+
+[transcription]
+backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenlabs-stream
+
+[whisper]                 # whisper-cli 与 whisper-server 共用
+# model = "/path/to/ggml-large-v3-turbo-q5_0.bin"
+# vad-model = "/path/to/ggml-silero-v6.2.0.bin"
+# vad = true              # 设为 false 可忽略已配置的 VAD 模型
+# cli = "whisper-cli"     # 可执行文件名或路径
+# server = "whisper-server"
+# server-url = "http://127.0.0.1:8080"  # 连接已运行实例而不本地启动
+
+[elevenlabs]              # elevenlabs 与 elevenlabs-stream 共用
+# api-key-command = "pass show elevenlabs"
+# model = "scribe_v2"
+# realtime-model = "scribe_v2_realtime"
+# diarize = true          # 说话人识别（仅批量 API）
+# num-speakers = 3        # 可选的说话人数提示
+
+[alignment]
+# backend = "vad"         # vad | whisperx | none
+# device = "auto"         # auto | cpu | cuda（WhisperX）
+# model = "custom/model"  # 覆盖 WhisperX 对齐模型
+
+[stream]
+# enabled = false         # 等同于 --stream
+# chunk-seconds = 15      # 直播转录片段的时长
+# context-seconds = 5     # 每个片段前保留的音频上下文
+
+[subtitles]
+# max-cue-seconds = 8.0   # 单条字幕的最长时长（ElevenLabs 后端）
+# max-cue-chars = 84      # 单条字幕单语言的最长字符数
+
+[agent]                   # 两个翻译阶段共享
+backend = "codex"         # codex | claude
+# model = "…"             # 很少需要
+# effort = "…"            # minimal | low | medium | high | xhigh
+# extra-options = ["…"]   # 传给 Agent CLI 的额外 argv 参数
+
+[agent.draft]             # 批量草稿翻译；覆盖 [agent]
+# backend = "…"
+# model = "…"             # 默认：codex → gpt-5.6-terra，claude → sonnet
+# effort = "low"
+# extra-options = ["…"]
+# workers = 4             # 并行草稿请求数
+# batch-size = 20         # 每次请求的字幕条数（Whisper 后端）
+# preceding-context = 10  # 作为上下文的前文字幕条数
+# following-context = 5   # 作为上下文的后文字幕条数
+# word-batch-size = 400   # 每次请求的词数（ElevenLabs 后端）
+# word-following-context = 40
+# timeout-seconds = 600
+# max-attempts = 3
+# retry-delay-seconds = 1
+
+[agent.final]             # 交互审校；覆盖 [agent]
+# backend = "…"
+# model = "…"             # 默认：codex → gpt-5.6-sol，claude → opus
+# effort = "high"
+# extra-options = ["…"]
+
+[review]
+# display-mode = "split"  # split | open | both
+# open-command = "code --reuse-window {workdir} {subtitle} {memory}"
+# auto-open-video = false
+# video-open-command = "vlc --sub-file={subtitle} {file}"
+
+[commands]
+# ffmpeg = "ffmpeg"
+# yt-dlp = "yt-dlp"
+# yt-dlp-options = ["--cookies-from-browser", "chrome"]
+```
+
+Codex 的默认模型是草稿翻译 `gpt-5.6-terra`、审校 `gpt-5.6-sol`；Claude 的默认
+是 `sonnet` 和 `opus`。如果这些名称对你的账户不可用，请自行覆盖。
+`[agent.draft]` 和 `[agent.final]` 中的设置优先于共享的 `[agent]` 值，因此两个
+阶段可以使用不同的后端。
+
+`extra-options` 和 `yt-dlp-options` 必须是只含字符串的 TOML 数组。YakiFlow 把
+每个字符串直接作为一个 argv 参数传递；带值的选项要写成两个数组元素。
+
+### 配置 profile
+
+把可复用的变体放在 `[profiles.NAME]` 下，并在 `run`、`resume`、`doctor` 或
+`models fetch` 时用 `--profile` 选择：
+
+```toml
+source-language = "auto"
+target-language = "zh-CN"
+
+[agent]
+backend = "codex"
 
 [profiles.stream]
-stream = true
-translation_batch_size = 5
-draft_codex_options = ["-c", "service_tier=fast"]
+stream.enabled = true
+transcription.backend = "whisper-server"
+agent.draft.batch-size = 5
+agent.draft.extra-options = ["-c", "service_tier=fast"]
 ```
 
 ```console
 yakiflow run 'https://example.com/live' --profile stream
 yakiflow doctor --profile stream
-yakiflow models fetch --profile stream
 ```
 
-如果用户与项目文件都定义了所选名称，两处配置档会按字段合并，项目值覆盖用户
-值；列表会整体替换，而不是追加。配置档在两个基础配置文件之后应用，因此用户
-配置档也会覆盖项目基础设置；显式命令行参数仍有最高优先级。未选中的配置档完全
-不生效。
+profile 可以使用点号键或嵌套表，并按单项设置合并：只修改
+`agent.draft.batch-size` 的 profile 会保留基础配置中 `[agent.draft]` 的其他
+值。数组整体替换而不是追加。用户和项目文件都定义了所选名称时，项目 profile
+获胜；profile 在两个基础配置之后应用，而 `-c` 和专用选项仍然优先于 profile。
+选择未知的 profile 是错误，profile 不能继承其他 profile，未被选中的 profile
+没有任何影响。YakiFlow 会把完整解析后的设置随任务保存，因此续跑不依赖
+profile 或配置文件仍然存在。
 
-选择不存在的配置档会报错。`profiles` 和每个命名配置档都必须是 TOML 表，配置档
-不能包含嵌套表，也不能继承其他配置档。YakiFlow 会把完全解析后的有效设置随任务
-保存，因此恢复任务不依赖原配置档或配置文件继续存在。YakiFlow 不提供内置配置档；
-不选择配置档时仍使用原有默认行为。
+### 审校用的参考文件
 
-### 常用设置
-
-大多数用户只需要以下设置：
-
-| TOML 键 | 命令行参数 | 用途 |
-| --- | --- | --- |
-| `source_language` | `--source-language` | 源语言代码，或 `auto` |
-| `target_language` | `--target-language` | 翻译目标语言或区域 |
-| `translation_backend` | `--translation-backend` | `codex` 或 `claude` |
-| `output_dir` | `--output-dir` | 最终 SRT 保存目录 |
-| `output_mode` | `--output-mode` | `source`、`translated`、`bilingual` 或 `all` |
-| `download_dir` | `--download-dir` | 保留从 URL 下载的媒体 |
-| `whisper_model` | `--whisper-model` | 使用已有的自定义 whisper.cpp 模型 |
-| `vad_model` | `--vad-model` | 启用本地 Whisper 兼容 VAD 模型 |
-| `vad` | `--vad` / `--no-vad` | 无需修改配置即可忽略已配置的 VAD 模型（默认 `true`） |
-| `memory` | `--memory` | 指定持久化术语和风格记忆文件 |
-| `context_files` | `--context-file` | 将参考文件复制到工作目录供交互式审校使用；多个文件可重复指定此参数 |
-| `agent_workers` | `--agent-workers` | 限制草稿翻译并发数，默认为 4 |
-| `draft_model` | `--draft-model` | 覆盖后端的草稿模型 |
-| `final_model` | `--final-model` | 覆盖交互式审校模型 |
-| `keep_workdir` | `--keep-workdir` | 成功后仍保留中间文件 |
-
-Codex 默认使用 `gpt-5.6-terra` 做草稿翻译、`gpt-5.6-sol` 做审校；Claude 默认
-使用 `sonnet` 和 `opus`。如果当前账号不能使用这些名称，请覆盖相应模型设置。
-
-例如，可以把弹幕导出文件和说话人备注作为只读参考交给交互式审校 Agent：
+把弹幕导出和说话人备注作为只读参考传给交互式审校 Agent：
 
 ```console
 yakiflow run video.mp4 --context-file danmaku.xml --context-file speakers.txt
 ```
 
-YakiFlow 会将每个文件快照到任务工作目录的 `context/` 下，因此恢复任务时不再依赖
-原始参考文件。
-
-### 高级设置
-
-以下表格列出了其余所有 TOML 设置。内置默认值通常已经合适，只有在需要对应行为时
-才应修改。命令行参数栏中的破折号表示该设置仅支持 TOML。完整的命令行用法可运行
-`yakiflow run --help` 查看。
-
-#### 任务控制
-
-| TOML 键 | 命令行参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `stream` | `--stream` / `--no-stream` | `false` | 将 URL 作为直播流处理 |
-| `work_dir` | `--work-dir` | 临时目录 | 将可恢复任务状态和中间文件放在指定目录 |
-
-#### 对齐
-
-| TOML 键 | 命令行参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `alignment_backend` | `--alignment-backend` | `vad` | 时间轴调整后端：`vad` 或 `whisperx` |
-| `alignment_device` | `--alignment-device` | `auto` | WhisperX 设备：`auto`、`cpu` 或 `cuda` |
-| `alignment_model` | `--alignment-model` | 自动选择 | 覆盖对应语言的 WhisperX 对齐模型 |
-
-#### 翻译与 Agent 调优
-
-| TOML 键 | 命令行参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `draft_effort` | `--draft-effort` | `low` | 草稿翻译的推理强度 |
-| `final_effort` | `--final-effort` | `high` | 交互式审校的推理强度 |
-| `draft_codex_options` | — | `[]` | 仅传给 Codex 结构化草稿翻译调用的额外 argv token |
-| `final_codex_options` | — | `[]` | 传给 Codex 交互式审校和记忆冲突会话的额外 argv token |
-| `draft_claude_options` | — | `[]` | 仅传给 Claude 结构化草稿翻译调用的额外 argv token |
-| `final_claude_options` | — | `[]` | 传给 Claude 交互式审校和记忆冲突会话的额外 argv token |
-| `translation_batch_size` | — | `20` | 每次草稿请求最多发送的字幕条数 |
-| `translation_context` | — | `10` | 作为翻译上下文提供的前文字幕条数 |
-| `translation_following_context` | — | `5` | 作为翻译上下文提供的后文字幕条数，使跨越批次末尾的句子仍然可见（流式批次此时还没有后文） |
-| `draft_agent_timeout_seconds` | `--draft-agent-timeout-seconds` | `600` | 每次草稿 Agent 尝试的超时时间 |
-| `agent_max_attempts` | `--agent-max-attempts` | `3` | 草稿请求失败后的最大尝试次数 |
-| `agent_retry_delay_seconds` | `--agent-retry-delay-seconds` | `1` | 草稿请求两次尝试之间的等待秒数 |
-
-推理强度可设为 `minimal`、`low`、`medium`、`high` 或 `xhigh`。Agent 选项设置
-必须是只含字符串的 TOML 数组。YakiFlow 会把每个字符串直接作为一个 argv token，
-放在自身管理的参数之后、提示词或标准输入哨兵之前；不会进行 shell 解析、拼接或
-过滤。无效或冲突的参数由 Codex 或 Claude 报错。
-
-#### 审校显示
-
-| TOML 键 | 命令行参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `review_display_mode` | `--review-display-mode` | `split` | 使用 tmux 字幕窗格（`split`）、外部程序（`open`）或同时使用两者（`both`） |
-| `review_open_command` | `--review-open-command` | 未设置 | `open` 和 `both` 模式使用的命令模板；支持 `{srt}`、`{workdir}` 和 `{memory}` |
-| `auto_open_video` | `--auto-open-video` / `--no-auto-open-video` | `false` | 交互式审校开始时自动打开源视频 |
-| `video_open_command` | `--video-open-command` | 内置 `mpv` 命令 | 打开媒体的命令模板；支持 `{file}` 和 `{subtitle}` |
-
-当 `review_display_mode` 为 `"open"` 或 `"both"` 时，必须设置
-`review_open_command`。
-请勿给其中的占位符加引号；YakiFlow 会安全地将替换后的路径（包括含空格的路径）
-保留为单个参数。模板采用 shell 风格的参数解析，但解析后的命令会绕过 shell 直接
-启动。包含空格的字面参数仍需加引号。
-
-#### 直播流调优
-
-| TOML 键 | 命令行参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `stream_chunk_seconds` | — | `15` | 每个直播转录分块的时长 |
-| `stream_context_seconds` | — | `5` | 每个直播分块前保留的上下文音频重叠时长 |
-
-#### 外部命令
-
-| TOML 键 | 命令行参数 | 默认值 | 用途 |
-| --- | --- | --- | --- |
-| `ffmpeg` | — | `ffmpeg` | FFmpeg 可执行文件名或路径 |
-| `yt_dlp` | — | `yt-dlp` | yt-dlp 可执行文件名或路径 |
-| `yt_dlp_options` | — | `[]` | 额外的 yt-dlp argv token，例如 `["--cookies-from-browser", "chrome"]` |
-| `whisper_cli` | — | `whisper-cli` | whisper.cpp 批处理可执行文件名或路径 |
-| `whisper_server` | — | `whisper-server` | whisper.cpp 服务端可执行文件名或路径 |
-
-`yt_dlp_options` 必须是只含字符串的 TOML 数组。数组中的每个字符串都会原样传给
-yt-dlp；需要参数值的选项，要把选项名和值分别写成两个字符串，例如
-`yt_dlp_options = ["--cookies-from-browser", "chrome"]`。
-如果外部命令不在 `PATH` 中，请将对应设置改为它的完整路径。
+YakiFlow 会把每个文件快照到任务工作目录的 `context/` 下，因此续跑不依赖原始
+参考文件。
 
 ## 审校与翻译记忆
 
-从终端运行时，YakiFlow 会在批量翻译后启动交互式审校。Agent 会检查完整字幕，
-应用双方确认的修改，并可建议复用人名、术语或风格偏好。只有在你同意后，它才会
-更新记忆文件。
+在终端运行时，YakiFlow 会在批量翻译后启动交互式审校。Agent 检查完整的字幕
+文件、应用商定的修改，并可以提议可复用的名称、术语或风格偏好。只有在你确认
+后才会更新记忆。
 
-审校 Agent 默认用目标语言与你交流，你换用其他语言时它也会跟着切换。当目标语言
-无法沿用原文的断句时，它可以合并相关字幕条，并把同样的合并同步到所有配置的产物
-中。
+审校 Agent 用目标语言与你交流；如果你换用其他语言，它也会跟着切换。当目标
+语言无法保持原文的断句方式时，它可能合并这些字幕，并把合并同步到每个配置的
+输出文件。使用支持说话人识别的后端时，不同说话人的字幕在时间上重叠是正常
+现象，会原样保留。
 
-默认情况下，YakiFlow 会尽量通过 `tmux` 在 Agent 旁显示只读字幕窗格。在该窗格
-按 `o`，可以用 `mpv` 打开媒体并加载当前字幕。要使用其他播放器：
-
-```toml
-video_open_command = "vlc --sub-file={subtitle} {file}"
-```
-
-如需在交互式审校开始时自动打开源视频，请启用 `auto_open_video`（或传入
-`--auto-open-video`）。程序会使用配置的 `video_open_command`，并在播放器支持时
-附加暂存字幕。
-
-如果希望用编辑器打开暂存 SRT，而不是使用分屏预览：
+默认情况下，YakiFlow 会在可能时用 `tmux` 在 Agent 旁边显示一个只读字幕面板。
+在该面板中按 `o` 可用 `mpv` 打开带当前字幕的媒体。要换用其他播放器：
 
 ```toml
-review_display_mode = "open"
-review_open_command = "code --reuse-window {workdir} {srt} {memory}"
+[review]
+video-open-command = "vlc --sub-file={subtitle} {file}"
 ```
 
-若要同时打开编辑器并保留分屏预览，请使用 `review_display_mode = "both"`。
+要在交互审校开始时自动打开源视频，启用 `review.auto-open-video`。会使用配置的
+`video-open-command`，播放器支持时会挂载暂存的字幕。
 
-在 CI 或标准输入输出被重定向时，YakiFlow 会跳过交互式审校，直接保存批处理
-结果。
+要用编辑器打开暂存的字幕文件，而不是使用分屏预览：
+
+```toml
+[review]
+display-mode = "open"
+open-command = "code --reuse-window {workdir} {subtitle} {memory}"
+```
+
+`display-mode = "both"` 可以同时打开编辑器并保留分屏预览。`open-command` 支持
+`{subtitle}`、`{workdir}` 和 `{memory}` 占位符。占位符不要加引号；YakiFlow 会
+把替换后的路径（包括含空格的路径）安全地保持为单个参数。模板按 shell 风格
+解析参数，但最终命令不经过 shell 直接启动。
+
+在 CI 中或输入输出被重定向时，会跳过交互审校，直接完成批量结果。
 
 ## 可选：改善字幕时间轴
 
+以下选项适用于 Whisper 后端。ElevenLabs 后端本身提供词级精度的时间轴，默认
+`alignment.backend = "none"`。
+
 ### VAD
 
-Silero VAD 模型可以帮助 Whisper 跳过静音，并改善字幕起点。下载与你的
-whisper.cpp 构建兼容的模型，然后配置路径：
+Silero VAD 模型能帮助 Whisper 跳过静音并改善字幕起始时间。下载你的
+whisper.cpp 版本支持的模型，然后配置其路径：
 
 ```toml
-vad_model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
+[whisper]
+vad-model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
 ```
 
-`yakiflow models fetch` 不会下载 VAD 模型。下载命令请参考
+`yakiflow models fetch` 不会下载 VAD 模型。模型下载命令见
 [whisper.cpp VAD 指南](https://github.com/ggml-org/whisper.cpp#voice-activity-detection-vad)。
 
-如果想保留配置文件中的 `vad_model` 但本次运行不使用 VAD，可以传入 `--no-vad`
-（或设置 `vad = false`）。没有配置模型时 VAD 本来就不会启用，因此单独传 `--vad`
-不会有任何效果。
+传 `-c whisper.vad=false` 可以在保留配置文件中 `vad-model` 的同时禁用 VAD。
+没有配置模型时 VAD 始终关闭。
 
 ### WhisperX 强制对齐
 
-WhisperX 是可选组件，只调整时间轴；转录仍由 whisper.cpp 完成。当前 extra 需要
-Python 3.12 或 3.13。使用 uv 安装以下版本之一，不能同时安装：
+WhisperX 是可选的，只调整时间轴；转录仍由 whisper.cpp 完成。当前 extra 需要
+Python 3.12 或 3.13。用 uv 安装两种变体之一：
 
 ```console
 # CPU
@@ -374,29 +470,32 @@ uv sync --extra whisperx-cpu
 uv sync --extra whisperx-cuda
 ```
 
-然后启用并检查：
+然后启用并验证：
 
 ```toml
-alignment_backend = "whisperx"
-alignment_device = "auto" # auto、cpu 或 cuda
+[alignment]
+backend = "whisperx"
+device = "auto" # auto、cpu 或 cuda
 ```
 
 ```console
-yakiflow doctor --alignment-backend whisperx
+yakiflow doctor -c alignment.backend=whisperx
 ```
 
-首次运行可能会下载 NLTK 数据和对应语言的对齐模型。如果交互式运行时初始化
-失败，YakiFlow 会让你选择重试或回退 VAD；非交互运行会保留任务，供之后恢复。
+首次运行可能下载 NLTK 数据和语言专用的对齐模型。如果对齐初始化在交互式运行中
+失败，YakiFlow 允许重试或退回 VAD；非交互式运行会保留任务供以后恢复。
 
-## 故障排查
+## 疑难解答
 
-- 先运行 `yakiflow doctor --translation-backend codex`（或 `claude`）。
-- 默认 Whisper 模型缺失时，运行 `yakiflow models fetch`。
-- 如果配置的是自定义模型路径，YakiFlow 要求该文件已经存在，不会自动替换。
-- `whisper-server` 失败只影响 `--stream`，`yt-dlp` 失败只影响 URL 输入。
-- 审校时没有字幕窗格，可安装 `tmux`，或设置
-  `review_display_mode = "open"`。
-- 失败后请保留终端打印的工作目录；其中的任务日志和进程日志可用于排错或恢复。
+- 先用与运行相同的选项执行 `yakiflow doctor`。
+- 缺少默认 Whisper 模型时，运行 `yakiflow models fetch`。
+- 配置了自定义模型路径时，YakiFlow 要求该文件已经存在，不会替换它。
+- `yt-dlp` 的故障只影响 URL 输入；whisper.cpp 的故障只影响 Whisper 后端。
+- ElevenLabs 任务因 key 报错停止时，`yakiflow doctor` 会显示 key 将来自哪个
+  来源。
+- 审校没有字幕面板时，安装 `tmux` 或配置 `review.display-mode = "open"`。
+- 失败后请保留打印出的工作目录。其中包含诊断或恢复运行所需的任务日志和进程
+  日志。
 
 ## 开发
 

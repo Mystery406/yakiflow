@@ -2,10 +2,12 @@
 
 [简体中文](README.zh-CN.md) | English
 
-YakiFlow turns a local video, audio file, web video, or live stream into an SRT
-subtitle file. It transcribes with `whisper.cpp`, translates with Codex or
-Claude Code, and lets you review the result with an interactive Agent before it
-is saved.
+YakiFlow turns a local video, audio file, web video, or live stream into an ASS
+subtitle file. It transcribes with `whisper.cpp` or the ElevenLabs Scribe API,
+translates with Codex or Claude Code, and lets you review the result with an
+interactive Agent before it is saved. With a diarizing backend, each subtitle
+carries its speaker, and two speakers talking at once become two overlapping
+subtitles.
 
 Jobs are resumable: if a run is interrupted, YakiFlow keeps its completed work
 and prints the command needed to continue.
@@ -18,13 +20,15 @@ You need:
 
 - Python 3.12 or newer;
 - `ffmpeg`;
-- a recent [whisper.cpp](https://github.com/ggml-org/whisper.cpp) build whose
-  `whisper-cli` executable is on `PATH`;
-- either the `codex` or `claude` CLI, installed and signed in.
+- either the `codex` or `claude` CLI, installed and signed in;
+- for the default local transcription, a recent
+  [whisper.cpp](https://github.com/ggml-org/whisper.cpp) build whose
+  `whisper-cli` executable is on `PATH`.
 
-Install `yt-dlp` as well if you want to process URLs. Live streams additionally
-need `whisper-server`. `tmux` and `mpv` are optional conveniences for subtitle
-review and video preview.
+Install `yt-dlp` as well if you want to process URLs. `tmux` and `mpv` are
+optional conveniences for subtitle review and video preview. The ElevenLabs
+backends need no local transcription tools at all — see
+[Transcription backends](#transcription-backends).
 
 ### 2. Install YakiFlow
 
@@ -36,31 +40,41 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
+Add `.[elevenlabs]` to use the ElevenLabs backends and `.[keyring]` to store
+the API key in the OS keyring:
+
+```console
+python -m pip install -e '.[elevenlabs,keyring]'
+```
+
 ### 3. Save your usual settings
 
 Create `yakiflow.toml` in the directory where you will run YakiFlow:
 
 ```toml
-source_language = "auto"
-target_language = "zh-CN"
-translation_backend = "codex"
-output_dir = "./subtitles"
-output_mode = "bilingual"
+source-language = "auto"
+target-language = "zh-CN"
+output-dir = "./subtitles"
+output-mode = "bilingual"
+
+[agent]
+backend = "codex"
 ```
 
-Use `translation_backend = "claude"` if you signed in with Claude Code. You
-can also omit this file and pass the equivalent options on every run.
+Use `backend = "claude"` if you signed in with Claude Code. You can also omit
+this file and pass the equivalent options on every run.
 
 ### 4. Download the default model and check the setup
 
 ```console
 yakiflow models fetch
-yakiflow doctor --translation-backend codex
+yakiflow doctor -c agent.backend=codex
 ```
 
 Replace `codex` with `claude` when appropriate. Fix every reported `FAIL` that
-applies to your input; `yt-dlp` is only needed for URLs and `whisper-server` is
-only needed for `--stream`.
+applies to your input; `yt-dlp` is only needed for URLs, and the whisper.cpp
+checks only apply to the Whisper backends. `models fetch` is unnecessary for
+the ElevenLabs backends.
 
 ### 5. Create subtitles
 
@@ -74,7 +88,7 @@ Without `yakiflow.toml`, provide the three required settings explicitly:
 yakiflow run video.mp4 \
   --source-language auto \
   --target-language zh-CN \
-  --translation-backend codex \
+  -c agent.backend=codex \
   --output-dir ./subtitles
 ```
 
@@ -82,6 +96,97 @@ YakiFlow shows transcription and translation progress. In an interactive
 terminal, it then opens the selected Agent for final review. Tell the Agent any
 changes you want, then end the review session when you are satisfied. The final
 subtitle path is printed when the job finishes.
+
+## Command-line options
+
+A few high-frequency settings have dedicated options:
+
+| Option | Setting |
+| --- | --- |
+| `-s`, `--source-language` | Source language code, or `auto` |
+| `-t`, `--target-language` | Translation language or locale |
+| `--transcription-backend` | One of the four transcription backends |
+| `--stream` / `--no-stream` | Treat a URL as a live stream |
+| `--output-dir` | Directory for final subtitle files |
+| `--output-mode` | `source`, `translated`, `bilingual`, or `all` |
+| `--context-file` | Copy a reference file into the work directory; repeatable |
+| `--work-dir` | Place resumable job state in a chosen directory |
+| `--keep-workdir` | Keep intermediate files after success |
+| `--config-file` | Use this project configuration file |
+| `--profile` | Select a `[profiles.NAME]` section |
+
+Every other setting is changed with the repeatable `-c KEY=VALUE` option,
+where `KEY` is the setting's dotted TOML key:
+
+```console
+yakiflow run video.mp4 \
+  -c transcription.backend=elevenlabs \
+  -c agent.draft.effort=medium \
+  -c 'commands.yt-dlp-options=["--cookies-from-browser", "chrome"]'
+```
+
+Values are parsed as TOML (booleans, numbers, arrays); anything that does not
+parse as TOML is taken as a plain string. Dedicated options override `-c`, and
+`-c` overrides every configuration file.
+
+## Transcription backends
+
+Choose with `transcription.backend` (or `--transcription-backend`):
+
+| Backend | What it is | Needs |
+| --- | --- | --- |
+| `whisper-cli` | Local whisper.cpp batch transcription (default) | `whisper-cli`, a model file |
+| `whisper-server` | A whisper.cpp server — local, or an already-running one via `whisper.server-url` | `whisper-server`, or a reachable server |
+| `elevenlabs` | ElevenLabs Scribe batch API, with speaker diarization | `yakiflow[elevenlabs]`, an API key |
+| `elevenlabs-stream` | ElevenLabs Scribe realtime API over WebSocket | `yakiflow[elevenlabs]`, an API key |
+
+All four backends work for both normal runs and `--stream` live capture. For
+live streams, `whisper-server` and `elevenlabs-stream` give the fastest live
+preview; `whisper-cli` also works but reloads its model for every chunk, which
+makes the preview lag well behind the stream.
+
+The `elevenlabs` backend recognizes speakers (`elevenlabs.diarize`, on by
+default): each subtitle's speaker label lands in the ASS `Name` field, and
+overlapping speech becomes overlapping subtitles. The realtime API does not
+diarize. With the ElevenLabs backends, subtitle line breaks and translations
+are produced together by the draft Agent from the word-level transcript.
+
+To use an already-running whisper-server instead of starting one:
+
+```toml
+[transcription]
+backend = "whisper-server"
+
+[whisper]
+server-url = "http://127.0.0.1:8080"
+```
+
+### The ElevenLabs API key
+
+The key is looked up in this order:
+
+1. an `elevenlabs.api-key*` setting given with `-c` on the command line;
+2. the `ELEVENLABS_API_KEY` environment variable;
+3. an `elevenlabs.api-key*` setting from a configuration file;
+4. the OS keyring (requires `yakiflow[keyring]`).
+
+In a configuration file (or with `-c`), pick exactly one of three spellings:
+
+```toml
+[elevenlabs]
+api-key = "sk-…"                  # the key itself
+# api-key-file = "~/.secrets/elevenlabs"   # read the key from a file
+# api-key-command = "pass show elevenlabs" # run a command; stdout is the key
+```
+
+To store the key in the OS keyring instead of any file:
+
+```console
+yakiflow secret set elevenlabs
+yakiflow secret unset elevenlabs
+```
+
+`yakiflow doctor` reports where the key would come from without printing it.
 
 ## Common tasks
 
@@ -93,7 +198,6 @@ Any audio or video format supported by `ffmpeg` can be used:
 yakiflow run ./recordings/interview.mkv \
   --source-language en \
   --target-language zh-CN \
-  --translation-backend codex \
   --output-dir ./subtitles
 ```
 
@@ -103,12 +207,11 @@ yakiflow run ./recordings/interview.mkv \
 yakiflow run 'https://example.com/watch?v=123' \
   --source-language ja \
   --target-language en \
-  --translation-backend claude \
-  --download-dir ./downloads \
+  -c download-dir=./downloads \
   --output-dir ./subtitles
 ```
 
-`--download-dir` keeps the downloaded media; omit it to use a temporary copy.
+`download-dir` keeps the downloaded media; omit it to use a temporary copy.
 Set `--output-dir` for URL jobs so the subtitle location is predictable.
 Playlists are not downloaded.
 
@@ -119,28 +222,28 @@ yakiflow run 'https://example.com/live' \
   --stream \
   --source-language auto \
   --target-language zh-CN \
-  --translation-backend codex \
   --output-dir ./subtitles
 ```
 
 Live subtitles are provisional. After capture ends, YakiFlow transcribes the
-complete recording again before publishing the final SRT. In the TUI, press
-`s` to stop capture and finalize what has been received; press Ctrl-C once in a
-non-TUI run.
+complete recording again before publishing the final subtitles. In the TUI,
+press `s` to stop capture and finalize what has been received; press Ctrl-C
+once in a non-TUI run.
 
 ### Choose the subtitle format
 
-Use `--output-mode` or set `output_mode` in TOML:
+Use `--output-mode` or set `output-mode` in TOML:
 
 | Value | Result for an input named `video.mp4` |
 | --- | --- |
-| `bilingual` | `video.en-zh-cn.srt`, with translation above source text (default) |
-| `source` | `video.source.srt` |
-| `translated` | `video.translated.srt` |
+| `bilingual` | `video.en-zh-cn.ass`, with translation above source text (default) |
+| `source` | `video.source.ass` |
+| `translated` | `video.translated.ass` |
 | `all` | All three variants |
 
-With automatic language detection, the bilingual filename uses `auto`, for
-example `video.auto-zh-cn.srt`.
+With automatic language detection, the bilingual filename uses the detected
+language, for example `video.ja-zh-cn.ass`. Players such as `mpv` load ASS
+files directly (`mpv --sub-file=video.en-zh-cn.ass video.mp4`).
 
 ### Resume an interrupted job
 
@@ -154,90 +257,163 @@ yakiflow resume /path/to/workdir
 ```
 
 Keep the entire work directory intact. `resume` uses the original input and
-settings and does not accept replacement run options. To choose its location in
-advance, start the job with `--work-dir ./work/video-job`.
+settings; single settings can still be adjusted with `-c` when needed. A work
+directory created by an older YakiFlow with a different configuration schema
+must be finished by the version that created it. To choose the work directory
+location in advance, start the job with `--work-dir ./work/video-job`.
 
 ## Configuration guide
 
 Settings are read in this order, from highest to lowest priority:
 
-1. command-line options;
-2. the selected profile in the file passed to `--config`, or in
+1. dedicated command-line options;
+2. `-c KEY=VALUE` overrides;
+3. the selected profile in the file passed to `--config-file`, or in
    `yakiflow.toml` in the current directory;
-3. the selected profile in the user configuration file;
-4. base settings in the project configuration file;
-5. base settings in the user configuration file;
-6. built-in defaults.
+4. the selected profile in the user configuration file;
+5. base settings in the project configuration file;
+6. base settings in the user configuration file;
+7. built-in defaults.
 
 On Linux, the user configuration file is
 `~/.config/yakiflow/config.toml` (or
-`$XDG_CONFIG_HOME/yakiflow/config.toml`). Put normal settings directly at the
-TOML document root. Relative paths are resolved from the directory in which you
-start the job.
+`$XDG_CONFIG_HOME/yakiflow/config.toml`). Relative paths are resolved from the
+directory in which you start the job.
+
+Settings are grouped into TOML tables. A full example with the most useful
+keys:
+
+```toml
+# Top-level settings
+source-language = "auto"
+target-language = "zh-CN"
+output-mode = "bilingual"        # source | translated | bilingual | all
+output-dir = "./subtitles"
+# download-dir = "./downloads"   # keep media downloaded from URLs
+# memory = "./memory.md"         # persistent terminology/style memory file
+# context-files = ["notes.txt"]  # read-only references for interactive review
+# work-dir = "./work"            # resumable job state location
+# keep-workdir = false
+
+[transcription]
+backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenlabs-stream
+
+[whisper]                 # used by whisper-cli and whisper-server
+# model = "/path/to/ggml-large-v3-turbo-q5_0.bin"
+# vad-model = "/path/to/ggml-silero-v6.2.0.bin"
+# vad = true              # set false to ignore the configured VAD model
+# cli = "whisper-cli"     # executable name or path
+# server = "whisper-server"
+# server-url = "http://127.0.0.1:8080"  # connect instead of launching
+
+[elevenlabs]              # used by elevenlabs and elevenlabs-stream
+# api-key-command = "pass show elevenlabs"
+# model = "scribe_v2"
+# realtime-model = "scribe_v2_realtime"
+# diarize = true          # speaker recognition (batch API only)
+# num-speakers = 3        # optional speaker-count hint
+
+[alignment]
+# backend = "vad"         # vad | whisperx | none
+# device = "auto"         # auto | cpu | cuda (WhisperX)
+# model = "custom/model"  # override the WhisperX alignment model
+
+[stream]
+# enabled = false         # same as --stream
+# chunk-seconds = 15      # live transcription chunk length
+# context-seconds = 5     # audio overlap kept before each chunk
+
+[subtitles]
+# max-cue-seconds = 8.0   # longest single subtitle (ElevenLabs backends)
+# max-cue-chars = 84      # longest subtitle text per language
+
+[agent]                   # shared by both translation stages
+backend = "codex"         # codex | claude
+# model = "…"             # rarely needed
+# effort = "…"            # minimal | low | medium | high | xhigh
+# extra-options = ["…"]   # extra argv tokens for the agent CLI
+
+[agent.draft]             # batch draft translation; overrides [agent]
+# backend = "…"
+# model = "…"             # default: codex → gpt-5.6-terra, claude → sonnet
+# effort = "low"
+# extra-options = ["…"]
+# workers = 4             # parallel draft requests
+# batch-size = 20         # cues per request (Whisper backends)
+# preceding-context = 10  # earlier cues shown for context
+# following-context = 5   # later cues shown for context
+# word-batch-size = 400   # words per request (ElevenLabs backends)
+# word-following-context = 40
+# timeout-seconds = 600
+# max-attempts = 3
+# retry-delay-seconds = 1
+
+[agent.final]             # interactive review; overrides [agent]
+# backend = "…"
+# model = "…"             # default: codex → gpt-5.6-sol, claude → opus
+# effort = "high"
+# extra-options = ["…"]
+
+[review]
+# display-mode = "split"  # split | open | both
+# open-command = "code --reuse-window {workdir} {subtitle} {memory}"
+# auto-open-video = false
+# video-open-command = "vlc --sub-file={subtitle} {file}"
+
+[commands]
+# ffmpeg = "ffmpeg"
+# yt-dlp = "yt-dlp"
+# yt-dlp-options = ["--cookies-from-browser", "chrome"]
+```
+
+The default Codex models are `gpt-5.6-terra` for draft translation and
+`gpt-5.6-sol` for review. The Claude defaults are `sonnet` and `opus`. Override
+them if those names are unavailable to your account. Settings in `[agent.draft]`
+and `[agent.final]` win over the shared `[agent]` values, so the two stages can
+use different backends.
+
+`extra-options` and `yt-dlp-options` must be TOML arrays containing only
+strings. YakiFlow passes each string directly as one argv token; options with a
+value use two array items.
 
 ### Configuration profiles
 
 Put reusable variants under `[profiles.NAME]` and select one with `--profile`
-on `run`, `doctor`, or `models fetch`:
+on `run`, `resume`, `doctor`, or `models fetch`:
 
 ```toml
-source_language = "auto"
-target_language = "zh-CN"
-translation_backend = "codex"
+source-language = "auto"
+target-language = "zh-CN"
+
+[agent]
+backend = "codex"
 
 [profiles.stream]
-stream = true
-translation_batch_size = 5
-draft_codex_options = ["-c", "service_tier=fast"]
+stream.enabled = true
+transcription.backend = "whisper-server"
+agent.draft.batch-size = 5
+agent.draft.extra-options = ["-c", "service_tier=fast"]
 ```
 
 ```console
 yakiflow run 'https://example.com/live' --profile stream
 yakiflow doctor --profile stream
-yakiflow models fetch --profile stream
 ```
 
-If both user and project files define the selected name, their profile settings
-merge field by field, with project values replacing user values. Lists replace
-earlier lists rather than being appended. A profile is applied after both base
-files, so even a user profile overrides project base settings; explicit CLI
-values still win. Unselected profiles have no effect.
-
-Selecting an unknown profile is an error. `profiles` and each named profile
-must be TOML tables, and profiles cannot contain nested tables or inherit from
-other profiles. YakiFlow saves the fully resolved settings with each job, so a
+Profiles may use dotted keys or nested tables and merge setting by setting: a
+profile that changes `agent.draft.batch-size` keeps every other `[agent.draft]`
+value from the base configuration. Arrays replace earlier arrays rather than
+being appended. If both user and project files define the selected name, the
+project profile wins; a profile is applied after both base files, and `-c` plus
+dedicated options still win over profiles. Selecting an unknown profile is an
+error, profiles cannot inherit from other profiles, and unselected profiles
+have no effect. YakiFlow saves the fully resolved settings with each job, so a
 resume does not depend on the profile or configuration files still existing.
-There are no built-in profiles and selecting no profile preserves the normal
-defaults.
 
-### Common settings
+### Reference files for review
 
-Most users only need these settings:
-
-| TOML key | CLI option | What to use it for |
-| --- | --- | --- |
-| `source_language` | `--source-language` | Source language code, or `auto` |
-| `target_language` | `--target-language` | Translation language or locale |
-| `translation_backend` | `--translation-backend` | `codex` or `claude` |
-| `output_dir` | `--output-dir` | Directory for final SRT files |
-| `output_mode` | `--output-mode` | `source`, `translated`, `bilingual`, or `all` |
-| `download_dir` | `--download-dir` | Keep media downloaded from a URL |
-| `whisper_model` | `--whisper-model` | Use an existing custom whisper.cpp model |
-| `vad_model` | `--vad-model` | Enable a local Whisper-compatible VAD model |
-| `vad` | `--vad` / `--no-vad` | Ignore the configured VAD model without editing the config (default: `true`) |
-| `memory` | `--memory` | Choose the persistent terminology/style memory file |
-| `context_files` | `--context-file` | Copy reference files into the work directory for interactive review; repeat the option for multiple files |
-| `agent_workers` | `--agent-workers` | Limit parallel draft translations (default: 4) |
-| `draft_model` | `--draft-model` | Override the backend's draft model |
-| `final_model` | `--final-model` | Override the interactive review model |
-| `keep_workdir` | `--keep-workdir` | Keep intermediate files after success |
-
-The default Codex models are `gpt-5.6-terra` for draft translation and
-`gpt-5.6-sol` for review. The Claude defaults are `sonnet` and `opus`. Override
-them if those names are unavailable to your account.
-
-For example, pass a danmaku export and a speaker note to the interactive review
-Agent as read-only references:
+Pass a danmaku export and a speaker note to the interactive review Agent as
+read-only references:
 
 ```console
 yakiflow run video.mp4 --context-file danmaku.xml --context-file speakers.txt
@@ -245,89 +421,6 @@ yakiflow run video.mp4 --context-file danmaku.xml --context-file speakers.txt
 
 YakiFlow snapshots each file under `context/` in the job's work directory, so a
 resumed job does not depend on the original reference files.
-
-### Advanced settings
-
-The tables below complete the TOML reference. Defaults generally work well;
-change these settings only when you need the described behavior. A dash in the
-CLI column means the setting is TOML-only. Run `yakiflow run --help` for full
-command-line usage.
-
-#### Job control
-
-| TOML key | CLI option | Default | What it controls |
-| --- | --- | --- | --- |
-| `stream` | `--stream` / `--no-stream` | `false` | Treat a URL as a live stream |
-| `work_dir` | `--work-dir` | temporary directory | Place resumable job state and intermediate files in a chosen directory |
-
-#### Alignment
-
-| TOML key | CLI option | Default | What it controls |
-| --- | --- | --- | --- |
-| `alignment_backend` | `--alignment-backend` | `vad` | Timing adjustment backend: `vad` or `whisperx` |
-| `alignment_device` | `--alignment-device` | `auto` | WhisperX device: `auto`, `cpu`, or `cuda` |
-| `alignment_model` | `--alignment-model` | automatic | Override the language-specific WhisperX alignment model |
-
-#### Translation and Agent tuning
-
-| TOML key | CLI option | Default | What it controls |
-| --- | --- | --- | --- |
-| `draft_effort` | `--draft-effort` | `low` | Reasoning effort for draft translation |
-| `final_effort` | `--final-effort` | `high` | Reasoning effort for interactive review |
-| `draft_codex_options` | — | `[]` | Extra Codex argv tokens for structured draft translation calls |
-| `final_codex_options` | — | `[]` | Extra Codex argv tokens for interactive review and memory-conflict sessions |
-| `draft_claude_options` | — | `[]` | Extra Claude argv tokens for structured draft translation calls |
-| `final_claude_options` | — | `[]` | Extra Claude argv tokens for interactive review and memory-conflict sessions |
-| `translation_batch_size` | — | `20` | Maximum subtitle cues sent in each draft request |
-| `translation_context` | — | `10` | Number of preceding cues supplied as translation context |
-| `translation_following_context` | — | `5` | Number of following cues supplied as translation context, so a sentence that continues past the batch stays visible (streaming batches have none yet) |
-| `draft_agent_timeout_seconds` | `--draft-agent-timeout-seconds` | `600` | Timeout for each draft Agent attempt |
-| `agent_max_attempts` | `--agent-max-attempts` | `3` | Maximum attempts for a failed draft request |
-| `agent_retry_delay_seconds` | `--agent-retry-delay-seconds` | `1` | Delay between draft request attempts |
-
-The supported effort values are `minimal`, `low`, `medium`, `high`, and
-`xhigh`. Agent option settings must be TOML arrays containing only strings.
-YakiFlow passes each string directly as one argv token, after its managed flags
-and before the prompt or stdin sentinel; it does not shell-parse, combine, or
-filter them. Invalid or conflicting options are reported by Codex or Claude.
-
-#### Review display
-
-| TOML key | CLI option | Default | What it controls |
-| --- | --- | --- | --- |
-| `review_display_mode` | `--review-display-mode` | `split` | Use a tmux subtitle pane (`split`), an external program (`open`), or both (`both`) |
-| `review_open_command` | `--review-open-command` | unset | Command template used by `open` and `both` modes; supports `{srt}`, `{workdir}`, and `{memory}` |
-| `auto_open_video` | `--auto-open-video` / `--no-auto-open-video` | `false` | Open the source video automatically when interactive review starts |
-| `video_open_command` | `--video-open-command` | built-in `mpv` command | Command template for opening media; supports `{file}` and `{subtitle}` |
-
-`review_open_command` is required when `review_display_mode` is `"open"` or
-`"both"`.
-Leave its placeholders unquoted; YakiFlow safely keeps substituted paths,
-including paths containing spaces, as single arguments. The template uses
-shell-style argument parsing, but the resulting command is launched directly
-without a shell. Literal arguments containing spaces still need quotes.
-
-#### Live-stream tuning
-
-| TOML key | CLI option | Default | What it controls |
-| --- | --- | --- | --- |
-| `stream_chunk_seconds` | — | `15` | Duration of each live transcription chunk |
-| `stream_context_seconds` | — | `5` | Audio overlap retained before each live chunk for context |
-
-#### External commands
-
-| TOML key | CLI option | Default | What it controls |
-| --- | --- | --- | --- |
-| `ffmpeg` | — | `ffmpeg` | FFmpeg executable name or path |
-| `yt_dlp` | — | `yt-dlp` | yt-dlp executable name or path |
-| `yt_dlp_options` | — | `[]` | Extra yt-dlp argv tokens, such as `["--cookies-from-browser", "chrome"]` |
-| `whisper_cli` | — | `whisper-cli` | whisper.cpp batch executable name or path |
-| `whisper_server` | — | `whisper-server` | whisper.cpp server executable name or path |
-
-`yt_dlp_options` must be a TOML array containing only strings. Each string is
-passed directly as one yt-dlp argv token, so options with a value use two array
-items, for example `yt_dlp_options = ["--cookies-from-browser", "chrome"]`.
-Set an external command to its full path if it is not on `PATH`.
 
 ## Review and translation memory
 
@@ -339,35 +432,45 @@ only updated after you approve a proposal.
 The review Agent writes to you in the target language and switches if you write
 in another one. When the target language cannot keep one sentence split the way
 the source was, it may merge those cues, mirroring the merge across every
-configured artifact.
+configured artifact. Overlapping subtitles from different speakers are normal
+with a diarizing backend and are kept as they are.
 
 By default YakiFlow uses `tmux` to show a read-only subtitle pane next to the
 Agent when possible. In that pane, press `o` to open the media with the current
 subtitles in `mpv`. To use another player:
 
 ```toml
-video_open_command = "vlc --sub-file={subtitle} {file}"
+[review]
+video-open-command = "vlc --sub-file={subtitle} {file}"
 ```
 
 To open the source video automatically as the interactive review starts, enable
-`auto_open_video` (or pass `--auto-open-video`). The configured
-`video_open_command` is used, and the staged subtitles are attached when the
-player supports them.
+`review.auto-open-video`. The configured `video-open-command` is used, and the
+staged subtitles are attached when the player supports them.
 
-To open the staged SRT in an editor instead of using the split preview:
+To open the staged subtitle file in an editor instead of using the split
+preview:
 
 ```toml
-review_display_mode = "open"
-review_open_command = "code --reuse-window {workdir} {srt} {memory}"
+[review]
+display-mode = "open"
+open-command = "code --reuse-window {workdir} {subtitle} {memory}"
 ```
 
-Use `review_display_mode = "both"` to open the editor and retain the split
-preview at the same time.
+Use `display-mode = "both"` to open the editor and retain the split preview at
+the same time. `open-command` supports the `{subtitle}`, `{workdir}`, and
+`{memory}` placeholders. Leave placeholders unquoted; YakiFlow safely keeps
+substituted paths, including paths containing spaces, as single arguments. The
+template uses shell-style argument parsing, but the resulting command is
+launched directly without a shell.
 
 In CI or with redirected input/output, interactive review is skipped and the
 batch result is finalized directly.
 
 ## Optional: improve subtitle timing
+
+These options apply to the Whisper backends. The ElevenLabs backends deliver
+word-accurate timing already and default to `alignment.backend = "none"`.
 
 ### VAD
 
@@ -375,16 +478,16 @@ A Silero VAD model helps Whisper skip silence and improves cue starts. Download
 a model supported by your whisper.cpp build, then configure its path:
 
 ```toml
-vad_model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
+[whisper]
+vad-model = "/absolute/path/to/ggml-silero-v6.2.0.bin"
 ```
 
 `yakiflow models fetch` does not download VAD models. The
 [whisper.cpp VAD guide](https://github.com/ggml-org/whisper.cpp#voice-activity-detection-vad)
 has the model download commands.
 
-Pass `--no-vad` (or set `vad = false`) to run without VAD while keeping
-`vad_model` in the config file. VAD is off whenever no model is configured, so
-`--vad` on its own changes nothing.
+Pass `-c whisper.vad=false` to run without VAD while keeping `vad-model` in the
+config file. VAD is off whenever no model is configured.
 
 ### WhisperX forced alignment
 
@@ -403,12 +506,13 @@ uv sync --extra whisperx-cuda
 Then enable and verify it:
 
 ```toml
-alignment_backend = "whisperx"
-alignment_device = "auto" # auto, cpu, or cuda
+[alignment]
+backend = "whisperx"
+device = "auto" # auto, cpu, or cuda
 ```
 
 ```console
-yakiflow doctor --alignment-backend whisperx
+yakiflow doctor -c alignment.backend=whisperx
 ```
 
 The first run may download NLTK data and a language-specific alignment model.
@@ -417,14 +521,16 @@ VAD; a non-interactive run preserves the job for later resumption.
 
 ## Troubleshooting
 
-- Start with `yakiflow doctor --translation-backend codex` (or `claude`).
+- Start with `yakiflow doctor` using the same options as your run.
 - If the default Whisper model is missing, run `yakiflow models fetch`.
 - If a custom model path is configured, YakiFlow expects that file to already
   exist and will not replace it.
-- `whisper-server` failures only affect `--stream`; `yt-dlp` failures only
-  affect URL inputs.
+- `yt-dlp` failures only affect URL inputs; whisper.cpp failures only affect
+  the Whisper backends.
+- If an ElevenLabs run stops with a key error, `yakiflow doctor` shows which
+  source the key would come from.
 - If review has no subtitle pane, install `tmux` or configure
-  `review_display_mode = "open"`.
+  `review.display-mode = "open"`.
 - Keep the printed work directory after a failure. It contains the job journal
   and process logs needed to diagnose or resume the run.
 
