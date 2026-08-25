@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS cues (
     id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, start REAL NOT NULL,
     end REAL NOT NULL, source TEXT NOT NULL, translated TEXT,
     timing_confidence REAL, metadata_json TEXT NOT NULL DEFAULT '{}',
+    speaker TEXT,
     stable INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS translation_batches (
@@ -98,13 +99,14 @@ class JobDatabase:
         """Write cues inside the caller's transaction."""
         sql = """
         INSERT INTO cues(id,ordinal,start,end,source,translated,
-          timing_confidence,metadata_json,stable)
-        VALUES(?,?,?,?,?,?,?,?,?)
+          timing_confidence,metadata_json,speaker,stable)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
           ordinal=excluded.ordinal,start=excluded.start,end=excluded.end,
           source=excluded.source,
           translated=COALESCE(excluded.translated,cues.translated),
           timing_confidence=excluded.timing_confidence,metadata_json=excluded.metadata_json,
+          speaker=excluded.speaker,
           stable=excluded.stable
         """
         if reset_order:
@@ -140,6 +142,7 @@ class JobDatabase:
                     cue.translated,
                     cue.timing_confidence,
                     json.dumps(cue.metadata),
+                    cue.speaker,
                     stable,
                 )
                 for ordinal, cue in zip(ordinals, cues, strict=True)
@@ -170,6 +173,10 @@ class JobDatabase:
                 prior["translated"] if completed else cue.translated,
                 cue.timing_confidence,
                 metadata,
+                # Diarization always comes from the authoritative transcript;
+                # dropping it here would erase every speaker a draft batch
+                # had already finished translating.
+                cue.speaker,
             ))
         # Retiring the old rows and installing the merged transcript must be one
         # transaction: a crash in between would leave no durable timeline at
@@ -189,8 +196,8 @@ class JobDatabase:
         """Atomically install a renumbered timeline and mark alignment durable."""
         sql = """
         INSERT INTO cues(id,ordinal,start,end,source,translated,
-          timing_confidence,metadata_json,stable)
-        VALUES(?,?,?,?,?,?,?,?,1)
+          timing_confidence,metadata_json,speaker,stable)
+        VALUES(?,?,?,?,?,?,?,?,?,1)
         """
         now = utc_now()
         with self.connection:
@@ -207,6 +214,7 @@ class JobDatabase:
                         cue.translated,
                         cue.timing_confidence,
                         json.dumps(cue.metadata),
+                        cue.speaker,
                     )
                     for ordinal, cue in enumerate(cues)
                 ],
@@ -224,6 +232,7 @@ class JobDatabase:
             id=row["id"], start=row["start"], end=row["end"], source=row["source"],
             translated=row["translated"],
             timing_confidence=row["timing_confidence"], metadata=json.loads(row["metadata_json"]),
+            speaker=row["speaker"],
         )
 
     def list_cues(self, *, stable_only: bool = False) -> list[Cue]:

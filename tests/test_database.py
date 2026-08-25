@@ -32,6 +32,34 @@ def test_transcript_replacement_preserves_completed_source_corrections(
     db.close()
 
 
+def test_speaker_round_trips_and_survives_transcript_replacement(
+    tmp_path: Path,
+) -> None:
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    db.upsert_cues([
+        Cue("1", 0, 1, "draft", "translated", speaker="1"),
+        Cue("2", 1, 2, "draft two", None, speaker=None),
+    ])
+
+    assert [cue.speaker for cue in db.list_cues()] == ["1", None]
+
+    # The authoritative transcript owns diarization even for cues whose text
+    # and translation are preserved from a completed draft batch.
+    db.replace_transcript([
+        Cue("1", 0, 1, "authoritative", speaker="2"),
+        Cue("2", 1, 2, "authoritative two", speaker="1"),
+    ])
+    cues = db.list_cues(stable_only=True)
+    assert (cues[0].translated, cues[0].speaker) == ("translated", "2")
+    assert cues[1].speaker == "1"
+
+    db.replace_aligned_timeline([
+        Cue("1", 0, 1, "aligned", speaker="2"),
+    ])
+    assert db.list_cues(stable_only=True)[0].speaker == "2"
+    db.close()
+
+
 def test_aligned_timeline_replacement_is_authoritative_and_checkpointed(
     tmp_path: Path,
 ) -> None:

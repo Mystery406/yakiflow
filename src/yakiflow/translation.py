@@ -606,6 +606,7 @@ class TranslationPipeline:
                 "id": cue.id,
                 "source": cue.source,
                 "translated": cue.translated,
+                "speaker": cue.speaker,
             }
 
         return {
@@ -702,6 +703,9 @@ class TranslationPipeline:
             "idioms and other translationese with natural wording. Keep the "
             "meaning, speaker intent, and tone unchanged while doing so, and "
             "never add, drop, or embellish content to make a line read better.\n"
+            "Each cue's `speaker` is a diarization label (or null): use it to "
+            "resolve pronouns, register, and who is addressing whom, but never "
+            "translate it, change it, or copy it into the text.\n"
             "`preceding_context` and `following_context` are the neighbouring "
             "cues, supplied so you can see how a sentence continues on either "
             "side of this batch. Use them for continuity only: never translate "
@@ -975,5 +979,6 @@ class TranslationPipeline:
                 translated.strip() or cue.translated,
                 cue.timing_confidence,
                 metadata,
+                cue.speaker,
             ))
         return output

@@ -180,7 +180,8 @@ def merge_overlap(existing: list[Cue], incoming: list[Cue]) -> list[Cue]:
         if duplicate:
             continue
         merged = Cue(
-            cue_id(len(result)), cue.start, cue.end, cue.source, metadata=cue.metadata
+            cue_id(len(result)), cue.start, cue.end, cue.source,
+            metadata=cue.metadata, speaker=cue.speaker,
         )
         # Keep the list ordered so the next lookup can bisect it.
         insort(result, merged, key=_start_order)

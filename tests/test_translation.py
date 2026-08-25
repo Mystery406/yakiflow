@@ -356,7 +356,7 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
     assert MEMORY.strip() not in backend.prompts[0]
     payload = json.loads(backend.prompts[0].split("INPUT:\n", 1)[1])
     assert "memory" not in payload
-    assert set(payload["cues"][0]) == {"id", "source", "translated"}
+    assert set(payload["cues"][0]) == {"id", "source", "translated", "speaker"}
     assert set(backend.schemas[0]["properties"]) == {"cues"}
     assert backend.schemas[0]["title"] == "DraftTranslationResponse"
     item_schema = backend.schemas[0]["properties"]["cues"]["items"]

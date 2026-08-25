@@ -38,6 +38,10 @@ class Cue:
     translated: str | None = None
     timing_confidence: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Kept after ``metadata``: several construction sites pass every field
+    # positionally, and a new field ahead of ``metadata`` would silently bind
+    # their metadata argument to it.
+    speaker: str | None = None
 
     def __post_init__(self) -> None:
         if self.start < 0 or self.end < self.start:

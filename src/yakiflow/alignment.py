@@ -670,6 +670,7 @@ class PcmVolumeStartRefiner:
                     cue.translated,
                     cue.timing_confidence,
                     metadata,
+                    cue.speaker,
                 )
             )
         return output
@@ -874,6 +875,7 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                             cue.translated,
                             cue.timing_confidence,
                             metadata,
+                            cue.speaker,
                         )
                     )
                 numbered = self._renumber(fallback_cues)
@@ -1021,6 +1023,7 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                         fallback_cue.translated,
                         fallback_cue.timing_confidence,
                         metadata,
+                        fallback_cue.speaker,
                     )
                 )
 
@@ -1290,6 +1293,9 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                     None,
                     score,
                     cue_metadata,
+                    # A sentence split into several cues is still the same
+                    # utterance by the same person.
+                    cue.speaker,
                 )
             )
         if not output or not all_words:
@@ -1427,6 +1433,7 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                     cue.translated,
                     cue.timing_confidence,
                     metadata,
+                    cue.speaker,
                 )
             )
         return output
