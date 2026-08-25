@@ -1427,3 +1427,96 @@ def test_external_whisper_server_job_needs_no_local_model(tmp_path: Path) -> Non
     with pytest.raises(FileNotFoundError):
         asyncio.run(job._ensure_model())
     job.close()
+
+
+def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yakiflow.elevenlabs import ElevenLabsTranscriber
+
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\x00\x00" * 16000)
+
+    class FakeSpeechToText:
+        async def convert(self, **kwargs):
+            class Response:
+                language_code = "en"
+                words = [
+                    {"type": "word", "text": "How ", "start": 0.0, "end": 0.4, "speaker_id": "speaker_1"},
+                    {"type": "word", "text": "are ", "start": 0.5, "end": 0.9, "speaker_id": "speaker_1"},
+                    {"type": "word", "text": "you", "start": 1.0, "end": 1.4, "speaker_id": "speaker_1"},
+                    {"type": "word", "text": "Fine", "start": 1.2, "end": 1.8, "speaker_id": "speaker_2"},
+                ]
+            return Response()
+
+    class FakeClient:
+        speech_to_text = FakeSpeechToText()
+
+    class WordBackend(AgentBackend):
+        name = "fake"
+
+        async def invoke_with_trace(
+            self, prompt, *, system="", model, effort, schema, on_event=None
+        ):
+            payload = json.loads(prompt.split("INPUT:\n", 1)[1])
+            words = payload["words"]
+            cues: list[dict] = []
+            current: list[dict] = []
+            for word in words:
+                if current and current[-1].get("s") != word.get("s"):
+                    cues.append({
+                        "first_word": current[0]["i"],
+                        "last_word": current[-1]["i"],
+                        "translated": "T:" + "".join(w["w"] for w in current).strip(),
+                    })
+                    current = []
+                current.append(word)
+            if current:
+                cues.append({
+                    "first_word": current[0]["i"],
+                    "last_word": current[-1]["i"],
+                    "translated": "T:" + "".join(w["w"] for w in current).strip(),
+                })
+            return {"cues": cues}
+
+    monkeypatch.setattr(
+        job_module,
+        "make_transcriber",
+        lambda settings, work_dir, db, runner=None: ElevenLabsTranscriber(
+            settings, work_dir, db, runner, client_factory=lambda: FakeClient()
+        ),
+    )
+    settings = make_settings(
+        source_language="en",
+        target_language="zh-CN",
+        transcription={"backend": "elevenlabs"},
+        agent={"backend": "codex", "draft": {"model": "draft"}},
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=WordBackend())
+    # The alignment default for word-level backends is none.
+    assert job.settings.alignment.backend == "none"
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+
+    async def run_stages() -> list[Cue]:
+        cues = await job._transcription_stage(artifact)
+        cues = await job._translation_stage(artifact, cues)
+        return await job._alignment_stage(artifact, cues)
+
+    final = asyncio.run(run_stages())
+
+    assert job.db.get_checkpoint("detected_source_language") == "en"
+    assert len(job.db.list_transcript_words()) == 4
+    assert [(cue.speaker, cue.source, cue.translated) for cue in final] == [
+        ("1", "How are you", "T:How are you"),
+        ("2", "Fine", "T:Fine"),
+    ]
+    # The crosstalk overlap survives all the way through alignment none.
+    assert final[1].start < final[0].end
+    assert job.db.get_checkpoint("alignment_complete") is True
+    job.close()

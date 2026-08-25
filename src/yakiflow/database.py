@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Sequence
 
-from .models import Cue, JobStatus, utc_now
+from .models import Cue, JobStatus, Word, utc_now
 
 
 SCHEMA = """
@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS cues (
     end REAL NOT NULL, source TEXT NOT NULL, translated TEXT,
     timing_confidence REAL, metadata_json TEXT NOT NULL DEFAULT '{}',
     speaker TEXT,
+    stable INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS transcript_words (
+    ordinal INTEGER PRIMARY KEY, start REAL NOT NULL, end REAL NOT NULL,
+    speaker TEXT, text TEXT NOT NULL, logprob REAL,
     stable INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS translation_batches (
@@ -252,6 +257,48 @@ class JobDatabase:
             f"SELECT * FROM cues WHERE id IN ({placeholders}){stable}", tuple(ids)
         ).fetchall()
         return {row["id"]: self._cue(row) for row in rows}
+
+    def replace_transcript_words(self, words: Sequence[Word]) -> None:
+        """Install a complete word-level transcript atomically."""
+        with self.connection:
+            self.connection.execute("DELETE FROM transcript_words")
+            self._insert_words(words)
+
+    def append_transcript_words(self, words: Sequence[Word]) -> None:
+        """Add or overwrite words by ordinal, for incremental persistence."""
+        with self.connection:
+            self._insert_words(words)
+
+    def _insert_words(self, words: Sequence[Word]) -> None:
+        self.connection.executemany(
+            "INSERT OR REPLACE INTO transcript_words"
+            "(ordinal,start,end,speaker,text,logprob,stable) VALUES(?,?,?,?,?,?,1)",
+            [
+                (word.ordinal, word.start, word.end, word.speaker, word.text, word.logprob)
+                for word in words
+            ],
+        )
+
+    def list_transcript_words(self) -> list[Word]:
+        rows = self.connection.execute(
+            "SELECT * FROM transcript_words ORDER BY ordinal"
+        ).fetchall()
+        return [
+            Word(
+                ordinal=row["ordinal"], start=row["start"], end=row["end"],
+                text=row["text"], speaker=row["speaker"], logprob=row["logprob"],
+            )
+            for row in rows
+        ]
+
+    def delete_cues(self, ids: Sequence[str]) -> None:
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        with self.connection:
+            self.connection.execute(
+                f"DELETE FROM cues WHERE id IN ({placeholders})", tuple(ids)
+            )
 
     def checkpoint(self, name: str, value: Any) -> None:
         with self.connection:

@@ -51,6 +51,23 @@ class Cue:
         return replace(self, start=start, end=end, timing_confidence=confidence)
 
 @dataclass(slots=True)
+class Word:
+    """One word of a word-level transcript, on the original timeline.
+
+    ``ordinal`` is the word's position in the full time-ordered stream and is
+    the currency of the whole word pipeline: cue coverage, resume, and the
+    draft agent's output all reference words by it.
+    """
+
+    ordinal: int
+    start: float
+    end: float
+    text: str
+    speaker: str | None = None
+    logprob: float | None = None
+
+
+@dataclass(slots=True)
 class TranscriptEvent:
     cue: Cue
     final: bool = False

@@ -6,14 +6,17 @@ import json
 import re
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
 from .config import Settings
 from .database import JobDatabase
-from .models import AgentTraceEvent, Cue
+from .models import AgentTraceEvent, Cue, Word
 from .process import CommandRunner
+
+if TYPE_CHECKING:
+    from .elevenlabs import WordBatch
 
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
@@ -188,6 +191,34 @@ def claude_trace_events(data: dict[str, Any]) -> list[BackendTraceEvent]:
                 )
             )
     return events
+
+
+WORD_DRAFT_RESPONSE_SCHEMA: dict[str, Any] = {
+    "title": "WordDraftResponse",
+    "description": (
+        "Subtitle cues cut from a word-level transcript, each with a "
+        "first-pass translation."
+    ),
+    "type": "object",
+    "properties": {
+        "cues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "first_word": {"type": "integer"},
+                    "last_word": {"type": "integer"},
+                    "source": {"type": "string"},
+                    "translated": {"type": "string"},
+                },
+                "required": ["first_word", "last_word", "translated"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["cues"],
+    "additionalProperties": False,
+}
 
 
 DRAFT_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -982,3 +1013,517 @@ class TranslationPipeline:
                 cue.speaker,
             ))
         return output
+
+    # --- word mode: the backend delivers words; the draft agent cuts cues ---
+
+    def _stable_word_coverage(self) -> set[int]:
+        """Word ordinals already covered by a finished agent cue."""
+        covered: set[int] = set()
+        for cue in self.db.list_cues(stable_only=True):
+            word_range = cue.metadata.get("word_range")
+            if word_range:
+                covered.update(range(int(word_range[0]), int(word_range[1]) + 1))
+        return covered
+
+    def missing_word_batches(self, words: Sequence[Word]) -> list["WordBatch"]:
+        """Batches over every word no finished cue covers yet.
+
+        Batches are recomputed from coverage rather than remembered, so a
+        resumed job dispatches exactly the uncovered runs regardless of how
+        the original run had sliced them.
+        """
+        from .elevenlabs import split_word_batches
+
+        covered = self._stable_word_coverage()
+        runs: list[list[Word]] = []
+        current: list[Word] = []
+        for word in words:
+            if word.ordinal in covered:
+                if current:
+                    runs.append(current)
+                    current = []
+            else:
+                current.append(word)
+        if current:
+            runs.append(current)
+        batches: list[WordBatch] = []
+        for run in runs:
+            batches.extend(
+                split_word_batches(run, self.settings.agent.draft.word_batch_size)
+            )
+        return batches
+
+    async def segment_and_translate(
+        self,
+        on_batch: Callable[[list[Cue]], Awaitable[None]] | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> list[Cue]:
+        """Segment the stored word transcript into cues and translate them.
+
+        Returns the finished timeline: sorted by start, renumbered, and
+        installed as the authoritative transcript. The provisional preview
+        cues remain in the database only as retired (non-stable) rows.
+        """
+        words = self.db.list_transcript_words()
+        if not words:
+            raise RuntimeError("no transcript words available to segment")
+        batches = self.missing_word_batches(words)
+        boundaries: list[tuple[int, bool]] = []
+        last_ordinal = words[-1].ordinal
+        for batch in batches:
+            if batch.words[0].ordinal > 0:
+                boundaries.append((batch.words[0].ordinal - 1, False))
+            if batch.words[-1].ordinal < last_ordinal:
+                boundaries.append((batch.words[-1].ordinal, batch.forced_end))
+        completed = 0
+
+        async def run(batch: WordBatch) -> None:
+            nonlocal completed
+            async with self._agent_semaphore:
+                cues = await self._run_word_batch(list(batch.words), words)
+            async with self._write_lock:
+                self.db.upsert_cues(cues, stable=True)
+                if on_batch:
+                    await on_batch(self.db.list_cues(stable_only=True))
+                completed += 1
+                if on_progress:
+                    await on_progress(completed, len(batches))
+
+        tasks = [asyncio.create_task(run(batch)) for batch in batches]
+        succeeded = False
+        try:
+            await asyncio.gather(*tasks)
+            succeeded = True
+        finally:
+            if not succeeded:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        await self._repair_junctions(words, boundaries, on_batch)
+        covered = self._stable_word_coverage()
+        missing = [word.ordinal for word in words if word.ordinal not in covered]
+        if missing:
+            raise RuntimeError(
+                f"segmentation left words uncovered: {missing[:20]}"
+                + ("…" if len(missing) > 20 else "")
+            )
+        return self._install_word_timeline()
+
+    def _install_word_timeline(self) -> list[Cue]:
+        """Sort the agent's cues into one timeline and renumber it.
+
+        Concurrent batches finish in arbitrary order, so the rows' insertion
+        ordinals do not follow time; the published timeline must.
+        """
+        ordered = sorted(
+            self.db.list_cues(stable_only=True),
+            key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
+        )
+        renumbered = [
+            replace(cue, id=str(position))
+            for position, cue in enumerate(ordered, 1)
+        ]
+        self.db.replace_transcript(renumbered)
+        return self.db.list_cues(stable_only=True)
+
+    async def _repair_junctions(
+        self,
+        words: Sequence[Word],
+        boundaries: Sequence[tuple[int, bool]],
+        on_batch: Callable[[list[Cue]], Awaitable[None]] | None,
+    ) -> None:
+        """Re-cut suspicious batch boundaries with a small dedicated call.
+
+        A natural cue that happened to span a batch boundary came out as two
+        half-cues translated independently. Boundaries only fall on qualified
+        silences, so most are fine; a forced cut, or two same-speaker cues
+        nearly touching across the boundary, gets its combined word span
+        re-segmented and re-translated as a unit, replacing both halves.
+        """
+        from .elevenlabs import PAUSE_SPLIT_SECONDS
+
+        for boundary, forced in sorted(set(boundaries)):
+            cues = self.db.list_cues(stable_only=True)
+            by_word: dict[int, Cue] = {}
+            for cue in cues:
+                word_range = cue.metadata.get("word_range")
+                if word_range:
+                    for ordinal in range(int(word_range[0]), int(word_range[1]) + 1):
+                        by_word[ordinal] = cue
+            left = by_word.get(boundary)
+            right = by_word.get(boundary + 1)
+            if left is None or right is None or left.id == right.id:
+                continue
+            suspicious = forced or (
+                left.speaker == right.speaker
+                and right.start - left.end < PAUSE_SPLIT_SECONDS
+            )
+            if not suspicious:
+                continue
+            low = int(left.metadata["word_range"][0])
+            high = int(right.metadata["word_range"][1])
+            span = [word for word in words if low <= word.ordinal <= high]
+            replaced = sorted({
+                cue.id
+                for cue in cues
+                if cue.metadata.get("word_range")
+                and low <= int(cue.metadata["word_range"][0])
+                and int(cue.metadata["word_range"][1]) <= high
+            })
+            async with self._agent_semaphore:
+                new_cues = await self._run_word_batch(span, words)
+            async with self._write_lock:
+                self.db.delete_cues(replaced)
+                self.db.upsert_cues(new_cues, stable=True)
+                if on_batch:
+                    await on_batch(self.db.list_cues(stable_only=True))
+
+    def _word_system(self) -> str:
+        subtitles = self.settings.subtitles
+        memory_evidence = (
+            " A name, term, or spelling recorded in MEMORY is exactly this "
+            "kind of evidence: when the recognized wording reads as a "
+            "plausible misrecognition of something MEMORY records, restore "
+            "MEMORY's form, including when the two are written with different "
+            "characters or scripts, as long as they are pronounced alike."
+            if self.memory.strip()
+            else ""
+        )
+        return (
+            "You are YakiFlow's draft subtitler for a word-level transcript. "
+            "INPUT carries `words`: one batch of the raw, time-ordered ASR "
+            "word stream, each word as {i: word index, t: start second, s: "
+            "speaker label (absent when unknown), w: text}. Group these words "
+            "into subtitle cues and translate every cue into the target "
+            f"language ({self.settings.target_language}).\n"
+            "Return one entry per cue. `first_word` and `last_word` are `i` "
+            "values; the cue covers every word in that inclusive interval "
+            "that belongs to the same speaker as `first_word`. Words of other "
+            "speakers inside the interval belong to their own cues — people "
+            "talk over each other, and overlapping cues of different speakers "
+            "are expected. Use the speaker labels to resolve pronouns and "
+            "register, but never translate them or copy them into the text.\n"
+            "Every word must end up in exactly one cue of its own speaker: no "
+            "gaps, no overlaps, no word in two cues. Never invent word "
+            "indices and never write timestamps: timing is derived from the "
+            "words mechanically.\n"
+            "Cut cues at natural phrase boundaries. A cue may span at most "
+            f"{subtitles.max_cue_seconds:g} seconds and carry at most "
+            f"{subtitles.max_cue_chars} characters per language.\n"
+            "`source` is optional and defaults to the covered words joined "
+            "verbatim. Provide it only to correct highly certain "
+            "ASR/transcription errors whose correction remains phonetically "
+            "very close to the recognized wording (such as an obvious "
+            "homophone or minor recognition mistake)."
+            + memory_evidence
+            + " If there is any doubt, "
+            "leave `source` out; never rewrite the words for grammar, style, "
+            "or plausibility.\n"
+            "Write each translation the way a native speaker of the target "
+            "language would say it rather than as a word-by-word rendering: "
+            "use the word order that language actually uses, and replace "
+            "calqued idioms and other translationese with natural wording. "
+            "Keep the meaning, speaker intent, and tone unchanged while doing "
+            "so, and never add, drop, or embellish content to make a line "
+            "read better.\n"
+            "`preceding_cues` are finished cues from just before this batch "
+            "and `following_words` a peek past its end; both are context "
+            "only: never translate them and never return cues for them.\n"
+            + self._memory_section(translate_only=False)
+        )
+
+    def _word_prompt(
+        self,
+        batch_words: Sequence[Word],
+        preceding: Sequence[Cue],
+        following: Sequence[Word],
+        errors: Sequence[str] = (),
+    ) -> str:
+        def word_payload(word: Word) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "i": word.ordinal,
+                "t": round(word.start, 3),
+                "w": word.text,
+            }
+            if word.speaker is not None:
+                payload["s"] = word.speaker
+            return payload
+
+        payload = {
+            "source_language": self.settings.source_language,
+            "target_language": self.settings.target_language,
+            "words": [word_payload(word) for word in batch_words],
+            "preceding_cues": [
+                {
+                    "source": cue.source,
+                    "translated": cue.translated,
+                    "speaker": cue.speaker,
+                }
+                for cue in preceding
+            ],
+            "following_words": [word_payload(word) for word in following],
+        }
+        text = "INPUT:\n" + json.dumps(payload, ensure_ascii=False)
+        if errors:
+            text += (
+                "\nYour previous response was rejected by mechanical "
+                "validation. Fix these problems and answer again:\n"
+                + "\n".join(f"- {error}" for error in errors)
+            )
+        return text
+
+    def _cues_from_word_response(
+        self, raw: dict[str, Any], batch_words: Sequence[Word]
+    ) -> list[Cue]:
+        """Validate the agent's intervals and derive cues mechanically.
+
+        The agent chose only word intervals and text; start, end, and speaker
+        come from the words. Violations are collected into one error whose
+        messages name concrete word indices, so a retry can quote them back.
+        """
+        subtitles = self.settings.subtitles
+        by_ordinal = {word.ordinal: word for word in batch_words}
+        items = raw.get("cues")
+        if not isinstance(items, list) or not items:
+            raise ValueError("response carries no cues")
+        errors: list[str] = []
+        claimed: dict[str | None, set[int]] = {}
+        cues: list[Cue] = []
+        for item in items:
+            if not isinstance(item, dict):
+                errors.append("every cue must be an object")
+                continue
+            try:
+                first = int(item["first_word"])
+                last = int(item["last_word"])
+            except (KeyError, TypeError, ValueError):
+                errors.append("a cue is missing integer first_word/last_word")
+                continue
+            label = f"cue {first}–{last}"
+            if first not in by_ordinal or last not in by_ordinal:
+                errors.append(f"{label} references words outside this batch")
+                continue
+            if last < first:
+                errors.append(f"{label} ends before it starts")
+                continue
+            first_word = by_ordinal[first]
+            last_word = by_ordinal[last]
+            if first_word.speaker != last_word.speaker:
+                errors.append(
+                    f"{label} starts with speaker {first_word.speaker!r} but "
+                    f"ends with {last_word.speaker!r}; a cue belongs to one "
+                    "speaker"
+                )
+                continue
+            speaker = first_word.speaker
+            cue_words = [
+                word
+                for word in batch_words
+                if first <= word.ordinal <= last and word.speaker == speaker
+            ]
+            ordinals = {word.ordinal for word in cue_words}
+            taken = claimed.setdefault(speaker, set())
+            doubled = sorted(ordinals & taken)
+            if doubled:
+                errors.append(
+                    f"{label} claims words already covered by another cue of "
+                    f"speaker {speaker!r}: {doubled[:10]}"
+                )
+                continue
+            taken.update(ordinals)
+            start = cue_words[0].start
+            end = max(start, max(word.end for word in cue_words))
+            if end - start > subtitles.max_cue_seconds:
+                errors.append(
+                    f"{label} spans {end - start:.2f}s, above the "
+                    f"{subtitles.max_cue_seconds:g}s limit; split it"
+                )
+            source = str(item.get("source") or "").strip() or "".join(
+                word.text for word in cue_words
+            ).strip()
+            translated = str(item.get("translated") or "").strip()
+            if not translated:
+                errors.append(f"{label} has an empty translation")
+            for text_label, text in (("source", source), ("translation", translated)):
+                if len(text) > subtitles.max_cue_chars:
+                    errors.append(
+                        f"{label} {text_label} is {len(text)} characters, "
+                        f"above the {subtitles.max_cue_chars} limit; split "
+                        "the cue"
+                    )
+            cues.append(Cue(
+                f"w{first}-{last}",
+                start,
+                end,
+                source,
+                translated,
+                None,
+                {
+                    "word_range": [first, last],
+                    "words": [asdict(word) for word in cue_words],
+                },
+                speaker,
+            ))
+        for speaker, taken in claimed.items():
+            uncovered = sorted(
+                word.ordinal
+                for word in batch_words
+                if word.speaker == speaker and word.ordinal not in taken
+            )
+            if uncovered:
+                errors.append(
+                    f"words of speaker {speaker!r} are not covered by any "
+                    f"cue: {uncovered[:10]}"
+                )
+        unclaimed_speakers = {
+            word.speaker for word in batch_words
+        } - set(claimed)
+        for speaker in sorted(s or "" for s in unclaimed_speakers):
+            errors.append(
+                f"no cue covers any words of speaker {speaker!r}"
+            )
+        if errors:
+            raise ValueError("; ".join(errors))
+        return cues
+
+    async def _run_word_batch(
+        self, batch_words: list[Word], all_words: Sequence[Word]
+    ) -> list[Cue]:
+        draft = self.settings.agent.draft
+        first = batch_words[0].ordinal
+        last = batch_words[-1].ordinal
+        label = f"words {first}–{last}"
+        operation_id = uuid.uuid4().hex
+        system = self._word_system()
+        preceding = sorted(
+            (
+                cue
+                for cue in self.db.list_cues(stable_only=True)
+                if cue.start < batch_words[0].start
+            ),
+            key=lambda cue: (cue.start, cue.end),
+        )
+        preceding = (
+            preceding[-draft.preceding_context:] if draft.preceding_context else []
+        )
+        following = [
+            word for word in all_words if word.ordinal > last
+        ][:draft.word_following_context]
+        model = draft.model or ""
+        effort = draft.effort or "low"
+        attempts = draft.max_attempts
+        errors: list[str] = []
+        summary = f"Segment and translate {label}"
+        await self._emit_agent(
+            operation_id, "user_message", summary,
+            model=model, attempt=1, max_attempts=attempts,
+        )
+        for attempt in range(1, attempts + 1):
+            prompt = self._word_prompt(batch_words, preceding, following, errors)
+            batch_id = self.db.start_batch(
+                [label],
+                self.backend.name,
+                model,
+                {
+                    "system": system,
+                    "prompt": prompt,
+                    "attempt": attempt,
+                    "max_attempts": attempts,
+                },
+            )
+            await self._emit_agent(
+                operation_id, "lifecycle", summary,
+                state="running", model=model,
+                attempt=attempt, max_attempts=attempts,
+            )
+
+            async def backend_event(event: BackendTraceEvent) -> None:
+                await self._emit_agent(
+                    operation_id, event.kind, event.message,
+                    state="running", model=model,
+                    attempt=attempt, max_attempts=attempts,
+                    event_id=event.event_id, detail=event.detail,
+                )
+
+            try:
+                async with asyncio.timeout(draft.timeout_seconds):
+                    raw = await self.backend.invoke_with_trace(
+                        prompt, system=system, model=model, effort=effort,
+                        schema=WORD_DRAFT_RESPONSE_SCHEMA,
+                        on_event=backend_event,
+                    )
+                await self._emit_agent(
+                    operation_id,
+                    "agent_output",
+                    "Structured response",
+                    model=model,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    detail=_structured_output_detail(raw),
+                )
+                cues = self._cues_from_word_response(raw, batch_words)
+            except asyncio.CancelledError:
+                self.db.finish_batch(batch_id, error="cancelled")
+                await self._emit_agent(
+                    operation_id, "lifecycle", "Agent operation cancelled",
+                    state="cancelled", model=model,
+                    attempt=attempt, max_attempts=attempts,
+                )
+                raise
+            except Exception as exc:
+                error: Exception = (
+                    TimeoutError(
+                        "agent word batch timed out after "
+                        f"{draft.timeout_seconds:g}s"
+                    )
+                    if isinstance(exc, TimeoutError)
+                    else exc
+                )
+                self.db.finish_batch(batch_id, error=str(error))
+                await self._emit_agent(
+                    operation_id, "error", str(error),
+                    state="retrying" if attempt < attempts else "failed",
+                    model=model, attempt=attempt, max_attempts=attempts,
+                )
+                if attempt == attempts:
+                    await self._emit_agent(
+                        operation_id, "lifecycle", str(error),
+                        state="failed", model=model,
+                        attempt=attempt, max_attempts=attempts,
+                    )
+                    if error is exc:
+                        raise
+                    raise error from exc
+                if isinstance(exc, ValueError):
+                    # The mechanical findings ride along on the retry so the
+                    # agent fixes what was actually wrong.
+                    errors = [str(exc)]
+                await self._emit_agent(
+                    operation_id, "lifecycle",
+                    f"Retrying attempt {attempt + 1}/{attempts}",
+                    state="retrying", model=model,
+                    attempt=attempt + 1, max_attempts=attempts,
+                )
+                if self.on_retry:
+                    await self.on_retry(
+                        f"Agent word batch failed: {error}; "
+                        f"retrying {attempt + 1}/{attempts}"
+                    )
+                delay = draft.retry_delay_seconds
+                cap = max(_MAX_RETRY_BACKOFF_SECONDS, delay)
+                await asyncio.sleep(min(delay * 2 ** (attempt - 1), cap))
+                continue
+            self.db.finish_batch(batch_id, raw)
+            message = f"Segmented {len(cues)} cues from {label}"
+            await self._emit_agent(
+                operation_id, "result", message,
+                state="completed", model=model,
+                attempt=attempt, max_attempts=attempts,
+            )
+            await self._emit_agent(
+                operation_id, "lifecycle", message,
+                state="completed", model=model,
+                attempt=attempt, max_attempts=attempts,
+            )
+            return cues
+        raise RuntimeError("unreachable Agent retry state")

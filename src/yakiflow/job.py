@@ -235,6 +235,11 @@ class YakiFlowJob:
         return self._resume_status is JobStatus.COMPLETE
 
     @property
+    def _word_mode(self) -> bool:
+        """Whether the backend delivers words and the draft agent cuts cues."""
+        return self.settings.transcription.backend.startswith("elevenlabs")
+
+    @property
     def media_path(self) -> Path | None:
         """The original or downloaded media file used by this job."""
         if self._artifact is not None:
@@ -384,7 +389,18 @@ class YakiFlowJob:
         resume_from = self._transcription_resume_cues() if needs_transcription else []
         existing_cues = self.db.list_cues(stable_only=True)
         alignment_complete = bool(self.db.get_checkpoint("alignment_complete", False))
-        has_missing_translation = any(not cue.translated for cue in existing_cues)
+        if self._word_mode:
+            # Word-mode completeness is word coverage, not cue translations:
+            # a fresh word transcript has no stable cues at all yet.
+            words = self.db.list_transcript_words()
+            covered = self._covered_word_ordinals(existing_cues)
+            has_missing_translation = not words or any(
+                word.ordinal not in covered for word in words
+            )
+        else:
+            has_missing_translation = any(
+                not cue.translated for cue in existing_cues
+            )
         needs_translation = needs_transcription or (
             has_missing_translation and not alignment_complete
         )
@@ -394,8 +410,12 @@ class YakiFlowJob:
         )
         # Draft batches run alongside Whisper and are already represented by
         # the tail of the transcription stage. Keep a separate translation
-        # range only when transcription was restored from a checkpoint.
-        self._combined_translation_progress = needs_transcription and needs_translation
+        # range only when transcription was restored from a checkpoint. Word
+        # mode always keeps its own translation range: segmentation starts
+        # after the whole word transcript exists.
+        self._combined_translation_progress = (
+            needs_transcription and needs_translation and not self._word_mode
+        )
         self._translation_batches_completed = 0
         self._translation_batches_total = 0
         transcription_scale = self._remaining_transcription_fraction(
@@ -702,6 +722,11 @@ class YakiFlowJob:
     async def _transcription_stage(self, artifact: MediaArtifact) -> list[Cue]:
         partial_path = self._draft_partial_path(artifact)
         if self.db.get_checkpoint("transcribed"):
+            if self._word_mode and self.db.list_transcript_words():
+                await self._write_partial(partial_path, self._word_partial_view())
+                await self._begin_stage("transcribe", "using cached transcription")
+                await self._finish_stage("transcribe", "transcription ready")
+                return self.db.list_cues(stable_only=True)
             cues = self.db.list_cues(stable_only=True)
             if cues:
                 await self._write_partial(partial_path, cues)
@@ -728,6 +753,10 @@ class YakiFlowJob:
             await self._begin_stage(
                 "transcribe",
                 f"running authoritative full-audio transcription ({transcriber.name})",
+            )
+        if self._word_mode:
+            return await self._word_transcription_stage(
+                artifact, transcriber, partial_path
             )
         incremental: list[Cue] = []
         translation_tasks: list[asyncio.Task[None]] = []
@@ -841,6 +870,85 @@ class YakiFlowJob:
             await self._finish_stage("transcribe", "authoritative transcription ready")
         return self.db.list_cues(stable_only=True)
 
+    @staticmethod
+    def _covered_word_ordinals(cues: Sequence[Cue]) -> set[int]:
+        covered: set[int] = set()
+        for cue in cues:
+            word_range = cue.metadata.get("word_range")
+            if word_range:
+                covered.update(range(int(word_range[0]), int(word_range[1]) + 1))
+        return covered
+
+    def _word_partial_view(self) -> list[Cue]:
+        """Finished agent cues, plus preview cues where no agent cue exists yet."""
+        stable = self.db.list_cues(stable_only=True)
+        covered = self._covered_word_ordinals(stable)
+        preview: list[Cue] = []
+        for cue in self.db.list_cues():
+            if not cue.id.startswith("preview-"):
+                continue
+            word_range = cue.metadata.get("word_range")
+            if word_range is None or covered.isdisjoint(
+                range(int(word_range[0]), int(word_range[1]) + 1)
+            ):
+                preview.append(cue)
+        return sorted(
+            [*stable, *preview],
+            key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
+        )
+
+    async def _word_transcription_stage(
+        self,
+        artifact: MediaArtifact,
+        transcriber,
+        partial_path: Path,
+    ) -> list[Cue]:
+        async def event(item: TranscriptEvent) -> None:
+            await self.emit("transcript", "provisional preview subtitle", cue=item.cue)
+
+        async def word_progress(fraction: float) -> None:
+            await self._report_progress(
+                "transcribe",
+                fraction,
+                f"{transcriber.name} transcription · {round(fraction * 100)}%",
+            )
+
+        preview = await transcriber.transcribe(
+            artifact.audio_path, event, word_progress
+        )
+        # The preview cues are provisional placeholders: the draft agent's
+        # segmentation of the stored words produces the real cues.
+        if preview:
+            self.db.upsert_cues(preview, stable=False)
+        await self._write_partial(partial_path, self._word_partial_view())
+        self.db.checkpoint("transcribed", True)
+        await self._finish_stage("transcribe", "word transcript ready")
+        return self.db.list_cues(stable_only=True)
+
+    async def _word_translation_stage(self, artifact: MediaArtifact) -> list[Cue]:
+        self.db.set_status(JobStatus.TRANSLATING)
+        await self._begin_stage(
+            "translate", "segmenting and translating the word transcript"
+        )
+        pipeline = self._translation_pipeline()
+        partial_path = self._draft_partial_path(artifact)
+
+        async def on_batch(_cues: list[Cue]) -> None:
+            await self._write_partial(partial_path, self._word_partial_view())
+
+        async def on_progress(completed: int, total: int) -> None:
+            await self._report_progress(
+                "translate",
+                completed / total if total else 1.0,
+                f"Agent word batches · {completed}/{total}",
+            )
+
+        final = await pipeline.segment_and_translate(on_batch, on_progress)
+        await self._write_partial(partial_path, final)
+        await self._emit_agent_cues(final)
+        await self._finish_stage("translate", "draft segmentation and translation ready")
+        return final
+
     async def _write_partial(self, path: Path, cues: Sequence[Cue]) -> None:
         mode = self.settings.output_mode if self.settings.output_mode != "all" else "bilingual"
         # write_ass_atomic renders every cue and fsyncs, and this runs once per
@@ -853,6 +961,8 @@ class YakiFlowJob:
             await asyncio.to_thread(write_ass_atomic, path, list(cues), mode)
 
     async def _translation_stage(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Cue]:
+        if self._word_mode:
+            return await self._word_translation_stage(artifact)
         self.db.set_status(JobStatus.TRANSLATING)
         progress_stage = (
             "transcribe" if self._combined_translation_progress else "translate"

@@ -16,6 +16,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2", "pytest-asyncio>=0.23"]
+elevenlabs = [
+  "elevenlabs>=2.60,<3",
+  # The SDK's realtime speech-to-text client imports websockets on demand.
+  "websockets>=13",
+]
+keyring = ["keyring>=25"]
 whisperx-cpu = [
   "whisperx>=3.8.4,<3.9",
   "torch~=2.8.0",
