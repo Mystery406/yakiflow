@@ -133,8 +133,8 @@ def test_stream_auto_language_is_sent_on_every_chunk(tmp_path: Path, monkeypatch
         def __init__(self, host: str, port: int, timeout: int):
             pass
 
-        def request(self, method: str, path: str, *, body: bytes, headers: dict[str, str]) -> None:
-            bodies.append(body)
+        def request(self, method: str, path: str, *, body, headers: dict[str, str]) -> None:
+            bodies.append(b"".join(body) if not isinstance(body, bytes) else body)
             paths.append(path)
 
         @staticmethod
@@ -153,8 +153,8 @@ def test_stream_auto_language_is_sent_on_every_chunk(tmp_path: Path, monkeypatch
         make_settings(source_language="auto"), tmp_path, db
     )
 
-    server._post_audio(audio)
-    server._post_audio(audio)
+    server._post_audio(audio, 180.0)
+    server._post_audio(audio, 180.0)
 
     language_field = b'name="language"\r\n\r\nauto\r\n'
     assert len(bodies) == 2
@@ -330,3 +330,209 @@ def test_overlap_deduplication_covers_the_whole_recovery_window() -> None:
     merged = merge_overlap(durable, repeated)
     assert len(merged) == len(durable)
     assert [cue.source for cue in merged] == [cue.source for cue in durable]
+
+
+def test_make_transcriber_maps_backends_and_rejects_unknown(tmp_path: Path) -> None:
+    from yakiflow.transcription import make_transcriber
+
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    cli = make_transcriber(
+        make_settings(transcription={"backend": "whisper-cli"}), tmp_path, db
+    )
+    assert isinstance(cli, WhisperCliTranscriber)
+    server = make_transcriber(
+        make_settings(transcription={"backend": "whisper-server"}), tmp_path, db
+    )
+    assert isinstance(server, WhisperServerTranscriber)
+    with pytest.raises(ValueError, match="unsupported transcription backend"):
+        make_transcriber(
+            make_settings(transcription={"backend": "wav2vec"}), tmp_path, db
+        )
+    db.close()
+
+
+def test_needs_local_whisper_gates_on_backend_and_server_url() -> None:
+    from yakiflow.transcription import needs_local_whisper
+
+    assert needs_local_whisper(make_settings())
+    assert needs_local_whisper(
+        make_settings(transcription={"backend": "whisper-server"})
+    )
+    assert not needs_local_whisper(
+        make_settings(
+            transcription={"backend": "whisper-server"},
+            whisper={"server_url": "http://127.0.0.1:8080"},
+        )
+    )
+    assert not needs_local_whisper(
+        make_settings(transcription={"backend": "elevenlabs"})
+    )
+
+
+def test_whisper_cli_chunks_merge_through_the_chunk_timeline(tmp_path: Path) -> None:
+    """Each chunk is one full CLI run whose cues land on the stream timeline."""
+    texts = iter([
+        '{"transcription":[{"timestamps":{"from":"00:00:01,000","to":"00:00:02,000"},"text":"first"}]}',
+        # The second chunk re-hears the overlap window and adds new speech.
+        '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,000"},"text":"first"},'
+        '{"timestamps":{"from":"00:00:02,000","to":"00:00:03,000"},"text":"second"}]}',
+    ])
+
+    class ChunkRunner:
+        async def run(self, args, *, on_line=None, **kwargs):
+            prefix = Path(args[args.index("--output-file") + 1])
+            prefix.with_suffix(".json").write_text(next(texts), encoding="utf-8")
+
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = WhisperCliTranscriber(
+        make_settings(), tmp_path, db, runner=ChunkRunner()
+    )
+
+    async def exercise() -> None:
+        first = await transcriber.submit_chunk(tmp_path / "chunk1.wav", 0.0)
+        assert [(cue.start, cue.source) for cue in first] == [(1.0, "first")]
+        second = await transcriber.submit_chunk(tmp_path / "chunk2.wav", 1.0)
+        # The duplicated overlap text is dropped; only new speech is returned.
+        assert [(cue.start, cue.source) for cue in second] == [(3.0, "second")]
+        assert [cue.source for cue in transcriber.chunk_cues] == ["first", "second"]
+
+    asyncio.run(exercise())
+    db.close()
+
+
+def test_external_server_url_mode_never_spawns(tmp_path: Path) -> None:
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    settings = make_settings(
+        transcription={"backend": "whisper-server"},
+        whisper={"server_url": "https://transcribe.example.com:8443/whisper"},
+    )
+    server = WhisperServerTranscriber(settings, tmp_path, db)
+
+    async def boom(*_args) -> None:
+        raise AssertionError("external URL mode must not spawn a server")
+
+    server._spawn = boom  # type: ignore[method-assign]
+    asyncio.run(server.start_chunks())
+    asyncio.run(server.close_chunks())
+    assert (server.tls, server.host, server.port) == (
+        True, "transcribe.example.com", 8443
+    )
+    assert server.request_path == "/whisper"
+    db.close()
+
+
+def test_authoritative_post_streams_the_file_without_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    class Response:
+        status = 200
+
+        @staticmethod
+        def read() -> bytes:
+            return (
+                b'{"transcription":[{"timestamps":'
+                b'{"from":"00:00:00,500","to":"00:00:01,000"},"text":"served"}]}'
+            )
+
+    class Connection:
+        def __init__(self, host, port, timeout="unset"):
+            seen["timeout"] = timeout
+
+        def request(self, method, path, *, body, headers):
+            seen["body"] = b"".join(body)
+            seen["headers"] = headers
+            seen["path"] = path
+
+        @staticmethod
+        def getresponse() -> Response:
+            return Response()
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    audio = tmp_path / "reference.wav"
+    audio.write_bytes(b"RIFF" + b"x" * 100)
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    settings = make_settings(
+        source_language="auto",
+        transcription={"backend": "whisper-server"},
+        whisper={"server_url": "http://127.0.0.1:9999"},
+    )
+    server = WhisperServerTranscriber(settings, tmp_path, db)
+    events: list[tuple[bool, str]] = []
+
+    async def on_event(event) -> None:
+        events.append((event.final, event.cue.source))
+
+    cues = asyncio.run(server.transcribe(audio, on_event))
+
+    assert seen["timeout"] is None
+    assert seen["path"] == "/inference"
+    body = seen["body"]
+    assert isinstance(body, bytes) and b"x" * 100 in body
+    headers = seen["headers"]
+    assert int(headers["Content-Length"]) == len(body)
+    assert [(cue.start, cue.source) for cue in cues] == [(0.5, "served")]
+    assert events == [(True, "served")]
+    db.close()
+
+
+def test_external_server_failure_names_the_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, *args, **kwargs):
+            raise ConnectionRefusedError("connection refused")
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    audio = tmp_path / "reference.wav"
+    audio.write_bytes(b"RIFF-fake")
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    settings = make_settings(
+        transcription={"backend": "whisper-server"},
+        whisper={"server_url": "http://transcribe.internal:8080"},
+    )
+    server = WhisperServerTranscriber(settings, tmp_path, db)
+
+    with pytest.raises(RuntimeError, match="transcribe.internal:8080"):
+        asyncio.run(server.transcribe(audio))
+    db.close()
+
+
+def test_server_transcribe_scrapes_vad_and_progress_from_stderr(
+    tmp_path: Path,
+) -> None:
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    settings = make_settings(transcription={"backend": "whisper-server"})
+    server = WhisperServerTranscriber(settings, tmp_path, db)
+
+    async def fake_spawn() -> None:
+        assert server._stderr_hook is not None
+        server._stderr_hook("VAD segment 0: start = 1.00, end = 2.00")
+        server._stderr_hook("VAD segment 1: start = 3.00, end = 4.00")
+        server._stderr_hook("whisper progress = 50%")
+
+    async def fake_shutdown() -> None:
+        pass
+
+    server._spawn = fake_spawn  # type: ignore[method-assign]
+    server._shutdown = fake_shutdown  # type: ignore[method-assign]
+    server._post_audio = lambda wav, timeout: {"transcription": []}  # type: ignore[method-assign]
+    audio = tmp_path / "reference.wav"
+    audio.write_bytes(b"RIFF-fake")
+
+    asyncio.run(server.transcribe(audio))
+
+    assert db.get_checkpoint("whisper_vad_intervals") == [[1.0, 2.0], [3.0, 4.0]]
+    db.close()

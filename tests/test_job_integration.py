@@ -1275,6 +1275,8 @@ def test_transcription_failure_cancels_draft_agent_tasks(
     backend = BlockingBackend()
 
     class FailingTranscriber:
+        name = "fake"
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -1291,7 +1293,9 @@ def test_transcription_failure_cancels_draft_agent_tasks(
             await backend.started.wait()
             raise ValueError("transcription failed")
 
-    monkeypatch.setattr(job_module, "WhisperCliTranscriber", FailingTranscriber)
+    monkeypatch.setattr(
+        job_module, "make_transcriber", lambda *args, **kwargs: FailingTranscriber()
+    )
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFF-fake")
     settings = make_settings(
@@ -1355,3 +1359,71 @@ def test_resuming_a_finished_job_does_not_republish_over_reviewed_files(
     assert published.read_text(encoding="utf-8") == reviewed
     assert resumed.db.job()["status"] == "complete"
     resumed.close()
+
+
+def test_alignment_none_installs_the_timeline_without_touching_overlaps(
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF-fake")
+    settings = make_settings(
+        source_language="en",
+        target_language="zh-CN",
+        agent={"backend": "codex"},
+        alignment={"backend": "none"},
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
+    # Two speakers talking over each other: any timing adjustment pass would
+    # "fix" this overlap, which is exactly why alignment none must not run one.
+    cues = [
+        Cue("1", 0.0, 4.0, "a", "甲", speaker="1"),
+        Cue("2", 2.0, 6.0, "b", "乙", speaker="2"),
+    ]
+    job.db.upsert_cues(cues)
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+
+    aligned = asyncio.run(job._alignment_stage(artifact, cues))
+
+    assert [(cue.start, cue.end, cue.speaker) for cue in aligned] == [
+        (0.0, 4.0, "1"),
+        (2.0, 6.0, "2"),
+    ]
+    assert job.db.get_checkpoint("alignment_complete") is True
+    assert job.alignment_result is not None
+    assert job.alignment_result.backend == "none"
+    job.close()
+
+
+def test_external_whisper_server_job_needs_no_local_model(tmp_path: Path) -> None:
+    settings = make_settings(
+        source_language="en",
+        target_language="zh-CN",
+        agent={"backend": "codex"},
+        transcription={"backend": "whisper-server"},
+        whisper={
+            "server_url": "http://127.0.0.1:9999",
+            "model": tmp_path / "definitely-missing.bin",
+        },
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
+    # A missing custom model path is fatal for local Whisper, but an external
+    # server owns its own model, so nothing is checked or downloaded.
+    asyncio.run(job._ensure_model())
+    job.close()
+
+    local = make_settings(
+        source_language="en",
+        target_language="zh-CN",
+        agent={"backend": "codex"},
+        whisper={"model": tmp_path / "definitely-missing.bin"},
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work2",
+    )
+    job = YakiFlowJob("input.mp4", local, backend=PipelineBackend())
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(job._ensure_model())
+    job.close()

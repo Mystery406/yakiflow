@@ -11,7 +11,8 @@ from collections.abc import Awaitable, Callable
 from math import inf
 from pathlib import Path
 from time import monotonic
-from typing import Any, Sequence
+from typing import Any, ClassVar, Sequence
+from urllib.parse import urlparse
 
 from .config import Settings
 from .database import JobDatabase
@@ -198,7 +199,114 @@ def whisper_language_and_vad_args(settings: Settings) -> list[str]:
     return args
 
 
+def needs_local_whisper(settings: Settings) -> bool:
+    """Whether this configuration runs a Whisper model on this machine.
+
+    Gates the default-model download and the model-file checks: an external
+    whisper-server owns its own model, and the ElevenLabs backends have none.
+    """
+    backend = settings.transcription.backend
+    if backend == "whisper-cli":
+        return True
+    if backend == "whisper-server":
+        return settings.whisper.server_url is None
+    return False
+
+
+async def extract_tail(
+    runner: CommandRunner,
+    ffmpeg: str,
+    audio: Path,
+    start: float,
+    destination: Path,
+) -> None:
+    """Write 16 kHz mono PCM covering ``audio`` from ``start`` onwards."""
+    await runner.run([
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", str(start), "-i", audio,
+        "-ac", "1", "-ar", "16000", destination,
+    ])
+
+
+class ChunkTimeline:
+    """The accumulated preview timeline built from overlapping stream chunks."""
+
+    def __init__(self) -> None:
+        self.cues: list[Cue] = []
+
+    def add(self, incoming: Sequence[Cue]) -> list[Cue]:
+        """Merge one chunk's cues in and return only the newly added ones."""
+        known = {cue.id for cue in self.cues}
+        self.cues = merge_overlap(self.cues, list(incoming))
+        return [cue for cue in self.cues if cue.id not in known]
+
+
+class ElapsedProgressTicker:
+    """Synthetic progress for backends that report none of their own.
+
+    Emits ``min(0.95, elapsed / estimate)`` on an interval; a real progress
+    figure reported by the backend replaces the synthetic curve from then on.
+    """
+
+    def __init__(
+        self,
+        estimate_seconds: float,
+        on_progress: ProgressCallback | None,
+        interval: float = 2.0,
+    ):
+        self.estimate_seconds = max(1.0, estimate_seconds)
+        self.on_progress = on_progress
+        self.interval = interval
+        self._real: float | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    def report_real(self, fraction: float) -> None:
+        current = self._real if self._real is not None else 0.0
+        self._real = min(1.0, max(current, fraction))
+
+    async def _run(self) -> None:
+        started = monotonic()
+        while True:
+            await asyncio.sleep(self.interval)
+            if self.on_progress is None:
+                continue
+            if self._real is not None:
+                await self.on_progress(self._real)
+            else:
+                elapsed = monotonic() - started
+                await self.on_progress(min(0.95, elapsed / self.estimate_seconds))
+
+    async def __aenter__(self) -> ElapsedProgressTicker:
+        if self.on_progress is not None:
+            self._task = asyncio.create_task(self._run())
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+
 class Transcriber(ABC):
+    """One speech-to-text backend, usable for chunk previews and full audio.
+
+    The preview and the authoritative pass each build their own instance:
+    provisional chunk state is discarded anyway, and per-instance process or
+    socket lifetime keeps the two passes from sharing half-open resources.
+    """
+
+    name: ClassVar[str]
+
+    def __init__(self) -> None:
+        self._chunk_timeline = ChunkTimeline()
+
+    @property
+    def chunk_cues(self) -> list[Cue]:
+        return self._chunk_timeline.cues
+
     @abstractmethod
     async def transcribe(
         self,
@@ -209,9 +317,22 @@ class Transcriber(ABC):
         resume_from: Sequence[Cue] = (),
     ) -> list[Cue]: ...
 
+    async def start_chunks(self) -> None:
+        """Prepare for streaming chunk previews; default is nothing to do."""
+
+    @abstractmethod
+    async def submit_chunk(self, wav: Path, offset: float) -> list[Cue]:
+        """Transcribe one stream excerpt and return the newly added cues."""
+
+    async def close_chunks(self) -> None:
+        """Release chunk-preview resources; default is nothing to hold."""
+
 
 class WhisperCliTranscriber(Transcriber):
+    name = "whisper-cli"
+
     def __init__(self, settings: Settings, work_dir: Path, db: JobDatabase, runner: CommandRunner | None = None):
+        super().__init__()
         self.settings = settings
         self.work_dir = work_dir
         self.db = db
@@ -342,6 +463,25 @@ class WhisperCliTranscriber(Transcriber):
                 await on_event(TranscriptEvent(cue, final=True))
         return cues
 
+    async def submit_chunk(self, wav: Path, offset: float) -> list[Cue]:
+        """Run one full whisper-cli pass over a stream excerpt.
+
+        Each chunk reloads the model, which makes this the slowest chunk
+        backend — but a slow chunk only delays the preview: the stream loop
+        re-cuts its tail from the last emitted second, so a backlog is
+        absorbed rather than accumulated.
+        """
+        prefix = self.work_dir / "whisper-chunk"
+
+        async def line(stream: str, value: str) -> None:
+            self.db.log("whisper-cli-chunk", stream, value)
+
+        await self.runner.run(self._cli_args(wav, prefix), on_line=line)
+        incoming = self._load_json(
+            prefix, offset=offset, ordinal_offset=len(self.chunk_cues)
+        )
+        return self._chunk_timeline.add(incoming)
+
     def _cli_args(self, input_audio: Path, prefix: Path) -> list[str | Path]:
         """Build one whisper-cli invocation for an input file and output prefix."""
         args: list[str | Path] = [
@@ -353,12 +493,9 @@ class WhisperCliTranscriber(Transcriber):
         return args
 
     async def _extract_tail(self, audio: Path, start: float, destination: Path) -> None:
-        """Write 16 kHz mono PCM covering ``audio`` from ``start`` onwards."""
-        await self.runner.run([
-            self.settings.commands.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", str(start), "-i", audio,
-            "-ac", "1", "-ar", "16000", destination,
-        ])
+        await extract_tail(
+            self.runner, self.settings.commands.ffmpeg, audio, start, destination
+        )
 
     @staticmethod
     def _json_path(prefix: Path) -> Path:
@@ -383,26 +520,152 @@ def _allocate_loopback_port() -> int:
         return int(reservation.getsockname()[1])
 
 
-class WhisperServerTranscriber:
-    """Persistent whisper-server client used for low-latency stream chunks."""
+class WhisperServerTranscriber(Transcriber):
+    """whisper-server client for stream chunks and whole-file transcription.
+
+    With ``whisper.server-url`` configured this talks to an already-running
+    external instance — nothing is spawned, probed, or terminated. Otherwise
+    a private local server is launched for the lifetime of the pass.
+    """
+
+    name = "whisper-server"
 
     def __init__(
         self,
         settings: Settings,
         work_dir: Path,
         db: JobDatabase,
+        runner: CommandRunner | None = None,
         port: int | None = None,
     ):
+        super().__init__()
         self.settings = settings
         self.work_dir = work_dir
         self.db = db
-        self.port = port
-        self.request_path = f"/yakiflow-{uuid.uuid4().hex}"
+        self.runner = runner or CommandRunner()
+        self.external_url = settings.whisper.server_url
+        if self.external_url:
+            parsed = urlparse(self.external_url)
+            self.tls = parsed.scheme == "https"
+            self.host = parsed.hostname or "127.0.0.1"
+            self.port: int | None = parsed.port or (443 if self.tls else 80)
+            self.request_path = (parsed.path or "").rstrip("/")
+        else:
+            self.tls = False
+            self.host = "127.0.0.1"
+            self.port = port
+            self.request_path = f"/yakiflow-{uuid.uuid4().hex}"
         self.process: asyncio.subprocess.Process | None = None
-        self.cues: list[Cue] = []
         self._log_tasks: list[asyncio.Task[None]] = []
+        self._stderr_hook: Callable[[str], None] | None = None
 
-    async def start(self) -> None:
+    async def start_chunks(self) -> None:
+        if not self.external_url:
+            await self._spawn()
+
+    async def submit_chunk(self, wav: Path, offset: float) -> list[Cue]:
+        payload = await asyncio.to_thread(self._post_audio, wav, 180.0)
+        language = detected_source_language(payload)
+        if language:
+            self.db.checkpoint("detected_source_language", language)
+        incoming = parse_json_full(
+            payload, offset=offset, ordinal_offset=len(self.chunk_cues)
+        )
+        return self._chunk_timeline.add(incoming)
+
+    async def close_chunks(self) -> None:
+        await self._shutdown()
+
+    async def transcribe(
+        self,
+        audio: Path,
+        on_event: EventCallback | None = None,
+        on_progress: ProgressCallback | None = None,
+        *,
+        resume_from: Sequence[Cue] = (),
+    ) -> list[Cue]:
+        from .media import pcm_audio_duration
+
+        preserved = list(resume_from)
+        input_audio = audio
+        input_offset = 0.0
+        if preserved:
+            input_offset = max(cue.end for cue in preserved)
+            input_audio = self.work_dir / "whisper-resume.wav"
+            await extract_tail(
+                self.runner,
+                self.settings.commands.ffmpeg,
+                audio,
+                input_offset,
+                input_audio,
+            )
+        duration = pcm_audio_duration(input_audio) or 60.0
+        # whisper-server reports no request progress of its own; large models
+        # run near real time, so elapsed time over duration is the estimate,
+        # replaced by any real `progress = NN%` line the local server prints.
+        ticker = ElapsedProgressTicker(max(30.0, duration), on_progress)
+        vad_intervals: list[tuple[float, float]] = []
+
+        def scrape(line: str) -> None:
+            interval = parse_vad_segment(line, offset=input_offset)
+            if interval is not None:
+                append_vad_interval(vad_intervals, interval)
+            progress = PROGRESS_RE.search(line)
+            if progress is not None:
+                ticker.report_real(min(100, int(progress.group("percent"))) / 100)
+
+        spawned = not self.external_url
+        if spawned:
+            self._stderr_hook = scrape
+            await self._spawn()
+        try:
+            async with ticker:
+                try:
+                    payload = await asyncio.to_thread(
+                        self._post_audio, input_audio, None
+                    )
+                except OSError as exc:
+                    if not spawned:
+                        raise RuntimeError(
+                            f"whisper-server at {self.external_url} did not "
+                            f"accept the request: {exc}"
+                        ) from exc
+                    # A local server that dropped the connection gets exactly
+                    # one restart; a second failure is a real problem.
+                    await self._shutdown()
+                    await self._spawn()
+                    payload = await asyncio.to_thread(
+                        self._post_audio, input_audio, None
+                    )
+        finally:
+            if spawned:
+                await self._shutdown()
+        language = detected_source_language(payload)
+        if language:
+            self.db.checkpoint("detected_source_language", language)
+        if vad_intervals:
+            # Not every whisper-server build prints its VAD spans; when this
+            # one did not, the checkpoint stays as-is and alignment falls back
+            # to its PCM energy analysis.
+            stored = [
+                (float(start), float(end))
+                for start, end in self.db.get_checkpoint(
+                    "whisper_vad_intervals", []
+                )
+            ]
+            self.db.checkpoint(
+                "whisper_vad_intervals",
+                merge_vad_intervals(stored + vad_intervals),
+            )
+        cues = preserved + parse_json_full(
+            payload, offset=input_offset, ordinal_offset=len(preserved)
+        )
+        for cue in cues:
+            if on_event:
+                await on_event(TranscriptEvent(cue, final=True))
+        return cues
+
+    async def _spawn(self) -> None:
         if self.port is None:
             self.port = _allocate_loopback_port()
         args: list[str] = [
@@ -421,17 +684,20 @@ class WhisperServerTranscriber:
             # StreamReader.readline() raises once a line exceeds its 64 KiB
             # limit, which would silently kill this drainer and let the
             # undrained pipe block whisper-server. Frame the lines ourselves.
+            def record(line: str) -> None:
+                self.db.log("whisper-server", stream, line)
+                if stream == "stderr" and self._stderr_hook is not None:
+                    self._stderr_hook(line)
+
             pending = bytearray()
             while raw := await reader.read(_PIPE_CHUNK_BYTES):
                 pending.extend(raw)
                 while (newline := pending.find(b"\n")) >= 0:
                     line = bytes(pending[:newline])
                     del pending[:newline + 1]
-                    self.db.log("whisper-server", stream, line.decode(errors="replace"))
+                    record(line.decode(errors="replace"))
             if pending:
-                self.db.log(
-                    "whisper-server", stream, bytes(pending).decode(errors="replace")
-                )
+                record(bytes(pending).decode(errors="replace"))
         self._log_tasks = [
             asyncio.create_task(drain(self.process.stdout, "stdout")),
             asyncio.create_task(drain(self.process.stderr, "stderr")),
@@ -439,7 +705,7 @@ class WhisperServerTranscriber:
         try:
             await self._wait_until_ready()
         except BaseException:
-            await self.close()
+            await self._shutdown()
             raise
 
     async def _wait_until_ready(self, timeout: float = 180.0) -> None:
@@ -481,46 +747,87 @@ class WhisperServerTranscriber:
                 raise RuntimeError("whisper-server exited during startup")
             return
 
-    async def submit(self, wav_path: Path, offset: float = 0.0) -> list[Cue]:
-        payload = await asyncio.to_thread(self._post_audio, wav_path)
-        language = detected_source_language(payload)
-        if language:
-            self.db.checkpoint("detected_source_language", language)
-        incoming = parse_json_full(payload, offset=offset, ordinal_offset=len(self.cues))
-        self.cues = merge_overlap(self.cues, incoming)
-        return incoming
+    def _post_audio(self, wav_path: Path, timeout: float | None) -> dict[str, Any]:
+        """POST one WAV to /inference, streaming it instead of loading it.
 
-    def _post_audio(self, wav_path: Path) -> dict[str, Any]:
+        A stream chunk is small, but the authoritative pass posts the whole
+        reference audio — hours of PCM — so the request body is generated from
+        the file in pieces, with the exact Content-Length computed up front.
+        ``timeout=None`` likewise exists for that pass: transcribing a long
+        file takes as long as it takes.
+        """
         import http.client
         boundary = "----yakiflow-whisper-boundary"
-        audio = wav_path.read_bytes()
-        fields = [
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n".encode(),
+        prologue = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n"
             # Repeat `auto` for each independent chunk; never replace it with
             # the language detected from the first chunk.
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{self.settings.source_language}\r\n".encode(),
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chunk.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode(),
-            audio,
-            f"\r\n--{boundary}--\r\n".encode(),
-        ]
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=180)
-        connection.request(
-            "POST",
-            f"{self.request_path}/inference",
-            body=b"".join(fields),
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
-        response = connection.getresponse()
-        body = response.read()
-        connection.close()
-        if response.status >= 400:
-            raise RuntimeError(f"whisper-server HTTP {response.status}: {body[:500]!r}")
-        return json.loads(body)
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{self.settings.source_language}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"chunk.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        ).encode()
+        epilogue = f"\r\n--{boundary}--\r\n".encode()
+        size = wav_path.stat().st_size
 
-    async def close(self) -> None:
+        def body():
+            yield prologue
+            with wav_path.open("rb") as fh:
+                while chunk := fh.read(1024 * 1024):
+                    yield chunk
+            yield epilogue
+
+        connection_class = (
+            http.client.HTTPSConnection if self.tls else http.client.HTTPConnection
+        )
+        connection = connection_class(self.host, self.port, timeout=timeout)
+        try:
+            connection.request(
+                "POST",
+                f"{self.request_path}/inference",
+                body=body(),
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(prologue) + size + len(epilogue)),
+                },
+            )
+            response = connection.getresponse()
+            payload = response.read()
+        finally:
+            connection.close()
+        if response.status >= 400:
+            raise RuntimeError(
+                f"whisper-server HTTP {response.status}: {payload[:500]!r}"
+            )
+        return json.loads(payload)
+
+    async def _shutdown(self) -> None:
         if self.process is not None:
             # Share the project's single escalation policy so any helper
             # whisper-server spawned dies with it and stops holding the port.
             await terminate_process(self.process)
+            self.process = None
         if self._log_tasks:
             await asyncio.gather(*self._log_tasks, return_exceptions=True)
+            self._log_tasks = []
+
+
+def make_transcriber(
+    settings: Settings,
+    work_dir: Path,
+    db: JobDatabase,
+    runner: CommandRunner | None = None,
+) -> Transcriber:
+    backend = settings.transcription.backend
+    if backend == "whisper-cli":
+        return WhisperCliTranscriber(settings, work_dir, db, runner)
+    if backend == "whisper-server":
+        return WhisperServerTranscriber(settings, work_dir, db, runner)
+    if backend in {"elevenlabs", "elevenlabs-stream"}:
+        from . import elevenlabs
+
+        cls = (
+            elevenlabs.ElevenLabsTranscriber
+            if backend == "elevenlabs"
+            else elevenlabs.ElevenLabsRealtimeTranscriber
+        )
+        return cls(settings, work_dir, db, runner)
+    raise ValueError(f"unsupported transcription backend: {backend}")

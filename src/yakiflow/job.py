@@ -52,8 +52,8 @@ from .subtitles import (
     write_text_atomic,
 )
 from .transcription import (
-    WhisperCliTranscriber,
-    WhisperServerTranscriber,
+    make_transcriber,
+    needs_local_whisper,
     normalize_source_language,
 )
 from .translation import AgentBackend, TranslationPipeline, make_backend
@@ -373,7 +373,8 @@ class YakiFlowJob:
         source = MediaSource.parse(self.input_value)
         model = self.settings.whisper.model
         needs_model = bool(
-            model
+            needs_local_whisper(self.settings)
+            and model
             and not model.is_file()
             and model.expanduser().resolve() == default_model_path().expanduser().resolve()
         )
@@ -525,6 +526,11 @@ class YakiFlowJob:
             raise
 
     async def _ensure_model(self) -> None:
+        if not needs_local_whisper(self.settings):
+            # An external whisper-server owns its own model, and the
+            # ElevenLabs backends have none: downloading half a gigabyte of
+            # Whisper weights for them would be pure waste.
+            return
         vad_model = self.settings.whisper.vad_model
         if vad_model is not None and not vad_model.is_file():
             raise FileNotFoundError(
@@ -610,8 +616,10 @@ class YakiFlowJob:
             await self._finish_stage("acquire", "media ready")
             return artifact
 
-        server = WhisperServerTranscriber(self.settings, self.work_dir, self.db)
-        await server.start()
+        transcriber = make_transcriber(
+            self.settings, self.work_dir, self.db, self.runner
+        )
+        await transcriber.start_chunks()
         pipeline = self._translation_pipeline()
         partial_path = self._live_partial_path(source)
         completed_chunks = 0
@@ -645,14 +653,12 @@ class YakiFlowJob:
 
         async def chunk(excerpt: Path, start: float) -> None:
             nonlocal completed_chunks
-            existing_ids = {cue.id for cue in server.cues}
-            await server.submit(excerpt, start)
-            new_cues = [cue for cue in server.cues if cue.id not in existing_ids]
-            self.db.replace_transcript(server.cues)
+            new_cues = await transcriber.submit_chunk(excerpt, start)
+            self.db.replace_transcript(transcriber.chunk_cues)
             timeline = self.db.list_cues(stable_only=True)
             await self._write_partial(partial_path, timeline)
             for cue in new_cues:
-                await self.emit("transcript", "Whisper subtitle", cue=cue)
+                await self.emit("transcript", "live subtitle", cue=cue)
             # An Agent round trip runs an order of magnitude longer than the
             # Whisper call above. Awaiting it here would leave the transcriber
             # idle until it returned, so let the next chunk start while this
@@ -682,7 +688,7 @@ class YakiFlowJob:
             artifact = await acquirer.acquire_stream(source, chunk)
             stream_succeeded = True
         finally:
-            await server.close()
+            await transcriber.close_chunks()
             if translation_tasks:
                 if not stream_succeeded:
                     for task in translation_tasks:
@@ -710,16 +716,19 @@ class YakiFlowJob:
             self.db.discard_provisional_transcript()
         self.db.checkpoint("transcription_started", True)
         self.db.set_status(JobStatus.TRANSCRIBING)
+        transcriber = make_transcriber(
+            self.settings, self.work_dir, self.db, self.runner
+        )
         if resume_from:
             await self._begin_stage(
                 "transcribe",
-                f"resuming Whisper after {resume_from[-1].end:.2f}s",
+                f"resuming {transcriber.name} after {resume_from[-1].end:.2f}s",
             )
         else:
             await self._begin_stage(
-                "transcribe", "running authoritative full-audio transcription"
+                "transcribe",
+                f"running authoritative full-audio transcription ({transcriber.name})",
             )
-        transcriber = WhisperCliTranscriber(self.settings, self.work_dir, self.db, self.runner)
         incremental: list[Cue] = []
         translation_tasks: list[asyncio.Task[None]] = []
         scheduled_translation_ids: set[str] = set()
@@ -979,6 +988,21 @@ class YakiFlowJob:
             await self._begin_stage("align", "using cached alignment")
             await self._finish_stage("align", "alignment ready")
             return restored
+        if self.settings.alignment.backend == "none":
+            # No timing adjustment at all: silence trimming, forced alignment,
+            # and end extension each assume one monotonic timeline, and every
+            # one of them would corrupt legitimately overlapping cues from
+            # different speakers. The timeline is still installed so the
+            # ``alignment_complete`` checkpoint keeps its resume meaning.
+            await self._begin_stage("align", "alignment disabled (none)")
+            self.alignment_result = AlignmentResult(list(cues), "none")
+            self.db.replace_aligned_timeline(self.alignment_result.cues)
+            await self.emit("timeline-replaced", "subtitle timeline installed")
+            await self._write_partial(
+                self._draft_partial_path(artifact), self.alignment_result.cues
+            )
+            await self._finish_stage("align", "alignment skipped")
+            return self.alignment_result.cues
         await self._begin_stage("align", "adjusting subtitle starts against silence")
         language = self.db.get_checkpoint("detected_source_language") or normalize_source_language(
             self.settings.source_language
