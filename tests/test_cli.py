@@ -6,8 +6,11 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import yakiflow.cli as cli
 import yakiflow.tui as tui
+from conftest import make_settings
 from yakiflow.config import Settings
 from yakiflow.job import YakiFlowJob
 from yakiflow.process import ProcessResult
@@ -19,59 +22,94 @@ class TTY(io.StringIO):
         return True
 
 
-def test_alignment_cli_options_are_loaded(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_c_overrides_parse_toml_literals(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     args = cli._parser().parse_args([
         "run",
         "input.mp4",
-        "--alignment-backend",
-        "whisperx",
-        "--alignment-device",
-        "cpu",
-        "--alignment-model",
-        "custom/model",
+        "-c", "transcription.backend=elevenlabs",
+        "-c", "elevenlabs.diarize=false",
+        "-c", "agent.draft.workers=7",
+        "-c", "agent.draft.extra-options=[\"--search\", \"-v\"]",
+        "-c", "target-language=zh-CN",
     ])
 
     settings = cli._settings(args)
-    assert settings.alignment_backend == "whisperx"
-    assert settings.alignment_device == "cpu"
-    assert settings.alignment_model == "custom/model"
+
+    assert settings.transcription.backend == "elevenlabs"
+    assert settings.elevenlabs.diarize is False
+    assert settings.agent.draft.workers == 7
+    assert settings.agent.draft.extra_options == ("--search", "-v")
+    assert settings.target_language == "zh-CN"
 
 
-def test_auto_open_video_cli_option_is_loaded(
+def test_c_override_values_fall_back_to_strings(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    args = cli._parser().parse_args([
+        "run", "input.mp4",
+        # An unquoted string is not a TOML literal but is obviously a string.
+        "-c", "review.open-command=editor {file}",
+    ])
+    settings = cli._settings(args)
+    assert settings.review.open_command == "editor {file}"
+
+
+def test_unknown_c_override_is_reported_as_command_line(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     args = cli._parser().parse_args([
-        "run",
-        "input.mp4",
-        "--auto-open-video",
+        "run", "input.mp4", "-c", "transcriptoin.backend=elevenlabs",
     ])
-
-    settings = cli._settings(args)
-
-    assert settings.auto_open_video is True
+    with pytest.raises(ValueError, match=r"command line \(-c\)"):
+        cli._settings(args)
 
 
-def test_both_review_display_mode_cli_option_is_loaded(
+def test_malformed_c_override_is_rejected() -> None:
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        cli.parse_config_items(["transcription.backend"])
+
+
+def test_dedicated_flags_outrank_c_overrides_and_profiles(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'target-language = "fr"\n'
+        '[profiles.stream]\nstream.enabled = true\ntarget-language = "ja"\n'
+    )
     args = cli._parser().parse_args([
-        "run",
-        "input.mp4",
-        "--review-display-mode",
-        "both",
-        "--review-open-command",
-        "editor {srt}",
+        "run", "input.mp4",
+        "--config-file", str(config),
+        "--profile", "stream",
+        "-c", "target-language=ko",
+        "-t", "zh-CN",
+        "--no-stream",
     ])
 
     settings = cli._settings(args)
 
-    assert settings.review_display_mode == "both"
-    assert settings.review_open_command == "editor {srt}"
+    assert settings.target_language == "zh-CN"
+    assert settings.stream.enabled is False
+
+
+def test_missing_config_file_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    args = cli._parser().parse_args([
+        "run", "input.mp4", "--config-file", str(tmp_path / "absent.toml"),
+    ])
+    with pytest.raises(ValueError, match="configuration file does not exist"):
+        cli._settings(args)
+
+
+def test_transcription_backend_flag(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    args = cli._parser().parse_args([
+        "run", "input.mp4", "--transcription-backend", "whisper-server",
+    ])
+    settings = cli._settings(args)
+    assert settings.transcription.backend == "whisper-server"
 
 
 def test_context_file_cli_option_is_repeatable(
@@ -99,7 +137,7 @@ def test_context_file_cli_option_is_repeatable(
 def test_profile_option_is_available_on_config_loading_commands(monkeypatch) -> None:
     selected: list[str | None] = []
 
-    def fake_load_settings(_values, **kwargs):
+    def fake_load_settings(_values=None, **kwargs):
         selected.append(kwargs.get("profile"))
         return Settings()
 
@@ -115,6 +153,51 @@ def test_profile_option_is_available_on_config_loading_commands(monkeypatch) -> 
     assert selected == ["stream", "stream", "stream"]
 
 
+class FakeKeyring:
+    class errors:
+        class PasswordDeleteError(Exception):
+            pass
+
+    def __init__(self) -> None:
+        self.stored: dict[tuple[str, str], str] = {}
+
+    def set_password(self, service: str, entry: str, value: str) -> None:
+        self.stored[(service, entry)] = value
+
+    def delete_password(self, service: str, entry: str) -> None:
+        if (service, entry) not in self.stored:
+            raise self.errors.PasswordDeleteError()
+        del self.stored[(service, entry)]
+
+
+def test_secret_set_and_unset_use_the_keyring(monkeypatch, capsys) -> None:
+    fake = FakeKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", fake)
+    monkeypatch.setitem(sys.modules, "keyring.errors", fake.errors)
+    monkeypatch.setattr(cli, "_read_secret", lambda prompt: "sk-secret")
+
+    assert cli.main(["secret", "set", "elevenlabs"]) == 0
+    assert fake.stored == {("yakiflow", "elevenlabs"): "sk-secret"}
+
+    assert cli.main(["secret", "unset", "elevenlabs"]) == 0
+    assert fake.stored == {}
+
+    # Unsetting an absent key reports rather than fails.
+    assert cli.main(["secret", "unset", "elevenlabs"]) == 0
+    capsys.readouterr()
+
+
+def test_secret_set_rejects_empty_key(monkeypatch, capsys) -> None:
+    fake = FakeKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", fake)
+    monkeypatch.setitem(sys.modules, "keyring.errors", fake.errors)
+    monkeypatch.setattr(cli, "_read_secret", lambda prompt: "")
+
+    assert cli.main(["secret", "set", "elevenlabs"]) == 2
+    assert fake.stored == {}
+    assert "no API key" in capsys.readouterr().err
+
+
 def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> None:
     work_dir = tmp_path / "preserved job"
 
@@ -122,11 +205,11 @@ def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> No
         def __init__(self, *, is_finished: bool = False) -> None:
             self.work_dir = work_dir
             self.is_finished = is_finished
-            self.settings = Settings(
+            self.settings = make_settings(
                 source_language="en",
                 target_language="zh",
-                translation_backend="codex",
-            )
+                agent={"backend": "codex"},
+            ).resolved()
 
     monkeypatch.setattr(
         cli.YakiFlowJob,
@@ -204,12 +287,12 @@ def test_memory_conflict_agent_retries_when_destination_changes_again(
     runner = ConflictRunner()
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="en",
             target_language="zh-CN",
-            translation_backend="codex",
-            memory=destination,
-            work_dir=work_dir,
+            agent={"backend": "codex"},
+            memory=str(destination),
+            work_dir=str(work_dir),
         ),
         runner=runner,
         backend=UnusedBackend(),

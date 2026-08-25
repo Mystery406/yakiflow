@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import yakiflow.transcription as transcription_module
+from conftest import make_settings
 from yakiflow.config import Settings
 from yakiflow.database import JobDatabase
 from yakiflow.models import Cue
@@ -103,7 +104,7 @@ def test_interrupted_run_keeps_the_whole_vad_timeline(tmp_path: Path) -> None:
     audio = tmp_path / "reference.wav"
     audio.write_bytes(b"RIFF-fake")
     db = JobDatabase(tmp_path / "job.sqlite3")
-    settings = Settings(vad_model=tmp_path / "vad.bin")
+    settings = make_settings(whisper={"vad_model": tmp_path / "vad.bin"})
     transcriber = WhisperCliTranscriber(
         settings, tmp_path, db, runner=BurstThenInterruptRunner()
     )
@@ -148,7 +149,9 @@ def test_stream_auto_language_is_sent_on_every_chunk(tmp_path: Path, monkeypatch
     audio = tmp_path / "chunk.wav"
     audio.write_bytes(b"RIFF-fake")
     db = JobDatabase(tmp_path / "job.sqlite3")
-    server = WhisperServerTranscriber(Settings(source_language="auto"), tmp_path, db)
+    server = WhisperServerTranscriber(
+        make_settings(source_language="auto"), tmp_path, db
+    )
 
     server._post_audio(audio)
     server._post_audio(audio)

@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yakiflow.doctor as doctor_module
-from yakiflow.config import Settings
+from conftest import make_settings
 from yakiflow.doctor import run_doctor
 
 
@@ -34,12 +34,11 @@ def test_doctor_checks_whisperx_package_and_explicit_cuda(
     )
 
     checks = run_doctor(
-        Settings(
-            whisper_model=model,
-            translation_backend="codex",
-            alignment_backend="whisperx",
-            alignment_device="cuda",
-        )
+        make_settings(
+            whisper={"model": model},
+            agent={"backend": "codex"},
+            alignment={"backend": "whisperx", "device": "cuda"},
+        ).resolved()
     )
     mapped = {check.name: check for check in checks}
 
@@ -53,7 +52,9 @@ def test_doctor_does_not_require_whisperx_for_default_vad(
 ) -> None:
     model = _stub_dependencies(tmp_path, monkeypatch)
 
-    checks = run_doctor(Settings(whisper_model=model, translation_backend="codex"))
+    checks = run_doctor(
+        make_settings(whisper={"model": model}, agent={"backend": "codex"}).resolved()
+    )
 
     assert all(not check.name.startswith("WhisperX") for check in checks)
 
@@ -70,11 +71,11 @@ def test_doctor_names_both_whisperx_install_variants(
     )
 
     checks = run_doctor(
-        Settings(
-            whisper_model=model,
-            translation_backend="codex",
-            alignment_backend="whisperx",
-        )
+        make_settings(
+            whisper={"model": model},
+            agent={"backend": "codex"},
+            alignment={"backend": "whisperx"},
+        ).resolved()
     )
     whisperx = next(check for check in checks if check.name == "WhisperX")
 
@@ -89,12 +90,11 @@ def test_doctor_checks_both_review_display_dependencies(
     model = _stub_dependencies(tmp_path, monkeypatch)
 
     checks = run_doctor(
-        Settings(
-            whisper_model=model,
-            translation_backend="codex",
-            review_display_mode="both",
-            review_open_command="editor {srt}",
-        )
+        make_settings(
+            whisper={"model": model},
+            agent={"backend": "codex"},
+            review={"display_mode": "both", "open_command": "editor {srt}"},
+        ).resolved()
     )
     mapped = {check.name: check for check in checks}
 

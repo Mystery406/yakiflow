@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
 
 from platformdirs import user_cache_path, user_config_path
 
@@ -12,104 +13,283 @@ from .media_player import DEFAULT_VIDEO_OPEN_COMMAND
 
 DEFAULT_MODEL_NAME = "ggml-large-v3-turbo-q5_0.bin"
 
+# Stamped into every work directory's stored configuration. A work directory
+# whose stamp differs was created by an incompatible yakiflow and must be
+# finished by the version that created it.
+SETTINGS_SCHEMA_VERSION = 2
+
+TRANSCRIPTION_BACKENDS = (
+    "whisper-cli",
+    "whisper-server",
+    "elevenlabs",
+    "elevenlabs-stream",
+)
+EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
+
+# The three spellings of the single "where does the ElevenLabs key come from"
+# slot. A configuration layer that sets any one of them replaces the whole
+# slot, exactly as it would replace a single-valued setting.
+_API_KEY_SLOT = ("api_key", "api_key_file", "api_key_command")
+
 
 def default_model_path() -> Path:
     return user_cache_path("yakiflow") / "models" / DEFAULT_MODEL_NAME
+
+
+def _path(default: Path | None = None) -> Any:
+    return field(default=default, metadata={"kind": "path"})
+
+
+def _paths() -> Any:
+    return field(default=(), metadata={"kind": "paths"})
+
+
+def _argv(default: tuple[str, ...] | None = ()) -> Any:
+    return field(default=default, metadata={"kind": "argv"})
+
+
+def _grp(cls: type) -> Any:
+    # ``from __future__ import annotations`` leaves ``f.type`` a string, so the
+    # group class itself travels in the field metadata.
+    return field(default_factory=cls, metadata={"group": cls})
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionSettings:
+    backend: str = "whisper-cli"
+
+
+@dataclass(frozen=True, slots=True)
+class WhisperSettings:
+    model: Path | None = _path()
+    vad: bool = True
+    vad_model: Path | None = _path()
+    cli: str = "whisper-cli"
+    server: str = "whisper-server"
+    server_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ElevenLabsSettings:
+    api_key: str | None = None
+    api_key_file: Path | None = _path()
+    api_key_command: str | None = None
+    model: str = "scribe_v2"
+    realtime_model: str = "scribe_v2_realtime"
+    diarize: bool = True
+    num_speakers: int | None = None
+    # Set by ``load_settings`` when the command line won the API-key slot, so
+    # key resolution can rank that ahead of the environment variable. Internal:
+    # a configuration file cannot set it, but a stored job round-trips it.
+    api_key_from_cli: bool = field(default=False, metadata={"internal": True})
+
+
+@dataclass(frozen=True, slots=True)
+class AlignmentSettings:
+    # ``None`` resolves per transcription backend: word-level ElevenLabs
+    # backends default to ``none``, Whisper backends to ``vad``.
+    backend: str | None = None
+    device: str = "auto"
+    model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamSettings:
+    enabled: bool = False
+    chunk_seconds: int = 15
+    context_seconds: int = 5
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleSettings:
+    max_cue_seconds: float = 8.0
+    max_cue_chars: int = 84
+
+
+@dataclass(frozen=True, slots=True)
+class DraftAgentSettings:
+    # The shared keys default to "unset" so the [agent] table can fill them.
+    backend: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    extra_options: tuple[str, ...] | None = _argv(None)
+    # Everything below only means something for batch drafting, so writing it
+    # into [agent] or [agent.final] is an unknown-key error by construction.
+    workers: int = 4
+    batch_size: int = 20
+    preceding_context: int = 10
+    following_context: int = 5
+    word_batch_size: int = 400
+    word_following_context: int = 40
+    timeout_seconds: float = 600
+    max_attempts: int = 3
+    retry_delay_seconds: float = 1
+
+
+@dataclass(frozen=True, slots=True)
+class FinalAgentSettings:
+    backend: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    extra_options: tuple[str, ...] | None = _argv(None)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentSettings:
+    backend: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    extra_options: tuple[str, ...] | None = _argv(None)
+    draft: DraftAgentSettings = _grp(DraftAgentSettings)
+    final: FinalAgentSettings = _grp(FinalAgentSettings)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSettings:
+    display_mode: str = "split"
+    open_command: str | None = None
+    auto_open_video: bool = False
+    video_open_command: str = DEFAULT_VIDEO_OPEN_COMMAND
+
+
+@dataclass(frozen=True, slots=True)
+class CommandsSettings:
+    ffmpeg: str = "ffmpeg"
+    yt_dlp: str = "yt-dlp"
+    yt_dlp_options: tuple[str, ...] = _argv()
+
+
+_STAGE_MODEL_DEFAULTS = {
+    "draft": {"codex": "gpt-5.6-terra", "claude": "sonnet"},
+    "final": {"codex": "gpt-5.6-sol", "claude": "opus"},
+}
+_STAGE_EFFORT_DEFAULTS = {"draft": "low", "final": "high"}
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
     source_language: str | None = None
     target_language: str | None = None
-    whisper_model: Path | None = None
-    vad: bool = True
-    vad_model: Path | None = None
-    alignment_backend: str = "vad"
-    alignment_device: str = "auto"
-    alignment_model: str | None = None
-    translation_backend: str | None = None
-    stream: bool = False
-    download_dir: Path | None = None
-    output_dir: Path | None = None
     output_mode: str = "bilingual"
-    memory: Path | None = None
-    context_files: tuple[Path, ...] = ()
-    work_dir: Path | None = None
+    download_dir: Path | None = _path()
+    output_dir: Path | None = _path()
+    memory: Path | None = _path()
+    context_files: tuple[Path, ...] = _paths()
+    work_dir: Path | None = _path()
     keep_workdir: bool = False
-    draft_model: str | None = None
-    draft_effort: str = "low"
-    final_model: str | None = None
-    final_effort: str = "high"
-    draft_codex_options: tuple[str, ...] = ()
-    final_codex_options: tuple[str, ...] = ()
-    draft_claude_options: tuple[str, ...] = ()
-    final_claude_options: tuple[str, ...] = ()
-    agent_workers: int = 4
-    translation_batch_size: int = 20
-    translation_context: int = 10
-    translation_following_context: int = 5
-    draft_agent_timeout_seconds: float = 600
-    agent_max_attempts: int = 3
-    agent_retry_delay_seconds: float = 1
-    review_display_mode: str = "split"
-    review_open_command: str | None = None
-    auto_open_video: bool = False
-    video_open_command: str = DEFAULT_VIDEO_OPEN_COMMAND
-    stream_chunk_seconds: int = 15
-    stream_context_seconds: int = 5
-    whisper_cli: str = "whisper-cli"
-    whisper_server: str = "whisper-server"
-    ffmpeg: str = "ffmpeg"
-    yt_dlp: str = "yt-dlp"
-    yt_dlp_options: tuple[str, ...] = ()
+    transcription: TranscriptionSettings = _grp(TranscriptionSettings)
+    whisper: WhisperSettings = _grp(WhisperSettings)
+    elevenlabs: ElevenLabsSettings = _grp(ElevenLabsSettings)
+    alignment: AlignmentSettings = _grp(AlignmentSettings)
+    stream: StreamSettings = _grp(StreamSettings)
+    subtitles: SubtitleSettings = _grp(SubtitleSettings)
+    agent: AgentSettings = _grp(AgentSettings)
+    review: ReviewSettings = _grp(ReviewSettings)
+    commands: CommandsSettings = _grp(CommandsSettings)
 
     def resolved(self) -> Settings:
+        """Fill derived defaults; safe to apply to already-resolved settings."""
+
         def absolute(path: Path | None) -> Path | None:
             return path.expanduser().resolve() if path is not None else None
 
-        memory = absolute(self.memory or user_config_path("yakiflow") / "memory.md")
-        model = absolute(self.whisper_model or default_model_path())
-        draft = self.draft_model
-        final = self.final_model
-        if self.translation_backend == "codex":
-            draft = draft or "gpt-5.6-terra"
-            final = final or "gpt-5.6-sol"
-        elif self.translation_backend == "claude":
-            draft = draft or "sonnet"
-            final = final or "opus"
+        whisper = replace(
+            self.whisper,
+            model=absolute(self.whisper.model or default_model_path()),
+            vad_model=absolute(self.whisper.vad_model) if self.whisper.vad else None,
+        )
+        elevenlabs = replace(
+            self.elevenlabs,
+            api_key_file=absolute(self.elevenlabs.api_key_file),
+        )
+        alignment = replace(
+            self.alignment,
+            backend=self.alignment.backend
+            or (
+                "none"
+                if self.transcription.backend.startswith("elevenlabs")
+                else "vad"
+            ),
+        )
+        agent = replace(
+            self.agent,
+            draft=self._resolved_stage(self.agent.draft, "draft"),
+            final=self._resolved_stage(self.agent.final, "final"),
+        )
         return replace(
             self,
-            memory=memory,
-            whisper_model=model,
-            vad_model=absolute(self.vad_model) if self.vad else None,
+            memory=absolute(self.memory or user_config_path("yakiflow") / "memory.md"),
             download_dir=absolute(self.download_dir),
             output_dir=absolute(self.output_dir),
             context_files=tuple(
                 path.expanduser().resolve() for path in self.context_files
             ),
             work_dir=absolute(self.work_dir),
-            draft_model=draft,
-            final_model=final,
+            whisper=whisper,
+            elevenlabs=elevenlabs,
+            alignment=alignment,
+            agent=agent,
+        )
+
+    def _resolved_stage(
+        self, stage: DraftAgentSettings | FinalAgentSettings, name: str
+    ) -> DraftAgentSettings | FinalAgentSettings:
+        """Resolve one stage: stage value, then [agent] shared, then default."""
+        backend = stage.backend or self.agent.backend
+        model = stage.model or self.agent.model
+        if model is None and backend is not None:
+            model = _STAGE_MODEL_DEFAULTS[name].get(backend)
+        effort = stage.effort or self.agent.effort or _STAGE_EFFORT_DEFAULTS[name]
+        extra_options = stage.extra_options
+        if extra_options is None:
+            extra_options = self.agent.extra_options
+        if extra_options is None:
+            extra_options = ()
+        return replace(
+            stage,
+            backend=backend,
+            model=model,
+            effort=effort,
+            extra_options=extra_options,
         )
 
 
-PATH_FIELDS = {
-    "whisper_model",
-    "vad_model",
-    "download_dir",
-    "output_dir",
-    "memory",
-    "work_dir",
-}
-
-PATH_SEQUENCE_FIELDS = {"context_files"}
-
-ARG_TOKEN_FIELDS = {
-    "draft_codex_options",
-    "final_codex_options",
-    "draft_claude_options",
-    "final_claude_options",
-    "yt_dlp_options",
+# Old flat settings and where each one moved. Only consulted to make the
+# unknown-key error explain the regrouped schema instead of looking like a typo.
+_RELOCATED = {
+    "whisper_model": "whisper.model",
+    "vad": "whisper.vad",
+    "vad_model": "whisper.vad-model",
+    "whisper_cli": "whisper.cli",
+    "whisper_server": "whisper.server",
+    "alignment_backend": "alignment.backend",
+    "alignment_device": "alignment.device",
+    "alignment_model": "alignment.model",
+    "translation_backend": "agent.backend",
+    "draft_model": "agent.draft.model",
+    "draft_effort": "agent.draft.effort",
+    "final_model": "agent.final.model",
+    "final_effort": "agent.final.effort",
+    "draft_codex_options": "agent.draft.extra-options",
+    "final_codex_options": "agent.final.extra-options",
+    "draft_claude_options": "agent.draft.extra-options",
+    "final_claude_options": "agent.final.extra-options",
+    "agent_workers": "agent.draft.workers",
+    "translation_batch_size": "agent.draft.batch-size",
+    "translation_context": "agent.draft.preceding-context",
+    "translation_following_context": "agent.draft.following-context",
+    "draft_agent_timeout_seconds": "agent.draft.timeout-seconds",
+    "agent_max_attempts": "agent.draft.max-attempts",
+    "agent_retry_delay_seconds": "agent.draft.retry-delay-seconds",
+    "review_display_mode": "review.display-mode",
+    "review_open_command": "review.open-command",
+    "auto_open_video": "review.auto-open-video",
+    "video_open_command": "review.video-open-command",
+    "stream_chunk_seconds": "stream.chunk-seconds",
+    "stream_context_seconds": "stream.context-seconds",
+    "ffmpeg": "commands.ffmpeg",
+    "yt_dlp": "commands.yt-dlp",
+    "yt_dlp_options": "commands.yt-dlp-options",
 }
 
 
@@ -120,11 +300,6 @@ def _read_toml(
         return {}, {}
     with path.open("rb") as fh:
         data = tomllib.load(fh)
-    if "yakiflow" in data:
-        raise ValueError(
-            f"legacy [yakiflow] configuration is not supported in {path}; "
-            "move its settings to the TOML document root"
-        )
     raw_profiles = data.pop("profiles", {})
     if not isinstance(raw_profiles, dict):
         raise ValueError(f"profiles must be a table in {path}")
@@ -132,13 +307,10 @@ def _read_toml(
     for name, values in raw_profiles.items():
         if not isinstance(values, dict):
             raise ValueError(f"profile {name!r} must be a table in {path}")
-        for key, value in values.items():
-            normalized = key.replace("-", "_")
-            if isinstance(value, dict):
-                raise ValueError(
-                    f"profile {name!r} cannot contain nested table {key!r} in {path}"
-                )
-            if normalized in {"profile", "profiles", "inherit", "inherits", "extends"}:
+        for key in values:
+            if key.replace("-", "_") in {
+                "profile", "profiles", "inherit", "inherits", "extends",
+            }:
                 raise ValueError(
                     f"profile {name!r} cannot inherit from another profile in {path}"
                 )
@@ -147,43 +319,126 @@ def _read_toml(
 
 
 def _clean(
-    values: Mapping[str, Any], *, source: str | None = None
+    values: Mapping[str, Any],
+    *,
+    source: str | None = None,
+    cls: type = Settings,
+    prefix: str = "",
 ) -> dict[str, Any]:
-    """Normalize one settings mapping.
+    """Normalize one settings mapping into a nested dict of leaf values.
 
-    ``source`` names a configuration file. Naming one makes unknown keys an
+    ``source`` names a configuration layer. Naming one makes unknown keys an
     error, so a misspelled setting is reported instead of silently leaving the
-    default in place; mappings rebuilt from a saved job stay permissive so an
-    older work directory can still be resumed.
+    default in place; mappings rebuilt from a saved job stay permissive so a
+    same-schema work directory with fewer fields can still be resumed.
     """
-    valid = {f.name for f in fields(Settings)}
+    specs = {f.name: f for f in fields(cls)}
     result: dict[str, Any] = {}
-    for key, value in values.items():
-        key = key.replace("-", "_")
-        if key not in valid:
-            if source is not None:
-                raise ValueError(f"unknown setting {key!r} in {source}")
-            continue
+    for raw_key, value in values.items():
+        key = str(raw_key).replace("-", "_")
+        dotted = f"{prefix}{key.replace('_', '-')}"
+        spec = specs.get(key)
+        if spec is None or (spec.metadata.get("internal") and source is not None):
+            if source is None:
+                continue
+            relocated = _RELOCATED.get(key) if not prefix else None
+            if relocated is not None:
+                raise ValueError(
+                    f"setting {dotted!r} in {source} moved to {relocated!r}: "
+                    "the configuration schema is grouped now; see the README"
+                )
+            raise ValueError(f"unknown setting {dotted!r} in {source}")
         if value is None:
             continue
-        if key in PATH_FIELDS:
+        group = spec.metadata.get("group")
+        if group is not None:
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    f"{dotted!r} is a table of settings, not a single value"
+                    + (f" in {source}" if source else "")
+                )
+            result[key] = _clean(
+                value, source=source, cls=group, prefix=f"{dotted}."
+            )
+            continue
+        if isinstance(value, Mapping):
+            raise ValueError(
+                f"{dotted!r} is a single setting, not a table"
+                + (f" in {source}" if source else "")
+            )
+        kind = spec.metadata.get("kind")
+        if kind == "path":
             result[key] = Path(value).expanduser()
-        elif key in PATH_SEQUENCE_FIELDS:
+        elif kind == "paths":
             items = (
                 value
                 if isinstance(value, Sequence) and not isinstance(value, str)
                 else (value,)
             )
             result[key] = tuple(Path(item).expanduser() for item in items)
-        elif key in ARG_TOKEN_FIELDS:
+        elif kind == "argv":
             if not isinstance(value, (list, tuple)) or not all(
                 isinstance(item, str) for item in value
             ):
-                raise ValueError(f"{key} must be an array of strings")
+                raise ValueError(f"{dotted} must be an array of strings")
             result[key] = tuple(value)
         else:
             result[key] = value
+    if cls is ElevenLabsSettings and source is not None:
+        slots = [name for name in _API_KEY_SLOT if name in result]
+        if len(slots) > 1:
+            listed = ", ".join(name.replace("_", "-") for name in slots)
+            raise ValueError(
+                f"elevenlabs.{listed.replace(', ', ' and elevenlabs.')} are "
+                f"mutually exclusive in {source}: they are three spellings of "
+                "the same API-key setting"
+            )
     return result
+
+
+def _merge_layer(base: dict[str, Any], overlay: Mapping[str, Any]) -> None:
+    """Deep-merge one cleaned configuration layer into ``base``, leaf by leaf.
+
+    The ElevenLabs API-key slot merges as a unit: a layer that sets any of its
+    three spellings replaces whichever spelling a lower layer had chosen.
+    """
+    incoming = overlay.get("elevenlabs")
+    if isinstance(incoming, Mapping) and any(
+        name in incoming for name in _API_KEY_SLOT
+    ):
+        existing = base.get("elevenlabs")
+        if isinstance(existing, dict):
+            for name in _API_KEY_SLOT:
+                existing.pop(name, None)
+    _deep_merge(base, overlay)
+
+
+def _deep_merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> None:
+    for key, value in overlay.items():
+        if isinstance(value, Mapping):
+            node = base.setdefault(key, {})
+            if isinstance(node, dict):
+                _deep_merge(node, value)
+            else:
+                base[key] = dict(value)
+        else:
+            base[key] = value
+
+
+def _build(mapping: Mapping[str, Any], cls: type = Settings) -> Any:
+    kwargs: dict[str, Any] = {}
+    for spec in fields(cls):
+        if spec.name not in mapping:
+            continue
+        group = spec.metadata.get("group")
+        value = mapping[spec.name]
+        kwargs[spec.name] = _build(value, group) if group is not None else value
+    return cls(**kwargs)
+
+
+def build_settings(values: Mapping[str, Any]) -> Settings:
+    """Build unresolved ``Settings`` from one nested, permissive mapping."""
+    return _build(_clean(values, source=None))
 
 
 def load_settings(
@@ -192,8 +447,16 @@ def load_settings(
     project_file: Path | None = None,
     user_file: Path | None = None,
     profile: str | None = None,
+    cli_config: Mapping[str, Any] | None = None,
+    stored: Mapping[str, Any] | None = None,
 ) -> Settings:
-    """Load base/profile settings and overlay explicit CLI values."""
+    """Load base/profile settings and overlay the command line.
+
+    ``cli_config`` carries the nested ``-c key=value`` overrides and is checked
+    as strictly as a configuration file; ``cli`` carries the values of the
+    dedicated flags, which argparse already validated. ``stored`` is a saved
+    job's configuration and forms the lowest layer when resuming.
+    """
     user_file = user_file or user_config_path("yakiflow") / "config.toml"
     if project_file is None:
         candidate = Path.cwd() / "yakiflow.toml"
@@ -206,61 +469,143 @@ def load_settings(
         and profile not in project_profiles
     ):
         raise ValueError(f"unknown profile {profile!r}")
-    # Precedence, lowest first: user base, project base, user profile, project
-    # profile, explicit CLI values.
-    merged = asdict(Settings())
-    merged.update(_clean(user_base, source=str(user_file)))
-    merged.update(_clean(project_base, source=str(project_file)))
+    # Precedence, lowest first: stored job settings, user base, project base,
+    # user profile, project profile, -c overrides, dedicated flags.
+    merged: dict[str, Any] = {}
+    if stored is not None:
+        _merge_layer(merged, _clean(stored, source=None))
+    _merge_layer(merged, _clean(user_base, source=str(user_file)))
+    _merge_layer(merged, _clean(project_base, source=str(project_file)))
     if profile is not None:
-        merged.update(
+        _merge_layer(
+            merged,
             _clean(
                 user_profiles.get(profile, {}),
                 source=f"profile {profile!r} in {user_file}",
-            )
+            ),
         )
-        merged.update(
+        _merge_layer(
+            merged,
             _clean(
                 project_profiles.get(profile, {}),
                 source=f"profile {profile!r} in {project_file}",
-            )
+            ),
         )
-    merged.update(_clean(cli or {}))
-    return Settings(**merged).resolved()
+    config_layer = _clean(cli_config or {}, source="command line (-c)")
+    _merge_layer(merged, config_layer)
+    flag_layer = _clean(cli or {}, source=None)
+    _merge_layer(merged, flag_layer)
+    for layer in (config_layer, flag_layer):
+        elevenlabs = layer.get("elevenlabs", {})
+        if any(name in elevenlabs for name in _API_KEY_SLOT):
+            merged.setdefault("elevenlabs", {})["api_key_from_cli"] = True
+    return _build(merged).resolved()
+
+
+def _require_positive(value: float, name: str) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _require_non_negative(value: float, name: str) -> None:
+    if value < 0:
+        raise ValueError(f"{name} cannot be negative")
 
 
 def validate_run_settings(settings: Settings) -> None:
     if not settings.target_language:
-        raise ValueError("--target-language is required")
+        raise ValueError("target-language is required (-t/--target-language)")
     if not settings.source_language:
-        raise ValueError("--source-language is required (use 'auto' for automatic detection)")
-    if settings.translation_backend not in {"codex", "claude"}:
-        raise ValueError("--translation-backend must be codex or claude")
+        raise ValueError(
+            "source-language is required (-s/--source-language; "
+            "use 'auto' for automatic detection)"
+        )
+    if settings.transcription.backend not in TRANSCRIPTION_BACKENDS:
+        raise ValueError(
+            "transcription.backend must be one of "
+            + ", ".join(TRANSCRIPTION_BACKENDS)
+            + " (--transcription-backend)"
+        )
     if settings.output_mode not in {"source", "translated", "bilingual", "all"}:
-        raise ValueError("invalid --output-mode")
-    if settings.alignment_backend not in {"vad", "whisperx"}:
-        raise ValueError("--alignment-backend must be vad or whisperx")
-    if settings.alignment_device not in {"auto", "cpu", "cuda"}:
-        raise ValueError("--alignment-device must be auto, cpu, or cuda")
-    if settings.review_display_mode not in {"split", "open", "both"}:
-        raise ValueError("invalid --review-display-mode")
+        raise ValueError(
+            "output-mode must be source, translated, bilingual, or all "
+            "(--output-mode)"
+        )
+    word_level = settings.transcription.backend.startswith("elevenlabs")
+    if settings.whisper.server_url is not None:
+        parsed = urlparse(settings.whisper.server_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "whisper.server-url must be an http(s) URL, got "
+                f"{settings.whisper.server_url!r}"
+            )
+    if settings.alignment.backend not in {"vad", "whisperx", "none"}:
+        raise ValueError("alignment.backend must be vad, whisperx, or none")
+    if word_level and settings.alignment.backend == "vad":
+        raise ValueError(
+            "alignment.backend 'vad' needs Whisper's VAD intervals; use "
+            "'none' (or 'whisperx') with an ElevenLabs transcription backend"
+        )
     if (
-        settings.review_display_mode in {"open", "both"}
-        and not settings.review_open_command
+        settings.transcription.backend == "elevenlabs"
+        and settings.elevenlabs.diarize
+        and settings.alignment.backend != "none"
     ):
         raise ValueError(
-            "--review-open-command is required when review display mode is open or both"
+            "alignment.backend must be 'none' when elevenlabs.diarize is "
+            "enabled: forced alignment assumes one non-overlapping timeline "
+            "and would destroy overlapping cues from different speakers"
         )
-    if settings.agent_workers < 1 or settings.translation_batch_size < 1:
-        raise ValueError("agent worker and batch counts must be positive")
-    if settings.translation_context < 0 or settings.translation_following_context < 0:
-        raise ValueError("translation context cannot be negative")
-    if settings.draft_agent_timeout_seconds <= 0:
-        raise ValueError("agent timeouts must be positive")
-    if settings.agent_max_attempts < 1:
-        raise ValueError("agent attempt count must be positive")
-    if settings.agent_retry_delay_seconds < 0:
-        raise ValueError("agent retry delay cannot be negative")
-    if settings.stream_chunk_seconds <= 0:
-        raise ValueError("stream chunk duration must be positive")
-    if settings.stream_context_seconds < 0:
-        raise ValueError("stream context duration cannot be negative")
+    if settings.alignment.device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("alignment.device must be auto, cpu, or cuda")
+    if word_level:
+        from .elevenlabs import elevenlabs_api_key
+
+        elevenlabs_api_key(settings)
+    num_speakers = settings.elevenlabs.num_speakers
+    if num_speakers is not None and num_speakers < 1:
+        raise ValueError("elevenlabs.num-speakers must be at least 1")
+    for stage_name in ("draft", "final"):
+        stage = getattr(settings.agent, stage_name)
+        if stage.backend is None:
+            raise ValueError("agent.backend is required (codex or claude)")
+        if stage.backend not in {"codex", "claude"}:
+            raise ValueError(
+                f"agent.{stage_name}.backend must be codex or claude, got "
+                f"{stage.backend!r}"
+            )
+        if stage.effort not in EFFORT_LEVELS:
+            raise ValueError(
+                f"agent.{stage_name}.effort must be one of "
+                + ", ".join(EFFORT_LEVELS)
+            )
+    draft = settings.agent.draft
+    _require_positive(draft.workers, "agent.draft.workers")
+    _require_positive(draft.batch_size, "agent.draft.batch-size")
+    _require_non_negative(draft.preceding_context, "agent.draft.preceding-context")
+    _require_non_negative(draft.following_context, "agent.draft.following-context")
+    if draft.word_batch_size < 50:
+        raise ValueError("agent.draft.word-batch-size must be at least 50")
+    _require_non_negative(
+        draft.word_following_context, "agent.draft.word-following-context"
+    )
+    _require_positive(draft.timeout_seconds, "agent.draft.timeout-seconds")
+    _require_positive(draft.max_attempts, "agent.draft.max-attempts")
+    _require_non_negative(
+        draft.retry_delay_seconds, "agent.draft.retry-delay-seconds"
+    )
+    _require_positive(settings.subtitles.max_cue_seconds, "subtitles.max-cue-seconds")
+    if settings.subtitles.max_cue_chars < 8:
+        raise ValueError("subtitles.max-cue-chars must be at least 8")
+    if settings.review.display_mode not in {"split", "open", "both"}:
+        raise ValueError("review.display-mode must be split, open, or both")
+    if (
+        settings.review.display_mode in {"open", "both"}
+        and not settings.review.open_command
+    ):
+        raise ValueError(
+            "review.open-command is required when review.display-mode is "
+            "open or both"
+        )
+    _require_positive(settings.stream.chunk_seconds, "stream.chunk-seconds")
+    _require_non_negative(settings.stream.context_seconds, "stream.context-seconds")

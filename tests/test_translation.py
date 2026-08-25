@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from yakiflow.config import Settings
+from conftest import make_settings
 from yakiflow.database import JobDatabase
 from yakiflow.models import AgentTraceEvent, Cue
 from yakiflow.process import ProcessResult
@@ -282,7 +282,9 @@ def test_draft_backend_commands_append_only_matching_options(tmp_path: Path) -> 
 
 
 def test_pipeline_emits_agent_lifecycle_and_readable_result(tmp_path: Path) -> None:
-    settings = Settings(target_language="zh-CN", draft_model="draft")
+    settings = make_settings(
+        target_language="zh-CN", agent={"draft": {"model": "draft"}}
+    )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "user source")])
     events: list[AgentTraceEvent] = []
@@ -313,9 +315,15 @@ def test_pipeline_emits_agent_lifecycle_and_readable_result(tmp_path: Path) -> N
 
 
 def test_translation_uses_draft_contract(tmp_path: Path) -> None:
-    settings = Settings(
-        target_language="zh-CN", translation_backend="codex", whisper_model=tmp_path / "m",
-        memory=tmp_path / "memory.md", draft_model="draft", final_model="final",
+    settings = make_settings(
+        target_language="zh-CN",
+        memory=tmp_path / "memory.md",
+        whisper={"model": tmp_path / "m"},
+        agent={
+            "backend": "codex",
+            "draft": {"model": "draft"},
+            "final": {"model": "final"},
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "user source")])
@@ -357,13 +365,17 @@ def test_translation_uses_draft_contract(tmp_path: Path) -> None:
 
 
 def test_draft_batches_see_the_cues_on_both_sides(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = make_settings(
         target_language="zh-CN",
-        translation_backend="codex",
-        draft_model="draft",
-        translation_batch_size=1,
-        translation_context=1,
-        translation_following_context=2,
+        agent={
+            "backend": "codex",
+            "draft": {
+                "model": "draft",
+                "batch_size": 1,
+                "preceding_context": 1,
+                "following_context": 2,
+            },
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     cues = [Cue(str(index), index, index + 1, f"s{index}") for index in range(1, 5)]
@@ -393,12 +405,12 @@ def test_draft_batches_see_the_cues_on_both_sides(tmp_path: Path) -> None:
 
 def test_streaming_batches_have_no_following_context(tmp_path: Path) -> None:
     # Nothing after the newest cue has been transcribed yet.
-    settings = Settings(
+    settings = make_settings(
         target_language="zh-CN",
-        translation_backend="codex",
-        draft_model="draft",
-        translation_batch_size=2,
-        translation_following_context=5,
+        agent={
+            "backend": "codex",
+            "draft": {"model": "draft", "batch_size": 2, "following_context": 5},
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     batch = [Cue("3", 2, 3, "s3"), Cue("4", 3, 4, "s4")]
@@ -419,10 +431,9 @@ def test_streaming_batches_have_no_following_context(tmp_path: Path) -> None:
 
 
 def test_post_alignment_translation_ignores_agent_source_edits(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = make_settings(
         target_language="zh-CN",
-        translation_backend="codex",
-        draft_model="draft",
+        agent={"backend": "codex", "draft": {"model": "draft"}},
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "forced-aligned sentence")])
@@ -440,8 +451,9 @@ def test_post_alignment_translation_ignores_agent_source_edits(tmp_path: Path) -
 
 
 def test_draft_prompt_omits_memory_rules_without_memory(tmp_path: Path) -> None:
-    settings = Settings(
-        target_language="zh-CN", translation_backend="codex", draft_model="draft",
+    settings = make_settings(
+        target_language="zh-CN",
+        agent={"backend": "codex", "draft": {"model": "draft"}},
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "user source")])
@@ -458,8 +470,9 @@ def test_draft_prompt_omits_memory_rules_without_memory(tmp_path: Path) -> None:
 
 
 def test_post_alignment_memory_rule_keeps_the_source_frozen(tmp_path: Path) -> None:
-    settings = Settings(
-        target_language="zh-CN", translation_backend="codex", draft_model="draft",
+    settings = make_settings(
+        target_language="zh-CN",
+        agent={"backend": "codex", "draft": {"model": "draft"}},
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "forced-aligned sentence")])
@@ -476,11 +489,11 @@ def test_post_alignment_memory_rule_keeps_the_source_frozen(tmp_path: Path) -> N
 
 
 def test_empty_translation_is_retried_and_reported(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = make_settings(
         target_language="zh-CN",
-        draft_model="draft",
-        agent_max_attempts=3,
-        agent_retry_delay_seconds=0,
+        agent={
+            "draft": {"model": "draft", "max_attempts": 3, "retry_delay_seconds": 0},
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "hello")])
@@ -509,12 +522,16 @@ def test_empty_translation_is_retried_and_reported(tmp_path: Path) -> None:
 
 
 def test_timed_out_agent_batch_is_cancelled_and_retried(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = make_settings(
         target_language="zh-CN",
-        draft_model="draft",
-        draft_agent_timeout_seconds=0.01,
-        agent_max_attempts=2,
-        agent_retry_delay_seconds=0,
+        agent={
+            "draft": {
+                "model": "draft",
+                "timeout_seconds": 0.01,
+                "max_attempts": 2,
+                "retry_delay_seconds": 0,
+            },
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "hello")])
@@ -534,11 +551,11 @@ def test_timed_out_agent_batch_is_cancelled_and_retried(tmp_path: Path) -> None:
 
 
 def test_empty_translation_fails_after_retry_limit(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = make_settings(
         target_language="zh-CN",
-        draft_model="draft",
-        agent_max_attempts=2,
-        agent_retry_delay_seconds=0,
+        agent={
+            "draft": {"model": "draft", "max_attempts": 2, "retry_delay_seconds": 0},
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     db.upsert_cues([Cue("c1", 0, 1, "hello")])

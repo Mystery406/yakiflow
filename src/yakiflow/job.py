@@ -12,7 +12,7 @@ import tempfile
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Sequence
+from typing import Awaitable, Callable, Iterable, Mapping, Sequence
 
 from platformdirs import user_runtime_path
 
@@ -25,7 +25,7 @@ from .alignment import (
     extend_cue_ends,
     make_alignment_backend,
 )
-from .config import Settings
+from .config import SETTINGS_SCHEMA_VERSION, Settings
 from .database import JobDatabase
 from .media import (
     MediaAcquirer,
@@ -137,16 +137,11 @@ class YakiFlowJob:
         self.runner = runner or CommandRunner()
         self.db = JobDatabase(self.work_dir / "job.sqlite3")
         self.listener = listener
-        draft_options = (
-            settings.draft_codex_options
-            if settings.translation_backend == "codex"
-            else settings.draft_claude_options
-        )
         self.backend = backend or make_backend(
-            settings.translation_backend or "",
+            settings.agent.draft.backend or "",
             self.work_dir,
             self.runner,
-            options=draft_options,
+            options=settings.agent.draft.extra_options or (),
         )
         self.memory_destination = settings.memory
         self.memory_path = self.work_dir / "memory.md"
@@ -177,7 +172,11 @@ class YakiFlowJob:
                 self.memory_path.write_text(current_memory.content, encoding="utf-8")
         self.memory_store = MemoryStore(self.memory_path)
         if not existing_job:
-            self.db.create_job(uuid.uuid4().hex, input_value, asdict(settings))
+            self.db.create_job(
+                uuid.uuid4().hex,
+                input_value,
+                {"settings_schema": SETTINGS_SCHEMA_VERSION, **asdict(settings)},
+            )
             self.db.checkpoint("temporary_workdir", self.temporary_workdir)
         job_row = self.db.job()
         self._resume_status = (
@@ -261,6 +260,9 @@ class YakiFlowJob:
         listener: EventListener | None = None,
         runner: CommandRunner | None = None,
         backend: AgentBackend | None = None,
+        config_file: Path | None = None,
+        profile: str | None = None,
+        overrides: Mapping[str, object] | None = None,
     ) -> YakiFlowJob:
         db = JobDatabase(Path(work_dir) / "job.sqlite3")
         row = db.job()
@@ -268,6 +270,15 @@ class YakiFlowJob:
             db.close()
             raise ValueError(f"not a YakiFlow work directory: {work_dir}")
         values = json.loads(row["config_json"])
+        stored_schema = values.pop("settings_schema", 1)
+        if stored_schema != SETTINGS_SCHEMA_VERSION:
+            db.close()
+            raise ValueError(
+                f"work directory {work_dir} was created with settings schema "
+                f"{stored_schema}, but this yakiflow uses schema "
+                f"{SETTINGS_SCHEMA_VERSION}; finish that job with the yakiflow "
+                "version that created it"
+            )
         temporary = db.get_checkpoint("temporary_workdir")
         if temporary is None:
             # Jobs created before this status was persisted can still be
@@ -280,7 +291,13 @@ class YakiFlowJob:
             )
         db.close()
         from .config import load_settings
-        settings = load_settings(values, project_file=Path("/__yakiflow_no_project_config__"), user_file=Path("/__yakiflow_no_user_config__"))
+        settings = load_settings(
+            stored=values,
+            project_file=config_file or Path("/__yakiflow_no_project_config__"),
+            user_file=Path("/__yakiflow_no_user_config__"),
+            profile=profile,
+            cli_config=overrides,
+        )
         return cls(
             row["input"], settings, work_dir=work_dir, runner=runner,
             backend=backend, listener=listener, _resume=True,
@@ -353,7 +370,7 @@ class YakiFlowJob:
         from .config import default_model_path
 
         source = MediaSource.parse(self.input_value)
-        model = self.settings.whisper_model
+        model = self.settings.whisper.model
         needs_model = bool(
             model
             and not model.is_file()
@@ -370,7 +387,7 @@ class YakiFlowJob:
             has_missing_translation and not alignment_complete
         )
         needs_post_alignment_translation = (
-            self.settings.alignment_backend == "whisperx"
+            self.settings.alignment.backend == "whisperx"
             and (not alignment_complete or has_missing_translation)
         )
         # Draft batches run alongside Whisper and are already represented by
@@ -385,7 +402,7 @@ class YakiFlowJob:
         self._progress_plan = make_progress_plan(
             needs_model=needs_model,
             is_url=source.is_url,
-            streaming=self.settings.stream,
+            streaming=self.settings.stream.enabled,
             needs_acquire=needs_acquire,
             needs_transcription=needs_transcription,
             needs_translation=(
@@ -507,12 +524,12 @@ class YakiFlowJob:
             raise
 
     async def _ensure_model(self) -> None:
-        vad_model = self.settings.vad_model
+        vad_model = self.settings.whisper.vad_model
         if vad_model is not None and not vad_model.is_file():
             raise FileNotFoundError(
                 f"configured Whisper VAD model does not exist: {vad_model}"
             )
-        model = self.settings.whisper_model
+        model = self.settings.whisper.model
         if model is None or model.is_file():
             return
         from .config import default_model_path
@@ -587,7 +604,7 @@ class YakiFlowJob:
             on_progress=media_progress,
             on_warning=media_warning,
         )
-        if not self.settings.stream:
+        if not self.settings.stream.enabled:
             artifact = await acquirer.acquire(source)
             await self._finish_stage("acquire", "media ready")
             return artifact
@@ -685,7 +702,7 @@ class YakiFlowJob:
                 await self._finish_stage("transcribe", "transcription ready")
                 return cues
         resume_from = self._transcription_resume_cues()
-        if self.settings.stream and not self.db.get_checkpoint("transcription_started"):
+        if self.settings.stream.enabled and not self.db.get_checkpoint("transcription_started"):
             # Streaming cues use positional IDs that the authoritative
             # full-audio pass will reuse. Their translations belong to the
             # provisional source text and must not survive that ID collision.
@@ -739,15 +756,15 @@ class YakiFlowJob:
                 partial_path, self.db.list_cues(stable_only=True)
             )
             await self.emit("transcript", "Whisper subtitle", cue=item.cue)
-            if len(incremental) % self.settings.translation_batch_size == 0:
-                batch = incremental[-self.settings.translation_batch_size:]
+            if len(incremental) % self.settings.agent.draft.batch_size == 0:
+                batch = incremental[-self.settings.agent.draft.batch_size:]
                 timeline = self.db.list_cues(stable_only=True)
                 batch_start = next(
                     index for index, cue in enumerate(timeline)
                     if cue.id == batch[0].id
                 )
                 context_start = max(
-                    0, batch_start - self.settings.translation_context
+                    0, batch_start - self.settings.agent.draft.preceding_context
                 )
                 preceding_context = timeline[context_start:batch_start]
                 scheduled_translation_ids.update(cue.id for cue in batch)
@@ -903,9 +920,9 @@ class YakiFlowJob:
         runs past the end of a batch is otherwise invisible to the Agent
         translating it.
         """
-        batch_size = self.settings.translation_batch_size
-        context_size = self.settings.translation_context
-        following_size = self.settings.translation_following_context
+        batch_size = self.settings.agent.draft.batch_size
+        context_size = self.settings.agent.draft.preceding_context
+        following_size = self.settings.agent.draft.following_context
         batches: list[tuple[list[Cue], list[Cue], list[Cue]]] = []
         run_start: int | None = None
 
@@ -966,10 +983,10 @@ class YakiFlowJob:
             self.settings.source_language
         )
         backend = make_alignment_backend(
-            self.settings.alignment_backend,
+            self.settings.alignment.backend,
             language=language,
-            device=self.settings.alignment_device,
-            model_name=self.settings.alignment_model,
+            device=self.settings.alignment.device,
+            model_name=self.settings.alignment.model,
         )
 
         async def alignment_progress(completed: int, total: int) -> None:

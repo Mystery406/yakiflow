@@ -6,10 +6,15 @@ import os
 import shlex
 import signal
 import sys
+import tomllib
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
-from .config import load_settings, validate_run_settings
+from .config import (
+    TRANSCRIPTION_BACKENDS,
+    load_settings,
+    validate_run_settings,
+)
 from .doctor import run_doctor
 from .job import YakiFlowJob
 from .models import JobEvent
@@ -48,39 +53,48 @@ def _parser() -> argparse.ArgumentParser:
     _settings_arguments(run)
     resume = sub.add_parser("resume", help="resume a preserved work directory")
     resume.add_argument("workdir", type=Path)
-    doctor = sub.add_parser("doctor", help="check external dependencies and authentication")
+    _config_arguments(resume)
+    doctor = sub.add_parser(
+        "doctor", help="check external dependencies and authentication"
+    )
     _settings_arguments(doctor)
     models = sub.add_parser("models", help="manage Whisper models")
     models_sub = models.add_subparsers(dest="models_command", required=True)
     fetch = models_sub.add_parser("fetch")
-    fetch.add_argument("--config", type=Path)
-    fetch.add_argument("--profile", metavar="NAME")
+    _config_arguments(fetch)
     fetch.add_argument("--whisper-model", type=Path)
+    secret = sub.add_parser("secret", help="manage API keys in the OS keyring")
+    secret_sub = secret.add_subparsers(dest="secret_command", required=True)
+    for verb in ("set", "unset"):
+        entry = secret_sub.add_parser(verb)
+        entry.add_argument("name", choices=["elevenlabs"])
     return parser
 
 
-def _settings_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path)
+def _config_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config-file", type=Path)
     parser.add_argument("--profile", metavar="NAME")
-    parser.add_argument("--source-language")
-    parser.add_argument("--target-language")
-    parser.add_argument("--whisper-model", type=Path)
     parser.add_argument(
-        "--vad",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="use the configured VAD model; --no-vad ignores it for this run",
+        "-c",
+        "--config",
+        dest="config_items",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "override one configuration setting by its dotted TOML key, e.g. "
+            "-c transcription.backend=elevenlabs; repeatable"
+        ),
     )
-    parser.add_argument("--vad-model", type=Path)
-    parser.add_argument("--alignment-backend", choices=["vad", "whisperx"])
-    parser.add_argument("--alignment-device", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--alignment-model")
-    parser.add_argument("--translation-backend", choices=["codex", "claude"])
-    parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--download-dir", type=Path)
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--output-mode", choices=["source", "translated", "bilingual", "all"])
-    parser.add_argument("--memory", type=Path)
+
+
+def _settings_arguments(parser: argparse.ArgumentParser) -> None:
+    _config_arguments(parser)
+    parser.add_argument("-s", "--source-language")
+    parser.add_argument("-t", "--target-language")
+    parser.add_argument(
+        "--stream", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument(
         "--context-file",
         dest="context_files",
@@ -92,38 +106,128 @@ def _settings_arguments(parser: argparse.ArgumentParser) -> None:
             "review; repeatable"
         ),
     )
-    parser.add_argument("--work-dir", type=Path)
-    parser.add_argument("--keep-workdir", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--draft-model")
-    parser.add_argument("--draft-effort", choices=["minimal", "low", "medium", "high", "xhigh"])
-    parser.add_argument("--final-model")
-    parser.add_argument("--final-effort", choices=["minimal", "low", "medium", "high", "xhigh"])
-    parser.add_argument("--agent-workers", type=int)
-    parser.add_argument("--draft-agent-timeout-seconds", type=float)
-    parser.add_argument("--agent-max-attempts", type=int)
-    parser.add_argument("--agent-retry-delay-seconds", type=float)
-    parser.add_argument("--review-display-mode", choices=["split", "open", "both"])
-    parser.add_argument("--review-open-command")
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
-        "--auto-open-video",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="open the source video automatically when interactive review starts",
+        "--output-mode", choices=["source", "translated", "bilingual", "all"]
     )
-    parser.add_argument("--video-open-command")
+    parser.add_argument(
+        "--transcription-backend", choices=list(TRANSCRIPTION_BACKENDS)
+    )
+    parser.add_argument("--work-dir", type=Path)
+    parser.add_argument(
+        "--keep-workdir", action=argparse.BooleanOptionalAction, default=None
+    )
+
+
+def parse_config_items(items: Sequence[str]) -> dict[str, Any]:
+    """Turn repeated ``-c key=value`` options into one nested mapping.
+
+    Values parse as TOML literals so booleans, numbers, and arrays keep their
+    types; anything that does not parse is taken as a plain string, which is
+    what an unquoted language code or path already is.
+    """
+    result: dict[str, Any] = {}
+    for item in items:
+        key, sep, raw_value = item.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(
+                f"invalid -c option {item!r}; expected KEY=VALUE with a "
+                "dotted TOML key"
+            )
+        try:
+            value = tomllib.loads(f"v = {raw_value}")["v"]
+        except tomllib.TOMLDecodeError:
+            value = raw_value
+        node = result
+        parts = key.split(".")
+        for part in parts[:-1]:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[parts[-1]] = value
+    return result
+
+
+def _flag_settings(namespace: argparse.Namespace) -> dict[str, Any]:
+    """Collect the dedicated settings flags into one nested mapping."""
+    values: dict[str, Any] = {}
+
+    def put(path: tuple[str, ...], value: Any) -> None:
+        if value is None:
+            return
+        node = values
+        for part in path[:-1]:
+            node = node.setdefault(part, {})
+        node[path[-1]] = value
+
+    get = lambda name: getattr(namespace, name, None)  # noqa: E731
+    put(("source_language",), get("source_language"))
+    put(("target_language",), get("target_language"))
+    put(("stream", "enabled"), get("stream"))
+    put(("context_files",), get("context_files"))
+    put(("output_dir",), get("output_dir"))
+    put(("output_mode",), get("output_mode"))
+    put(("transcription", "backend"), get("transcription_backend"))
+    put(("work_dir",), get("work_dir"))
+    put(("keep_workdir",), get("keep_workdir"))
+    put(("whisper", "model"), get("whisper_model"))
+    return values
 
 
 def _settings(namespace: argparse.Namespace):
-    values = vars(namespace).copy()
-    config = values.pop("config", None)
-    profile = values.pop("profile", None)
-    if config is not None and not config.is_file():
+    config_file = getattr(namespace, "config_file", None)
+    if config_file is not None and not config_file.is_file():
         # An unreadable config path would otherwise fall back to the defaults
         # and silently run with a different backend, model, or output location.
-        raise ValueError(f"configuration file does not exist: {config}")
-    for key in ("command", "input", "workdir", "models_command"):
-        values.pop(key, None)
-    return load_settings(values, project_file=config, profile=profile)
+        raise ValueError(f"configuration file does not exist: {config_file}")
+    return load_settings(
+        _flag_settings(namespace),
+        project_file=config_file,
+        profile=getattr(namespace, "profile", None),
+        cli_config=parse_config_items(getattr(namespace, "config_items", [])),
+    )
+
+
+def _resume_overrides(namespace: argparse.Namespace) -> Mapping[str, Any]:
+    return parse_config_items(getattr(namespace, "config_items", []))
+
+
+def _read_secret(prompt: str) -> str:
+    if sys.stdin.isatty():
+        import getpass
+
+        return getpass.getpass(prompt).strip()
+    return sys.stdin.readline().strip()
+
+
+def _secret(namespace: argparse.Namespace) -> int:
+    try:
+        import keyring
+        import keyring.errors
+    except ImportError:
+        raise ValueError(
+            "the keyring library is not installed; install yakiflow[keyring] "
+            "to store secrets in the OS keyring"
+        ) from None
+    from .elevenlabs import KEYRING_ENTRY, KEYRING_SERVICE
+
+    if namespace.secret_command == "set":
+        key = _read_secret("ElevenLabs API key: ")
+        if not key:
+            raise ValueError("no API key was provided")
+        keyring.set_password(KEYRING_SERVICE, KEYRING_ENTRY, key)
+        print(f"Stored {namespace.name} API key in the OS keyring.")
+        return 0
+    try:
+        keyring.delete_password(KEYRING_SERVICE, KEYRING_ENTRY)
+    except keyring.errors.PasswordDeleteError:
+        print(f"No {namespace.name} API key was stored.", file=sys.stderr)
+        return 0
+    print(f"Removed {namespace.name} API key from the OS keyring.")
+    return 0
 
 
 async def _run_job(job: YakiFlowJob) -> int:
@@ -206,12 +310,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     job: YakiFlowJob | None = None
     try:
+        if args.command == "secret":
+            return _secret(args)
         if args.command == "models":
             settings = _settings(args)
             def progress(done: int, total: int | None) -> None:
                 suffix = f"/{total}" if total else ""
                 print(f"\rDownloading {done}{suffix} bytes", end="", file=sys.stderr)
-            path = fetch_model(settings.whisper_model, progress)
+            path = fetch_model(settings.whisper.model, progress)
             print(f"\n{path}")
             return 0
         if args.command == "doctor":
@@ -221,7 +327,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{'OK' if check.ok else 'FAIL':4} {check.name}: {check.detail}")
             return 0 if all(check.ok for check in checks) else 1
         if args.command == "resume":
-            job = YakiFlowJob.from_workdir(args.workdir, listener=_print_event)
+            job = YakiFlowJob.from_workdir(
+                args.workdir,
+                listener=_print_event,
+                config_file=args.config_file,
+                profile=args.profile,
+                overrides=_resume_overrides(args),
+            )
             # The stored configuration bypasses argparse, so re-check it here
             # instead of failing deep inside a resumed stage.
             validate_run_settings(job.settings)

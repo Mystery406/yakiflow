@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 import yakiflow.job as job_module
+from conftest import make_settings
 from yakiflow.alignment import AlignmentResult
-from yakiflow.config import Settings
 from yakiflow.job import YakiFlowJob
 from yakiflow.media import MediaArtifact, MediaSource
 from yakiflow.memory import MemoryDestinationConflict
@@ -100,8 +100,8 @@ def test_context_files_are_snapshotted_and_restored_on_resume(
     work_dir = tmp_path / "work"
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
-            translation_backend="codex",
+        make_settings(
+            agent={"backend": "codex"},
             context_files=(first, second),
             work_dir=work_dir,
             memory=tmp_path / "memory.md",
@@ -186,11 +186,11 @@ def test_forced_alignment_replaces_timeline_then_translation_only_resumes(
     monkeypatch.setattr(job_module, "make_alignment_backend", lambda *args, **kwargs: aligner)
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="en",
             target_language="zh-CN",
-            translation_backend="codex",
-            whisper_model=tmp_path / "model.bin",
+            agent={"backend": "codex"},
+            whisper={"model": tmp_path / "model.bin"},
             work_dir=work_dir,
         ),
         backend=backend,
@@ -255,12 +255,12 @@ def test_alignment_stage_always_applies_volume_start_refinement(
     work_dir = tmp_path / f"{configured_backend}-{result_backend}"
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="en",
             target_language="zh-CN",
-            alignment_backend=configured_backend,
-            translation_backend="codex",
-            whisper_model=tmp_path / "model.bin",
+            alignment={"backend": configured_backend},
+            agent={"backend": "codex"},
+            whisper={"model": tmp_path / "model.bin"},
             work_dir=work_dir,
         ),
         backend=PipelineBackend(),
@@ -298,12 +298,12 @@ def test_alignment_stage_adjusts_long_vad_silence_before_backend(
     monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", keep_starts)
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="en",
             target_language="zh-CN",
-            alignment_backend="whisperx",
-            translation_backend="codex",
-            whisper_model=tmp_path / "model.bin",
+            alignment={"backend": "whisperx"},
+            agent={"backend": "codex"},
+            whisper={"model": tmp_path / "model.bin"},
             work_dir=tmp_path / "pre-align-vad",
         ),
         backend=PipelineBackend(),
@@ -337,12 +337,12 @@ def test_alignment_stage_extends_ends_after_final_start_refinement(
     monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", refine)
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="en",
             target_language="zh-CN",
-            alignment_backend="whisperx",
-            translation_backend="codex",
-            whisper_model=tmp_path / "model.bin",
+            alignment={"backend": "whisperx"},
+            agent={"backend": "codex"},
+            whisper={"model": tmp_path / "model.bin"},
             work_dir=tmp_path / "final-end-extension",
         ),
         backend=PipelineBackend(),
@@ -478,7 +478,7 @@ def test_resume_preserves_temporary_workdir_status(
     )
     job = YakiFlowJob(
         "input.mp4",
-        Settings(translation_backend="codex"),
+        make_settings(agent={"backend": "codex"}),
         backend=PipelineBackend(),
     )
     work_dir = job.work_dir
@@ -504,17 +504,19 @@ def test_resume_preserves_effective_profile_values_and_option_tokens(
     tmp_path: Path,
 ) -> None:
     work_dir = tmp_path / "work"
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        stream=True,
-        translation_batch_size=5,
-        draft_codex_options=("-c", "service_tier=fast"),
-        final_codex_options=("--search",),
-        draft_claude_options=("--permission-mode", "plan"),
-        final_claude_options=("--verbose",),
-        yt_dlp_options=("--cookies-from-browser", "chrome"),
+        agent={
+            "backend": "codex",
+            "draft": {
+                "batch_size": 5,
+                "extra_options": ("-c", "service_tier=fast"),
+            },
+            "final": {"extra_options": ("--search",)},
+        },
+        stream={"enabled": True},
+        commands={"yt_dlp_options": ("--cookies-from-browser", "chrome")},
         work_dir=work_dir,
     )
     job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
@@ -522,19 +524,14 @@ def test_resume_preserves_effective_profile_values_and_option_tokens(
 
     resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
 
-    assert resumed.settings.stream is True
-    assert resumed.settings.translation_batch_size == 5
-    assert resumed.settings.draft_codex_options == (
+    assert resumed.settings.stream.enabled is True
+    assert resumed.settings.agent.draft.batch_size == 5
+    assert resumed.settings.agent.draft.extra_options == (
         "-c",
         "service_tier=fast",
     )
-    assert resumed.settings.final_codex_options == ("--search",)
-    assert resumed.settings.draft_claude_options == (
-        "--permission-mode",
-        "plan",
-    )
-    assert resumed.settings.final_claude_options == ("--verbose",)
-    assert resumed.settings.yt_dlp_options == (
+    assert resumed.settings.agent.final.extra_options == ("--search",)
+    assert resumed.settings.commands.yt_dlp_options == (
         "--cookies-from-browser",
         "chrome",
     )
@@ -553,8 +550,8 @@ def test_local_input_is_canonicalized_before_journaling(
 
     job = YakiFlowJob(
         "movie.mp4",
-        Settings(
-            translation_backend="codex",
+        make_settings(
+            agent={"backend": "codex"},
             memory=tmp_path / "memory.md",
             work_dir=work_dir,
         ),
@@ -577,8 +574,8 @@ def test_new_job_rejects_populated_workdir_and_resume_keeps_one_job_row(
     tmp_path: Path,
 ) -> None:
     work_dir = tmp_path / "work"
-    settings = Settings(
-        translation_backend="codex",
+    settings = make_settings(
+        agent={"backend": "codex"},
         memory=tmp_path / "memory.md",
         work_dir=work_dir,
     )
@@ -604,8 +601,8 @@ def test_new_job_rejects_populated_workdir_and_resume_keeps_one_job_row(
     with pytest.raises(ValueError, match="work directory is not empty"):
         YakiFlowJob(
             "third.mp4",
-            Settings(
-                translation_backend="codex",
+            make_settings(
+                agent={"backend": "codex"},
                 memory=tmp_path / "memory.md",
                 work_dir=unrelated,
             ),
@@ -614,11 +611,11 @@ def test_new_job_rejects_populated_workdir_and_resume_keeps_one_job_row(
 
 
 def test_agent_summary_counts_real_concurrent_operations(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=tmp_path / "model.bin",
+        agent={"backend": "codex"},
+        whisper={"model": tmp_path / "model.bin"},
         memory=tmp_path / "memory.md",
         work_dir=tmp_path / "work",
     )
@@ -657,10 +654,11 @@ def test_local_job_runs_full_pipeline_with_fake_processes(tmp_path: Path) -> Non
     media.write_bytes(b"media")
     model = tmp_path / "model.bin"
     model.write_bytes(b"model")
-    settings = Settings(
-        source_language="auto", target_language="zh-CN", translation_backend="codex", whisper_model=model,
+    settings = make_settings(
+        source_language="auto", target_language="zh-CN", whisper={"model": model},
         memory=tmp_path / "memory.md", output_dir=tmp_path / "out", work_dir=tmp_path / "work",
-        output_mode="all", draft_model="draft", final_model="final",
+        output_mode="all",
+        agent={"backend": "codex", "draft": {"model": "draft"}, "final": {"model": "final"}},
     )
     runner = PipelineRunner()
     events = []
@@ -726,11 +724,11 @@ def test_reviewing_resume_preserves_and_finalizes_staged_agent_edits(
     model.write_bytes(b"model")
     work_dir = tmp_path / "work"
     output_dir = tmp_path / "out"
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=model,
+        agent={"backend": "codex"},
+        whisper={"model": model},
         memory=tmp_path / "memory.md",
         output_dir=output_dir,
         work_dir=work_dir,
@@ -763,8 +761,8 @@ def test_finalize_requires_all_staged_subtitles_before_moving_any(
     work_dir = tmp_path / "work"
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
-            translation_backend="codex",
+        make_settings(
+            agent={"backend": "codex"},
             memory=tmp_path / "memory.md",
             output_dir=output_dir,
             work_dir=work_dir,
@@ -793,10 +791,10 @@ def test_finalize_requires_all_staged_subtitles_before_moving_any(
 def _review_job(tmp_path: Path, cues: list[Cue], output_mode: str = "bilingual"):
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="en",
             target_language="zh-CN",
-            translation_backend="codex",
+            agent={"backend": "codex"},
             memory=tmp_path / "memory.md",
             output_dir=tmp_path / "out",
             work_dir=tmp_path / "work",
@@ -953,16 +951,14 @@ def test_overlapping_translation_does_not_add_an_empty_progress_stage(
     model.write_bytes(b"model")
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFF-fake")
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=model,
+        agent={"backend": "codex", "draft": {"batch_size": 1, "preceding_context": 1}},
+        whisper={"model": model},
         memory=tmp_path / "memory.md",
         work_dir=tmp_path / "work",
         output_dir=tmp_path,
-        translation_batch_size=1,
-        translation_context=1,
     )
     events = []
     backend = PipelineBackend()
@@ -1010,16 +1006,15 @@ def test_authoritative_transcription_retranslates_provisional_stream_cues(
     backend = PipelineBackend()
     job = YakiFlowJob(
         "input.mp4",
-        Settings(
+        make_settings(
             source_language="auto",
             target_language="zh-CN",
-            translation_backend="codex",
-            whisper_model=model,
+            agent={"backend": "codex", "draft": {"batch_size": 20}},
+            whisper={"model": model},
             memory=tmp_path / "memory.md",
             work_dir=tmp_path / "work",
             output_dir=tmp_path,
-            stream=True,
-            translation_batch_size=20,
+            stream={"enabled": True},
         ),
         runner=PipelineRunner(),
         backend=backend,
@@ -1055,11 +1050,11 @@ def test_resumed_progress_scales_transcription_to_remaining_audio(
         destination.setsampwidth(2)
         destination.setframerate(16_000)
         destination.writeframes(b"\0\0" * 160_000)
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=model,
+        agent={"backend": "codex"},
+        whisper={"model": model},
         memory=tmp_path / "memory.md",
         work_dir=tmp_path / "work",
         output_dir=tmp_path,
@@ -1084,10 +1079,10 @@ def test_memory_destination_change_must_be_accepted_before_finalize(
 ) -> None:
     destination = tmp_path / "memory.md"
     destination.write_text("# Memory\n\n- original\n", encoding="utf-8")
-    settings = Settings(
+    settings = make_settings(
         source_language="en",
         target_language="zh-CN",
-        translation_backend="codex",
+        agent={"backend": "codex"},
         memory=destination,
         work_dir=tmp_path / "work",
     )
@@ -1124,11 +1119,11 @@ def test_interrupted_whisper_resumes_after_preserved_cues(tmp_path: Path) -> Non
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFF-audio")
     work_dir = tmp_path / "work"
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=model,
+        agent={"backend": "codex"},
+        whisper={"model": model},
         memory=tmp_path / "memory.md",
         work_dir=work_dir,
         output_dir=tmp_path,
@@ -1191,17 +1186,21 @@ def test_missing_translations_are_sent_as_contiguous_agent_batches(
     tmp_path: Path,
 ) -> None:
     backend = PipelineBackend()
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=tmp_path / "model.bin",
+        agent={
+            "backend": "codex",
+            "draft": {
+                "batch_size": 2,
+                "preceding_context": 2,
+                "following_context": 2,
+            },
+        },
+        whisper={"model": tmp_path / "model.bin"},
         memory=tmp_path / "memory.md",
         work_dir=tmp_path / "work",
         output_dir=tmp_path,
-        translation_batch_size=2,
-        translation_context=2,
-        translation_following_context=2,
     )
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFF-audio")
@@ -1268,16 +1267,17 @@ def test_transcription_failure_cancels_draft_agent_tasks(
     monkeypatch.setattr(job_module, "WhisperCliTranscriber", FailingTranscriber)
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFF-fake")
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=tmp_path / "model.bin",
+        agent={
+            "backend": "codex",
+            "draft": {"model": "draft", "batch_size": 1},
+            "final": {"model": "final"},
+        },
+        whisper={"model": tmp_path / "model.bin"},
         memory=tmp_path / "memory.md",
         work_dir=tmp_path / "work",
-        draft_model="draft",
-        final_model="final",
-        translation_batch_size=1,
     )
     job = YakiFlowJob("input.mp4", settings, backend=backend)
     artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
@@ -1302,11 +1302,11 @@ def test_resuming_a_finished_job_does_not_republish_over_reviewed_files(
     model.write_bytes(b"model")
     work_dir = tmp_path / "work"
     output_dir = tmp_path / "out"
-    settings = Settings(
+    settings = make_settings(
         source_language="auto",
         target_language="zh-CN",
-        translation_backend="codex",
-        whisper_model=model,
+        agent={"backend": "codex"},
+        whisper={"model": model},
         memory=tmp_path / "memory.md",
         output_dir=output_dir,
         work_dir=work_dir,

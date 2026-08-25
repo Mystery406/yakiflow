@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import yakiflow.interactive_agent as interactive_agent
+from conftest import make_settings
 from yakiflow.config import Settings
 from yakiflow.interactive_agent import (
     build_interactive_command,
@@ -343,9 +344,8 @@ def test_both_display_mode_opens_external_command_and_tmux_preview(
 
     display = asyncio.run(
         start_agent_file_display(
-            Settings(
-                review_display_mode="both",
-                review_open_command="editor {srt}",
+            make_settings(
+                review={"display_mode": "both", "open_command": "editor {srt}"},
             ),
             tmp_path,
             [subtitle],
@@ -357,24 +357,30 @@ def test_both_display_mode_opens_external_command_and_tmux_preview(
     assert display.marker == tmp_path / ".agent-display-done"
 
 
-def test_interactive_commands_append_only_matching_final_options() -> None:
+def test_interactive_commands_append_final_extra_options() -> None:
     codex = build_interactive_command(
-        Settings(
-            translation_backend="codex",
-            final_model="final-codex",
-            final_effort="high",
-            final_codex_options=("-c", "service_tier=fast"),
-            final_claude_options=("--dangerously-skip-permissions",),
+        make_settings(
+            agent={
+                "final": {
+                    "backend": "codex",
+                    "model": "final-codex",
+                    "effort": "high",
+                    "extra_options": ["-c", "service_tier=fast"],
+                },
+            },
         ),
         "codex prompt",
     )
     claude = build_interactive_command(
-        Settings(
-            translation_backend="claude",
-            final_model="final-claude",
-            final_effort="medium",
-            final_codex_options=("--search",),
-            final_claude_options=("--permission-mode", "plan"),
+        make_settings(
+            agent={
+                "final": {
+                    "backend": "claude",
+                    "model": "final-claude",
+                    "effort": "medium",
+                    "extra_options": ["--permission-mode", "plan"],
+                },
+            },
         ),
         "claude prompt",
     )
@@ -428,13 +434,16 @@ def test_interactive_agent_auto_opens_video_before_runner(
     class Runner:
         async def run_interactive(self, command, *, cwd=None):
             assert calls == [
-                (Settings().video_open_command, media, subtitle, tmp_path)
+                (Settings().review.video_open_command, media, subtitle, tmp_path)
             ]
             return ProcessResult(tuple(command), 0, "", "")
 
     result = asyncio.run(
         interactive_agent.run_interactive_agent(
-            Settings(auto_open_video=True, translation_backend="codex"),
+            make_settings(
+                review={"auto_open_video": True},
+                agent={"final": {"backend": "codex"}},
+            ),
             tmp_path,
             [subtitle],
             runner=Runner(),
@@ -464,7 +473,7 @@ def test_interactive_agent_does_not_auto_open_video_by_default(
 
     asyncio.run(
         interactive_agent.run_interactive_agent(
-            Settings(translation_backend="codex"),
+            make_settings(agent={"final": {"backend": "codex"}}),
             tmp_path,
             [tmp_path / "movie.srt"],
             runner=Runner(),

@@ -506,7 +506,7 @@ class TranslationPipeline:
         self.on_retry = on_retry
         self.on_agent_event = on_agent_event
         self._write_lock = asyncio.Lock()
-        self._agent_semaphore = asyncio.Semaphore(settings.agent_workers)
+        self._agent_semaphore = asyncio.Semaphore(settings.agent.draft.workers)
 
     async def _emit_agent(
         self,
@@ -733,21 +733,21 @@ class TranslationPipeline:
         translate_only: bool = False,
     ) -> list[Cue]:
         batches = [
-            list(cues[i:i + self.settings.translation_batch_size])
-            for i in range(0, len(cues), self.settings.translation_batch_size)
+            list(cues[i:i + self.settings.agent.draft.batch_size])
+            for i in range(0, len(cues), self.settings.agent.draft.batch_size)
         ]
         completed = 0
 
         async def run(index: int, batch: list[Cue]) -> None:
             nonlocal completed
-            batch_start = index * self.settings.translation_batch_size
+            batch_start = index * self.settings.agent.draft.batch_size
             available_context = [*preceding_context, *cues[:batch_start]]
             context = (
-                available_context[-self.settings.translation_context:]
-                if self.settings.translation_context
+                available_context[-self.settings.agent.draft.preceding_context:]
+                if self.settings.agent.draft.preceding_context
                 else []
             )
-            following_size = self.settings.translation_following_context
+            following_size = self.settings.agent.draft.following_context
             batch_end = batch_start + len(batch)
             following = [
                 *cues[batch_end:batch_end + following_size],
@@ -758,8 +758,8 @@ class TranslationPipeline:
                     batch,
                     context,
                     following,
-                    self.settings.draft_model or "",
-                    self.settings.draft_effort,
+                    self.settings.agent.draft.model or "",
+                    self.settings.agent.draft.effort or "low",
                     translate_only=translate_only,
                 )
             async with self._write_lock:
@@ -819,7 +819,7 @@ class TranslationPipeline:
         system = self._draft_system(translate_only=translate_only)
         prompt = self._draft_prompt(batch, context, following)
         schema = DRAFT_RESPONSE_SCHEMA
-        attempts = self.settings.agent_max_attempts
+        attempts = self.settings.agent.draft.max_attempts
         summary = self._request_summary(batch, context, following)
         await self._emit_agent(
             operation_id, "user_message", summary,
@@ -852,7 +852,7 @@ class TranslationPipeline:
                 )
 
             try:
-                timeout = self.settings.draft_agent_timeout_seconds
+                timeout = self.settings.agent.draft.timeout_seconds
                 async with asyncio.timeout(timeout):
                     raw = await self.backend.invoke_with_trace(
                         prompt, system=system, model=model, effort=effort,
@@ -913,7 +913,7 @@ class TranslationPipeline:
                 error = (
                     TimeoutError(
                         "agent draft batch timed out after "
-                        f"{self.settings.draft_agent_timeout_seconds:g}s"
+                        f"{self.settings.agent.draft.timeout_seconds:g}s"
                     )
                     if isinstance(exc, TimeoutError)
                     else exc
@@ -945,7 +945,7 @@ class TranslationPipeline:
                         f"Agent draft batch failed: {error}; "
                         f"retrying {attempt + 1}/{attempts}"
                     )
-                delay = self.settings.agent_retry_delay_seconds
+                delay = self.settings.agent.draft.retry_delay_seconds
                 # Never wait less than the configured delay: someone who sets a
                 # long delay is backing off a rate-limited backend on purpose.
                 cap = max(_MAX_RETRY_BACKOFF_SECONDS, delay)

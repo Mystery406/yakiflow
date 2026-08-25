@@ -182,14 +182,14 @@ class MediaAcquirer:
     async def _download(self, source: MediaSource) -> Path:
         target_dir = (self.settings.download_dir or self.work_dir / "download").resolve()
         target_dir.mkdir(parents=True, exist_ok=True)
-        args = [self.settings.yt_dlp, "--newline", "--no-playlist", "--print", "after_move:filepath", "-P", target_dir]
+        args = [self.settings.commands.yt_dlp, "--newline", "--no-playlist", "--print", "after_move:filepath", "-P", target_dir]
         if self.settings.download_dir is None:
             args += ["-f", "bestaudio/best", "-o", "source.%(ext)s"]
         else:
             # yt-dlp's normal best format and merge logic preserves the preferred
             # container and falls back to mkv when needed.
             args += ["--merge-output-format", "mkv"]
-        args.extend(self.settings.yt_dlp_options)
+        args.extend(self.settings.commands.yt_dlp_options)
         args.append(source.value)
 
         started = time()
@@ -218,7 +218,7 @@ class MediaAcquirer:
     async def extract_audio(
         self, media_path: Path, output: Path, *, start: float = 0.0
     ) -> None:
-        args = [self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        args = [self.settings.commands.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
         if start > 0:
             # Input seeking: ffmpeg resumes at the keyframe before ``start`` and
             # drops the samples ahead of it, so the window lands sample-accurate
@@ -243,7 +243,7 @@ class MediaAcquirer:
         download_stem = f"source-{uuid.uuid4().hex}"
         template = target_dir / f"{download_stem}.%(ext)s"
         args = [
-            self.settings.yt_dlp, "--newline", "--no-playlist",
+            self.settings.commands.yt_dlp, "--newline", "--no-playlist",
             "--print", "after_move:filepath", "-o", template,
         ]
         if self.settings.download_dir is None:
@@ -255,14 +255,14 @@ class MediaAcquirer:
         # recent yt-dlp versions reject that unusual extension for safety.
         # Remuxing gives yt-dlp a safe, stable final extension in both cases.
         args += ["--remux-video", "mkv"]
-        args.extend(self.settings.yt_dlp_options)
+        args.extend(self.settings.commands.yt_dlp_options)
         args.append(source.value)
         task = asyncio.create_task(self.runner.run(args, on_line=self._download_log))
         result = None
         interrupted = False
         emitted_duration = 0.0
-        chunk_seconds = self.settings.stream_chunk_seconds
-        context_seconds = self.settings.stream_context_seconds
+        chunk_seconds = self.settings.stream.chunk_seconds
+        context_seconds = self.settings.stream.context_seconds
         tail_path = self.work_dir / "stream-tail.wav"
         excerpt = self.work_dir / "stream-chunk.wav"
         # A wall-clock deadline, not a poll count: decoding and transcribing a

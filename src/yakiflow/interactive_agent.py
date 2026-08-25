@@ -104,8 +104,8 @@ async def start_agent_file_display(
     media_path = _source_media(work_dir)
     marker = work_dir / ".agent-display-done"
     marker.unlink(missing_ok=True)
-    if settings.review_display_mode in {"open", "both"}:
-        command_text = settings.review_open_command
+    if settings.review.display_mode in {"open", "both"}:
+        command_text = settings.review.open_command
         if not command_text:
             raise ValueError(
                 "review_open_command is required for open or both display mode"
@@ -128,7 +128,7 @@ async def start_agent_file_display(
             )
         except (OSError, IndexError, ValueError) as exc:
             print(f"yakiflow: review_open_command failed: {exc}", file=sys.stderr)
-        if settings.review_display_mode == "open":
+        if settings.review.display_mode == "open":
             return AgentFileDisplay()
 
     # A split pane only makes sense from inside an active multiplexer
@@ -138,7 +138,7 @@ async def start_agent_file_display(
         return AgentFileDisplay()
     command = _split_window_args()
     command.extend(("--", *_preview_command(
-        file_path, marker, media_path, settings.video_open_command
+        file_path, marker, media_path, settings.review.video_open_command
     )))
     try:
         process = await asyncio.create_subprocess_exec(
@@ -328,8 +328,11 @@ When the user says the session is complete, summarize the changes and exit.
 
 def build_interactive_command(settings: Settings, prompt: str) -> list[str]:
     """Build the configured Agent CLI command in interactive mode."""
-    model = settings.final_model or ""
-    if settings.translation_backend == "codex":
+    final = settings.agent.final
+    model = final.model or ""
+    effort = final.effort or "high"
+    extra_options = final.extra_options or ()
+    if final.backend == "codex":
         command = [
             "codex",
             "--sandbox",
@@ -337,21 +340,19 @@ def build_interactive_command(settings: Settings, prompt: str) -> list[str]:
         ]
         if model:
             command.extend(("--model", model))
-        command.extend(
-            ("--config", f'model_reasoning_effort="{settings.final_effort}"')
-        )
-        command.extend(settings.final_codex_options)
+        command.extend(("--config", f'model_reasoning_effort="{effort}"'))
+        command.extend(extra_options)
         command.append(prompt)
         return command
-    if settings.translation_backend == "claude":
+    if final.backend == "claude":
         command = ["claude"]
         if model:
             command.extend(("--model", model))
-        command.extend(("--effort", settings.final_effort))
-        command.extend(settings.final_claude_options)
+        command.extend(("--effort", effort))
+        command.extend(extra_options)
         command.append(prompt)
         return command
-    raise ValueError(f"unsupported agent backend: {settings.translation_backend}")
+    raise ValueError(f"unsupported agent backend: {final.backend}")
 
 
 def build_memory_conflict_prompt(
@@ -405,20 +406,20 @@ async def run_interactive_agent(
     runner = runner or CommandRunner()
     prompt = build_interactive_prompt(settings, work_dir, outputs, context_files)
     command = build_interactive_command(settings, prompt)
-    if settings.auto_open_video and outputs:
+    if settings.review.auto_open_video and outputs:
         open_media(
-            settings.video_open_command,
+            settings.review.video_open_command,
             _source_media(work_dir),
             outputs[0],
             cwd=work_dir,
         )
     if (
-        settings.review_display_mode in {"split", "both"}
+        settings.review.display_mode in {"split", "both"}
         and not os.environ.get("TMUX")
     ):
         return await _run_in_new_tmux_session(
             command, work_dir, outputs, _source_media(work_dir),
-            settings.video_open_command,
+            settings.review.video_open_command,
         )
     return await runner.run_interactive(command, cwd=work_dir)
 

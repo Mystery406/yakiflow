@@ -798,7 +798,7 @@ class YakiFlowApp(App[None]):
 
     def action_open_media(self) -> None:
         if open_media(
-            self.job.settings.video_open_command,
+            self.job.settings.review.video_open_command,
             self.job.media_path,
             self.job.subtitle_path,
             cwd=self.job.work_dir,

@@ -2,7 +2,7 @@ import asyncio
 import wave
 from pathlib import Path
 
-from yakiflow.config import Settings
+from conftest import make_settings
 from yakiflow.database import JobDatabase
 from yakiflow import media
 from yakiflow.media import MediaAcquirer, MediaSource, _drain_stream_chunks
@@ -45,11 +45,13 @@ def test_media_source_preserves_urls_and_canonicalizes_local_paths(
 def test_persistent_url_downloads_once_then_extracts(tmp_path: Path) -> None:
     media = tmp_path / "downloads" / "video.mkv"
     runner = FakeRunner(media)
-    settings = Settings(
+    settings = make_settings(
         download_dir=media.parent,
-        ffmpeg="ffmpeg",
-        yt_dlp="yt-dlp",
-        yt_dlp_options=("--cookies-from-browser", "chrome"),
+        commands={
+            "ffmpeg": "ffmpeg",
+            "yt_dlp": "yt-dlp",
+            "yt_dlp_options": ["--cookies-from-browser", "chrome"],
+        },
     )
     db = JobDatabase(tmp_path / "db.sqlite3")
     progress: list[float] = []
@@ -177,7 +179,7 @@ def test_stream_decodes_only_the_audio_it_has_not_processed(
     db = JobDatabase(tmp_path / "db.sqlite3")
     asyncio.run(
         MediaAcquirer(
-            Settings(download_dir=tmp_path / "downloads"),
+            make_settings(download_dir=tmp_path / "downloads"),
             tmp_path / "work",
             db,
             runner,
@@ -224,11 +226,13 @@ def test_stream_download_ignores_files_from_previous_jobs(
     db = JobDatabase(tmp_path / "db.sqlite3")
     artifact = asyncio.run(
         MediaAcquirer(
-            Settings(
+            make_settings(
                 download_dir=download_dir,
-                ffmpeg="ffmpeg",
-                yt_dlp="yt-dlp",
-                yt_dlp_options=("--cookies-from-browser", "chrome"),
+                commands={
+                    "ffmpeg": "ffmpeg",
+                    "yt_dlp": "yt-dlp",
+                    "yt_dlp_options": ["--cookies-from-browser", "chrome"],
+                },
             ),
             tmp_path / "work",
             db,

@@ -192,8 +192,8 @@ def whisper_language_and_vad_args(settings: Settings) -> list[str]:
     args: list[str] = []
     if settings.source_language:
         args += ["--language", settings.source_language]
-    if settings.vad_model:
-        args += ["--vad", "--vad-model", str(settings.vad_model)]
+    if settings.whisper.vad_model:
+        args += ["--vad", "--vad-model", str(settings.whisper.vad_model)]
     return args
 
 
@@ -240,7 +240,7 @@ class WhisperCliTranscriber(Transcriber):
         stored_intervals = self.db.get_checkpoint("whisper_vad_intervals", [])
         vad_intervals = (
             [(float(start), float(end)) for start, end in stored_intervals]
-            if preserved and self.settings.vad_model
+            if preserved and self.settings.whisper.vad_model
             else []
         )
         self.db.checkpoint("whisper_vad_intervals", vad_intervals)
@@ -266,7 +266,7 @@ class WhisperCliTranscriber(Transcriber):
 
         async def line(stream: str, value: str) -> None:
             self.db.log("whisper-cli", stream, value)
-            if stream == "stderr" and self.settings.vad_model:
+            if stream == "stderr" and self.settings.whisper.vad_model:
                 record_vad(value, offset=input_offset)
             progress = PROGRESS_RE.search(value)
             if progress and on_progress:
@@ -306,7 +306,7 @@ class WhisperCliTranscriber(Transcriber):
 
             async def recovery_line(stream: str, value: str) -> None:
                 self.db.log("whisper-cli-recovery", stream, value)
-                if stream == "stderr" and self.settings.vad_model:
+                if stream == "stderr" and self.settings.whisper.vad_model:
                     record_vad(value, offset=resume_at)
 
             await self.runner.run(
@@ -344,7 +344,7 @@ class WhisperCliTranscriber(Transcriber):
     def _cli_args(self, input_audio: Path, prefix: Path) -> list[str | Path]:
         """Build one whisper-cli invocation for an input file and output prefix."""
         args: list[str | Path] = [
-            self.settings.whisper_cli, "-m", self.settings.whisper_model,
+            self.settings.whisper.cli, "-m", self.settings.whisper.model,
             "-f", input_audio, "-mc", "0", "--print-progress",
             "--output-json-full", "--output-file", prefix,
         ]
@@ -354,7 +354,7 @@ class WhisperCliTranscriber(Transcriber):
     async def _extract_tail(self, audio: Path, start: float, destination: Path) -> None:
         """Write 16 kHz mono PCM covering ``audio`` from ``start`` onwards."""
         await self.runner.run([
-            self.settings.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            self.settings.commands.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-ss", str(start), "-i", audio,
             "-ac", "1", "-ar", "16000", destination,
         ])
@@ -405,7 +405,7 @@ class WhisperServerTranscriber:
         if self.port is None:
             self.port = _allocate_loopback_port()
         args: list[str] = [
-            self.settings.whisper_server, "-m", str(self.settings.whisper_model),
+            self.settings.whisper.server, "-m", str(self.settings.whisper.model),
             "--host", "127.0.0.1", "--port", str(self.port),
             "--request-path", self.request_path,
         ]
