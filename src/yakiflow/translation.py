@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import re
 import uuid
 from abc import ABC, abstractmethod
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Sequence
 
 from .config import Settings
 from .database import JobDatabase
@@ -522,6 +524,177 @@ def make_backend(
     raise ValueError(f"unsupported agent backend: {name}")
 
 
+def _cue_time_key(cue: Cue) -> tuple[float, float, str]:
+    return (cue.start, cue.end, cue.speaker or "")
+
+
+def _word_span(cue: Cue) -> range:
+    word_range = cue.metadata.get("word_range")
+    if not word_range:
+        return range(0)
+    return range(int(word_range[0]), int(word_range[1]) + 1)
+
+
+def _junction_suspicious(left: Cue, right: Cue, forced: bool) -> bool:
+    """Whether the junction between two draft cues still needs agent repair."""
+    from .elevenlabs import PAUSE_SPLIT_SECONDS
+
+    return forced or (
+        left.speaker == right.speaker
+        and right.start - left.end < PAUSE_SPLIT_SECONDS
+    )
+
+
+class WordSettlement:
+    """Finalizes draft cue IDs incrementally as their prefix stops changing.
+
+    A word-mode cue's final ID is its 1-based position in the finished
+    timeline, sorted by (start, end, speaker). That position is already
+    determined mid-draft once nothing sorting before the cue can change any
+    more: the words ahead of it are contiguously covered by landed agent
+    cues, and no batch junction among them can still be replaced by a
+    repair. The tracker maintains that settled frontier by construction —
+    landed cues enter a bisect-ordered list, junctions resolve as their
+    sides land — and hands out renames to the exact IDs the final install
+    will assign, so they can be shown (and persisted) early.
+
+    Ties with future work are excluded structurally: word start times never
+    decrease with the ordinal, so any cue a later batch or repair may still
+    produce starts at or after the first mutable word, and only cues
+    starting strictly earlier settle.
+    """
+
+    def __init__(self, cues: Iterable[Cue]) -> None:
+        seed = sorted(
+            (cue for cue in cues if cue.metadata.get("word_range")),
+            key=_cue_time_key,
+        )
+        self._cues: list[Cue] = seed
+        self._keys = [_cue_time_key(cue) for cue in seed]
+        self._by_id = {cue.id: cue for cue in seed}
+        self._owner: dict[int, str] = {
+            ordinal: cue.id for cue in seed for ordinal in _word_span(cue)
+        }
+        # Junction j sits between words j and j+1; True marks a forced cut,
+        # which only a completed repair may clear.
+        self._pending: dict[int, bool] = {}
+        self._covered_cursor = 0
+        self._settled = 0
+
+    def register(self, added: Sequence[Cue], removed_ids: Sequence[str]) -> None:
+        """Fold one landed delta in: new cues arrive, superseded ones leave."""
+        for cue_id in removed_ids:
+            self._remove(cue_id)
+        for cue in added:
+            if not cue.metadata.get("word_range"):
+                continue
+            self._remove(cue.id)
+            self._insert(cue)
+
+    def _insert(self, cue: Cue) -> None:
+        # bisect_right keeps equal keys in insertion order, matching both the
+        # database ordinal order the final install sorts by and the stable
+        # seed sort above.
+        key = _cue_time_key(cue)
+        index = bisect_right(self._keys, key)
+        self._keys.insert(index, key)
+        self._cues.insert(index, cue)
+        self._by_id[cue.id] = cue
+        for ordinal in _word_span(cue):
+            self._owner[ordinal] = cue.id
+
+    def _remove(self, cue_id: str) -> None:
+        cue = self._by_id.pop(cue_id, None)
+        if cue is None:
+            return
+        index = bisect_left(self._keys, _cue_time_key(cue))
+        while self._cues[index].id != cue_id:
+            index += 1
+        del self._keys[index]
+        del self._cues[index]
+        for ordinal in _word_span(cue):
+            if self._owner.get(ordinal) == cue_id:
+                del self._owner[ordinal]
+
+    def add_junctions(self, junctions: Iterable[tuple[int, bool]]) -> None:
+        """Mark batch junctions that a repair pass may still re-cut.
+
+        The same junction can arrive once per adjacent batch with different
+        forced flags; a forced cut anywhere keeps it forced.
+        """
+        for junction, forced in junctions:
+            self._pending[junction] = self._pending.get(junction, False) or forced
+
+    def pending_junction(self, junction: int) -> bool:
+        return junction in self._pending
+
+    def resolve_junction(self, junction: int) -> None:
+        """Clear a junction the repair pass has finished with."""
+        self._pending.pop(junction, None)
+
+    def _resolve_clean_junctions(self) -> None:
+        """Clear junctions both of whose sides landed provably clean."""
+        for junction, forced in list(self._pending.items()):
+            left_id = self._owner.get(junction)
+            right_id = self._owner.get(junction + 1)
+            if left_id is None or right_id is None:
+                continue
+            if left_id == right_id or not _junction_suspicious(
+                self._by_id[left_id], self._by_id[right_id], forced
+            ):
+                del self._pending[junction]
+
+    def advance(
+        self, words: Sequence[Word], *, stream_complete: bool
+    ) -> list[tuple[str, Cue]]:
+        """Extend the settled prefix; return ``(old id, renamed cue)`` pairs.
+
+        ``words`` is the known word stream (indexable by ordinal), possibly
+        still growing when ``stream_complete`` is false — then the cue
+        holding the last known word stays unsettled, because the junction to
+        words yet to arrive could still send it through repair.
+        """
+        self._resolve_clean_junctions()
+        while self._covered_cursor in self._owner:
+            self._covered_cursor += 1
+        if self._covered_cursor == 0 or not words:
+            return []
+        total = len(words)
+        # Everything from the first word a repair or a pending batch could
+        # still rewrite is mutable: a repair replaces the whole span of the
+        # cues touching its junction, shifting every position after it.
+        barriers = [j for j in self._pending if j in self._owner]
+        if self._covered_cursor < total:
+            barriers.append(self._covered_cursor - 1)
+        elif not stream_complete:
+            barriers.append(total - 1)
+        if barriers:
+            mutable_from = min(
+                _word_span(self._by_id[self._owner[j]]).start for j in barriers
+            )
+            frontier_start = words[mutable_from].start
+        else:
+            mutable_from = total
+            frontier_start = math.inf
+        renames: list[tuple[str, Cue]] = []
+        while self._settled < len(self._cues):
+            cue = self._cues[self._settled]
+            span = _word_span(cue)
+            if not span or span.stop > mutable_from or cue.start >= frontier_start:
+                break
+            final_id = str(self._settled + 1)
+            if cue.id != final_id:
+                renamed = replace(cue, id=final_id)
+                del self._by_id[cue.id]
+                self._by_id[final_id] = renamed
+                self._cues[self._settled] = renamed
+                for ordinal in span:
+                    self._owner[ordinal] = final_id
+                renames.append((cue.id, renamed))
+            self._settled += 1
+        return renames
+
+
 class TranslationPipeline:
     def __init__(
         self,
@@ -541,6 +714,7 @@ class TranslationPipeline:
         self._write_lock = asyncio.Lock()
         self._agent_semaphore = asyncio.Semaphore(settings.agent.draft.workers)
         self._dispatched_word_ranges: set[tuple[int, int]] = set()
+        self._settlement: WordSettlement | None = None
 
     async def _emit_agent(
         self,
@@ -1019,6 +1193,48 @@ class TranslationPipeline:
 
     # --- word mode: the backend delivers words; the draft agent cuts cues ---
 
+    def _word_settlement(self) -> WordSettlement:
+        """The settled-ID tracker, seeded from the durable timeline once.
+
+        Settlement is fully recomputable from the database — a resumed job's
+        already-renamed cues just settle again to the same numbers — so a
+        fresh pipeline instance seeding here loses nothing.
+        """
+        if self._settlement is None:
+            self._settlement = WordSettlement(self.db.list_cues(stable_only=True))
+        return self._settlement
+
+    def _apply_word_delta(
+        self,
+        added: Sequence[Cue],
+        removed_ids: Sequence[str],
+        words: Sequence[Word],
+        *,
+        stream_complete: bool,
+    ) -> tuple[list[Cue], list[str]]:
+        """Persist one word-mode delta and advance the settled-ID frontier.
+
+        The caller holds the write lock. Returns the delta to report onward:
+        the input plus every cue just renamed to its now-final number, which
+        supersedes its provisional ID like any other replacement.
+        """
+        if removed_ids:
+            self.db.delete_cues(list(removed_ids))
+        if added:
+            self.db.upsert_cues(list(added), stable=True)
+        settlement = self._word_settlement()
+        settlement.register(added, removed_ids)
+        renames = settlement.advance(words, stream_complete=stream_complete)
+        if renames:
+            self.db.rename_cues([(old_id, cue.id) for old_id, cue in renames])
+        report = {cue.id: cue for cue in added}
+        removed = list(removed_ids)
+        for old_id, cue in renames:
+            report.pop(old_id, None)
+            report[cue.id] = cue
+            removed.append(old_id)
+        return list(report.values()), removed
+
     def _stable_word_coverage(self) -> set[int]:
         """Word ordinals already covered by a finished agent cue."""
         covered: set[int] = set()
@@ -1096,9 +1312,11 @@ class TranslationPipeline:
         async with self._agent_semaphore:
             cues = await self._run_word_batch(list(batch.words), all_words)
         async with self._write_lock:
-            self.db.upsert_cues(cues, stable=True)
+            added, removed = self._apply_word_delta(
+                cues, (), all_words, stream_complete=False
+            )
             if on_batch:
-                await on_batch(cues, [])
+                await on_batch(added, removed)
 
     async def segment_and_translate(
         self,
@@ -1125,6 +1343,16 @@ class TranslationPipeline:
                 boundaries.append((batch.words[0].ordinal - 1, False))
             if batch.words[-1].ordinal < last_ordinal:
                 boundaries.append((batch.words[-1].ordinal, batch.forced_end))
+        settlement = self._word_settlement()
+        settlement.add_junctions(boundaries)
+        # A resumed or streamed-ahead timeline may already hold a settled
+        # prefix; give those cues their final numbers before new work lands.
+        async with self._write_lock:
+            added, removed = self._apply_word_delta(
+                (), (), words, stream_complete=True
+            )
+            if on_batch and (added or removed):
+                await on_batch(added, removed)
         completed = 0
 
         async def run(batch: WordBatch) -> None:
@@ -1132,9 +1360,11 @@ class TranslationPipeline:
             async with self._agent_semaphore:
                 cues = await self._run_word_batch(list(batch.words), words)
             async with self._write_lock:
-                self.db.upsert_cues(cues, stable=True)
+                added, removed = self._apply_word_delta(
+                    cues, (), words, stream_complete=True
+                )
                 if on_batch:
-                    await on_batch(cues, [])
+                    await on_batch(added, removed)
                 completed += 1
                 if on_progress:
                     await on_progress(completed, len(batches))
@@ -1165,10 +1395,7 @@ class TranslationPipeline:
         Concurrent batches finish in arbitrary order, so the rows' insertion
         ordinals do not follow time; the published timeline must.
         """
-        ordered = sorted(
-            self.db.list_cues(stable_only=True),
-            key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
-        )
+        ordered = sorted(self.db.list_cues(stable_only=True), key=_cue_time_key)
         renumbered = [
             replace(cue, id=str(position))
             for position, cue in enumerate(ordered, 1)
@@ -1190,25 +1417,34 @@ class TranslationPipeline:
         nearly touching across the boundary, gets its combined word span
         re-segmented and re-translated as a unit, replacing both halves.
         """
-        from .elevenlabs import PAUSE_SPLIT_SECONDS
-
-        for boundary, forced in sorted(set(boundaries)):
+        settlement = self._word_settlement()
+        merged: dict[int, bool] = {}
+        for boundary, forced in boundaries:
+            merged[boundary] = merged.get(boundary, False) or forced
+        for boundary, forced in sorted(merged.items()):
+            if not settlement.pending_junction(boundary):
+                # Both halves landed and the junction already proved clean.
+                continue
             cues = self.db.list_cues(stable_only=True)
             by_word: dict[int, Cue] = {}
             for cue in cues:
-                word_range = cue.metadata.get("word_range")
-                if word_range:
-                    for ordinal in range(int(word_range[0]), int(word_range[1]) + 1):
-                        by_word[ordinal] = cue
+                for ordinal in _word_span(cue):
+                    by_word[ordinal] = cue
             left = by_word.get(boundary)
             right = by_word.get(boundary + 1)
-            if left is None or right is None or left.id == right.id:
-                continue
-            suspicious = forced or (
-                left.speaker == right.speaker
-                and right.start - left.end < PAUSE_SPLIT_SECONDS
-            )
-            if not suspicious:
+            if (
+                left is None
+                or right is None
+                or left.id == right.id
+                or not _junction_suspicious(left, right, forced)
+            ):
+                async with self._write_lock:
+                    settlement.resolve_junction(boundary)
+                    added, removed = self._apply_word_delta(
+                        (), (), words, stream_complete=True
+                    )
+                    if on_batch and (added or removed):
+                        await on_batch(added, removed)
                 continue
             low = int(left.metadata["word_range"][0])
             high = int(right.metadata["word_range"][1])
@@ -1223,10 +1459,12 @@ class TranslationPipeline:
             async with self._agent_semaphore:
                 new_cues = await self._run_word_batch(span, words)
             async with self._write_lock:
-                self.db.delete_cues(replaced)
-                self.db.upsert_cues(new_cues, stable=True)
+                settlement.resolve_junction(boundary)
+                added, removed = self._apply_word_delta(
+                    new_cues, replaced, words, stream_complete=True
+                )
                 if on_batch:
-                    await on_batch(new_cues, replaced)
+                    await on_batch(added, removed)
 
     def _word_system(self) -> str:
         subtitles = self.settings.subtitles

@@ -60,6 +60,23 @@ def test_speaker_round_trips_and_survives_transcript_replacement(
     db.close()
 
 
+def test_rename_cues_keeps_content_and_insertion_order(tmp_path: Path) -> None:
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    db.upsert_cues([
+        Cue("w0-1", 0, 1, "first", "一", speaker="1"),
+        Cue("w2-3", 1, 2, "second", "二", speaker="1"),
+    ])
+
+    db.rename_cues([("w0-1", "1"), ("w2-3", "2")])
+
+    cues = db.list_cues(stable_only=True)
+    assert [(cue.id, cue.source, cue.translated) for cue in cues] == [
+        ("1", "first", "一"),
+        ("2", "second", "二"),
+    ]
+    db.close()
+
+
 def test_aligned_timeline_replacement_is_authoritative_and_checkpointed(
     tmp_path: Path,
 ) -> None:

@@ -7,8 +7,8 @@ import pytest
 from conftest import make_settings
 from yakiflow.database import JobDatabase
 from yakiflow.elevenlabs import cues_from_words
-from yakiflow.models import Cue, Word
-from yakiflow.translation import AgentBackend, TranslationPipeline
+from yakiflow.models import Cue, Word, word_cue_id
+from yakiflow.translation import AgentBackend, TranslationPipeline, WordSettlement
 
 
 def _word(ordinal: int, start: float, end: float, text: str, speaker=None) -> Word:
@@ -112,11 +112,10 @@ def test_segment_and_translate_replaces_preview_cues_with_a_sorted_timeline(
 
     final = asyncio.run(pipeline.segment_and_translate(on_batch))
 
-    # Every batch reports its delta, and every added cue is a word-range cue.
-    assert deltas
-    assert all(
-        cue_id.startswith("w") for added, _ in deltas for cue_id in added
-    )
+    # The single batch covers every word, so the whole timeline settles at
+    # once: the delta reports the cues under their final numbers and retires
+    # the provisional word-range IDs.
+    assert deltas == [(["1", "2", "3"], ["w0-2", "w3-4", "w5-5"])]
 
     assert [cue.id for cue in final] == [str(i) for i in range(1, len(final) + 1)]
     assert [cue.speaker for cue in final] == ["1", "2", "1"]
@@ -230,10 +229,21 @@ def test_forced_batch_boundaries_get_junction_repair(tmp_path: Path) -> None:
     ]
     _store_words(db, words)
     backend = SegmentingBackend()
-    pipeline = _pipeline(db, backend, _settings(word_batch_size=5))
+    pipeline = _pipeline(db, backend, _settings(word_batch_size=5, workers=1))
+    deltas: list[tuple[list[str], list[str]]] = []
 
-    final = asyncio.run(pipeline.segment_and_translate())
+    async def on_batch(added, removed_ids) -> None:
+        deltas.append(([cue.id for cue in added], list(removed_ids)))
 
+    final = asyncio.run(pipeline.segment_and_translate(on_batch))
+
+    # The forced junction keeps every cue provisional until its repair
+    # lands; the repaired cue then settles as the complete timeline.
+    assert deltas == [
+        (["w0-9"], []),
+        (["w10-11"], []),
+        (["1"], ["w0-9", "w10-11", "w0-11"]),
+    ]
     # Two batch calls plus one junction-repair call over the combined span.
     assert len(backend.prompts) == 3
     repair_payload = json.loads(backend.prompts[-1].split("INPUT:\n", 1)[1])
@@ -267,6 +277,123 @@ def test_natural_boundaries_are_not_repaired(tmp_path: Path) -> None:
     assert len(backend.prompts) == 2
     assert [cue.metadata["word_range"] for cue in final] == [[0, 1], [2, 5]]
     db.close()
+
+
+def test_settled_ids_appear_progressively_across_batches(tmp_path: Path) -> None:
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    # Same stream as the natural-boundary test: a qualified silence splits it
+    # into two batches whose junction proves clean once both sides land.
+    words = [
+        _word(0, 0.0, 0.4, "one ", "1"),
+        _word(1, 0.5, 0.9, "two", "1"),
+        _word(2, 2.0, 2.4, "three ", "1"),
+        _word(3, 2.5, 2.9, "four ", "1"),
+        _word(4, 3.0, 3.4, "five ", "1"),
+        _word(5, 3.5, 3.9, "six", "1"),
+    ]
+    _store_words(db, words)
+    backend = SegmentingBackend()
+    pipeline = _pipeline(db, backend, _settings(word_batch_size=2, workers=1))
+    deltas: list[tuple[list[str], list[str]]] = []
+
+    async def on_batch(added, removed_ids) -> None:
+        deltas.append(([cue.id for cue in added], list(removed_ids)))
+
+    final = asyncio.run(pipeline.segment_and_translate(on_batch))
+
+    # While the second batch is outstanding its junction may still be
+    # repaired, so the first cue keeps its provisional ID; the junction
+    # proves clean the moment the second batch lands, and the whole prefix
+    # settles inside that same delta — before the final install.
+    assert deltas == [
+        (["w0-1"], []),
+        (["1", "2"], ["w0-1", "w2-5"]),
+    ]
+    assert [cue.id for cue in final] == ["1", "2"]
+    assert [cue.metadata["word_range"] for cue in final] == [[0, 1], [2, 5]]
+    db.close()
+
+
+# --- the settled-ID frontier ---
+
+
+def _agent_cue(first: int, last: int, start: float, end: float, speaker="1") -> Cue:
+    return Cue(
+        word_cue_id(first, last), start, end, "src", "译",
+        metadata={"word_range": [first, last]}, speaker=speaker,
+    )
+
+
+def test_settlement_holds_back_the_last_cue_while_the_stream_runs() -> None:
+    words = [
+        _word(0, 0.0, 0.4, "a ", "1"),
+        _word(1, 0.5, 0.9, "b", "1"),
+        _word(2, 2.0, 2.4, "c ", "1"),
+        _word(3, 2.5, 2.9, "d", "1"),
+    ]
+    settlement = WordSettlement([])
+    settlement.register(
+        [_agent_cue(0, 1, 0.0, 0.9), _agent_cue(2, 3, 2.0, 2.9)], []
+    )
+
+    # Words are still arriving: the junction to the future could send the
+    # last cue through repair, so only the first one settles.
+    renames = settlement.advance(words, stream_complete=False)
+    assert [(old, cue.id) for old, cue in renames] == [("w0-1", "1")]
+    assert settlement.advance(words, stream_complete=False) == []
+
+    renames = settlement.advance(words, stream_complete=True)
+    assert [(old, cue.id) for old, cue in renames] == [("w2-3", "2")]
+
+
+def test_settlement_waits_for_a_forced_junction_repair() -> None:
+    words = [_word(i, i * 1.0, i * 1.0 + 0.4, f"w{i} ", "1") for i in range(4)]
+    settlement = WordSettlement([])
+    settlement.add_junctions([(1, True)])
+    settlement.register(
+        [_agent_cue(0, 1, 0.0, 1.4), _agent_cue(2, 3, 2.0, 3.4)], []
+    )
+
+    # Only a completed repair clears a forced junction, and that repair
+    # would replace both cues around it: nothing settles yet.
+    assert settlement.advance(words, stream_complete=True) == []
+
+    settlement.resolve_junction(1)
+    renames = settlement.advance(words, stream_complete=True)
+    assert [(old, cue.id) for old, cue in renames] == [
+        ("w0-1", "1"), ("w2-3", "2"),
+    ]
+
+
+def test_settlement_keeps_a_suspicious_gap_pending() -> None:
+    words = [_word(i, i * 0.4, i * 0.4 + 0.35, f"w{i} ", "1") for i in range(4)]
+    settlement = WordSettlement([])
+    settlement.add_junctions([(1, False)])
+    settlement.register(
+        [_agent_cue(0, 1, 0.0, 0.75), _agent_cue(2, 3, 0.8, 1.55)], []
+    )
+
+    # Same speaker, 0.05 s apart across the junction: repair may still merge
+    # the halves, which would change the cue count.
+    assert settlement.advance(words, stream_complete=True) == []
+
+
+def test_settlement_reseeds_already_settled_ids_without_renaming() -> None:
+    words = [
+        _word(0, 0.0, 0.4, "a ", "1"),
+        _word(1, 0.5, 0.9, "b", "1"),
+        _word(2, 2.0, 2.4, "c ", "1"),
+        _word(3, 2.5, 2.9, "d", "1"),
+    ]
+    # A resumed job seeds cues a previous run already renamed: they settle
+    # again to the same numbers with no rename to report.
+    settlement = WordSettlement([
+        Cue("1", 0.0, 0.9, "a b", "译", metadata={"word_range": [0, 1]}, speaker="1"),
+        _agent_cue(2, 3, 2.0, 2.9),
+    ])
+
+    renames = settlement.advance(words, stream_complete=True)
+    assert [(old, cue.id) for old, cue in renames] == [("w2-3", "2")]
 
 
 # --- the mechanical validation matrix ---

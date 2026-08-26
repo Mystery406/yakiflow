@@ -291,6 +291,16 @@ class JobDatabase:
             for row in rows
         ]
 
+    def rename_cues(self, renames: Sequence[tuple[str, str]]) -> None:
+        """Give settled cues their final IDs; ordinal and content stay put."""
+        if not renames:
+            return
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE cues SET id=? WHERE id=?",
+                [(new_id, old_id) for old_id, new_id in renames],
+            )
+
     def delete_cues(self, ids: Sequence[str]) -> None:
         if not ids:
             return

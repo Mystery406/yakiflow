@@ -46,9 +46,10 @@ def subtitle_ordinal(cue: Cue) -> str:
     """Render the No. column, blank while the cue split is still provisional.
 
     A preview cue is renumbered on every re-segmentation, and a word-range
-    agent cue only gets its real number when the finished timeline is
-    installed, so showing either ID would only offer a sequence that keeps
-    shifting under the reader.
+    agent cue can still be replaced by a junction repair, so showing either
+    ID would only offer a sequence that keeps shifting under the reader.
+    Once the pipeline settles a cue's final number it renames the cue in
+    place, and the numeric ID shows here mid-draft.
     """
     if is_preview_cue_id(cue.id) or is_word_cue_id(cue.id):
         return ""
