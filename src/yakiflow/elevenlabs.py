@@ -641,6 +641,7 @@ class _RealtimeSession:
     async def open(self, previous_text: str = "") -> None:
         try:
             from elevenlabs.client import AsyncElevenLabs
+            from elevenlabs.realtime import AudioFormat, CommitStrategy
         except ImportError as exc:
             raise RuntimeError(
                 "the elevenlabs SDK is not installed; install "
@@ -649,9 +650,9 @@ class _RealtimeSession:
         client = AsyncElevenLabs(api_key=elevenlabs_api_key(self.settings))
         options: dict[str, Any] = {
             "model_id": self.settings.elevenlabs.realtime_model,
-            "audio_format": "pcm_16000",
+            "audio_format": AudioFormat.PCM_16000,
             "sample_rate": 16000,
-            "commit_strategy": "vad",
+            "commit_strategy": CommitStrategy.VAD,
             "include_timestamps": True,
         }
         if normalize_source_language(self.settings.source_language) is not None:

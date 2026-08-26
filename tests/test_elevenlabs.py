@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -423,7 +424,10 @@ def test_overlong_audio_is_rejected_before_upload(tmp_path: Path) -> None:
     db.close()
 
 
-def test_missing_sdk_is_reported_with_the_extra_name(tmp_path: Path) -> None:
+def test_missing_sdk_is_reported_with_the_extra_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "elevenlabs.client", None)
     db = JobDatabase(tmp_path / "job.sqlite3")
     transcriber = ElevenLabsTranscriber(_settings(), tmp_path, db)
     with pytest.raises(RuntimeError, match=r"yakiflow\[elevenlabs\]"):
