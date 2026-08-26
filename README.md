@@ -245,6 +245,24 @@ With automatic language detection, the bilingual filename uses the detected
 language, for example `video.ja-zh-cn.ass`. Players such as `mpv` load ASS
 files directly (`mpv --sub-file=video.en-zh-cn.ass video.mp4`).
 
+### Give each speaker its own style in Aegisub
+
+With a diarizing backend, every subtitle carries its speaker in the ASS `Name`
+(actor) field, while all lines share the `Default` style. To give speakers
+different colors or positions in Aegisub:
+
+1. Open the subtitle file in Aegisub and create one style per speaker in
+   `Subtitle → Styles Manager`.
+2. For each speaker, select any one of their lines and pick the new style in
+   the edit box's style dropdown.
+3. Load `contrib/aegisub/yakiflow-actor-styles.lua` from this repository via
+   `Automation → Automation... → Add`, then run `Automation → Fill actor
+   styles`.
+
+Every remaining `Default` line takes the style you assigned to that speaker's
+line. Lines you already restyled are left untouched, and one Ctrl-Z undoes the
+whole run.
+
 ### Resume an interrupted job
 
 In the TUI, press `s` to stop the current job cleanly and Ctrl-Q to leave the

@@ -234,6 +234,21 @@ yakiflow run 'https://example.com/live' \
 等播放器可以直接加载 ASS 文件
 （`mpv --sub-file=video.en-zh-cn.ass video.mp4`）。
 
+### 在 Aegisub 中为每个说话人设置样式
+
+使用带说话人识别的后端时，每条字幕的说话人都在 ASS 的 `Name`（说话人）字段中，
+而所有行共用 `Default` 样式。要在 Aegisub 中给不同说话人不同的颜色或位置：
+
+1. 在 Aegisub 中打开字幕文件，在「字幕 → 样式管理器」里为每个说话人建一个
+   样式。
+2. 对每个说话人，任选其一行，在编辑框的样式下拉菜单里选中新样式。
+3. 通过「自动化 → 自动化... → 添加」加载本仓库的
+   `contrib/aegisub/yakiflow-actor-styles.lua`，然后运行「自动化 → Fill actor
+   styles」。
+
+其余所有 `Default` 行都会改成该说话人那一行的样式。已经改过样式的行不会被
+改动，整个操作一次 Ctrl-Z 即可撤销。
+
 ### 恢复中断的任务
 
 在 TUI 中按 `s` 干净地停止当前任务，按 Ctrl-Q 退出界面。非 TUI 运行时，第一次
