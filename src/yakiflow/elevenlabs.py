@@ -16,6 +16,7 @@ import asyncio
 import os
 import subprocess
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -382,6 +383,45 @@ def _error_status(exc: BaseException) -> int | None:
     return int(status) if isinstance(status, int) else None
 
 
+# --- batch request wall-clock estimate ---
+
+# ElevenLabs splits a batch request into internally parallel segments:
+# ``min(4, ceil(duration / 480))``, so wall clock stops shrinking once the
+# audio is long enough to saturate all four.
+_SEGMENT_SECONDS = 480.0
+_MAX_SEGMENTS = 4
+
+# Published measurements put Scribe v2 near 55x real time on a ten-minute
+# file, which the split above runs as two segments; that is ~27x per segment,
+# rounded down here for headroom against a busy queue.
+_SEGMENT_SPEED = 20.0
+
+# The upload is the other half of the wall clock: the audio handed to this
+# backend is 16 kHz mono PCM, so an hour of it is ~115 MB. Assume a modest
+# uplink rather than the speed of a well-connected server.
+_UPLOAD_BYTES_PER_SECOND = 2_000_000.0
+
+# Request setup plus the queue wait before a segment starts.
+_REQUEST_OVERHEAD_SECONDS = 8.0
+
+
+def estimate_convert_seconds(duration: float | None, size_bytes: int) -> float:
+    """Guess how long one whole-file request takes, for synthetic progress.
+
+    The endpoint reports nothing until it answers, so the progress bar rides
+    this estimate; it only needs the right order of magnitude.
+    """
+    audio_seconds = duration if duration else 600.0
+    segments = min(
+        _MAX_SEGMENTS, max(1, ceil(audio_seconds / _SEGMENT_SECONDS))
+    )
+    transcribe_seconds = audio_seconds / (_SEGMENT_SPEED * segments)
+    upload_seconds = max(0, size_bytes) / _UPLOAD_BYTES_PER_SECOND
+    return max(
+        15.0, _REQUEST_OVERHEAD_SECONDS + upload_seconds + transcribe_seconds
+    )
+
+
 class ElevenLabsTranscriber(Transcriber):
     """Batch Scribe transcription through the official SDK."""
 
@@ -488,7 +528,7 @@ class ElevenLabsTranscriber(Transcriber):
                 f"limit of {MAX_UPLOAD_SECONDS / 3600:.1f} h; split the input "
                 "or use a Whisper backend"
             )
-        estimate = max(30.0, (duration or 600.0) * 0.1)
+        estimate = estimate_convert_seconds(duration, audio.stat().st_size)
         async with ElapsedProgressTicker(estimate, on_progress):
             response = await self._convert(
                 audio, diarize=self.settings.elevenlabs.diarize

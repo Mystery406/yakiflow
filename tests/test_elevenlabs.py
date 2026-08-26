@@ -9,6 +9,7 @@ from yakiflow.elevenlabs import (
     ElevenLabsTranscriber,
     cues_from_words,
     dispatchable_word_count,
+    estimate_convert_seconds,
     normalize_speaker,
     qualified_silences,
     split_word_batches,
@@ -232,6 +233,31 @@ def _write_wav(path: Path, seconds: float = 2.0) -> None:
         writer.setsampwidth(2)
         writer.setframerate(16000)
         writer.writeframes(b"\x00\x00" * int(16000 * seconds))
+
+
+def test_convert_estimate_follows_the_parallel_segment_split() -> None:
+    # The API transcribes a request as ``min(4, ceil(duration / 480))``
+    # internally parallel segments, so between 8 and 32 minutes the extra
+    # audio arrives with the extra workers and the estimate stays flat.
+    assert estimate_convert_seconds(480.0, 0) == estimate_convert_seconds(1920.0, 0)
+    # Past four segments there is no further speedup: twice the audio, twice
+    # the transcription time.
+    saturated = estimate_convert_seconds(3840.0, 0)
+    assert estimate_convert_seconds(7680.0, 0) == pytest.approx(2 * saturated - 8.0)
+
+
+def test_convert_estimate_counts_the_upload() -> None:
+    hour = 3600.0
+    uploaded = estimate_convert_seconds(hour, 32000 * int(hour))
+    assert uploaded > estimate_convert_seconds(hour, 0)
+    # Still well under real time: the bar should not crawl as if the request
+    # ran at the speed of the audio.
+    assert uploaded < hour / 10
+
+
+def test_convert_estimate_holds_a_floor_and_survives_unknown_duration() -> None:
+    assert estimate_convert_seconds(2.0, 64000) == 15.0
+    assert estimate_convert_seconds(None, 0) > 15.0
 
 
 def test_transcribe_sends_the_documented_parameters(tmp_path: Path) -> None:
