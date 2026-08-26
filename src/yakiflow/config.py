@@ -563,8 +563,11 @@ def validate_run_settings(settings: Settings) -> None:
 
         elevenlabs_api_key(settings)
     num_speakers = settings.elevenlabs.num_speakers
-    if num_speakers is not None and num_speakers < 1:
-        raise ValueError("elevenlabs.num-speakers must be at least 1")
+    if num_speakers is not None and not 1 <= num_speakers <= 32:
+        raise ValueError(
+            "elevenlabs.num-speakers must be between 1 and 32, the most "
+            "speakers diarization separates"
+        )
     for stage_name in ("draft", "final"):
         stage = getattr(settings.agent, stage_name)
         if stage.backend is None:

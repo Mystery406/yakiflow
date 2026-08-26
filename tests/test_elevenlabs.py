@@ -400,7 +400,7 @@ def test_overlong_audio_is_rejected_before_upload(tmp_path: Path) -> None:
         writer.setnchannels(1)
         writer.setsampwidth(2)
         writer.setframerate(1)
-        writer.writeframes(b"\x00\x00" * 17000)
+        writer.writeframes(b"\x00\x00" * 40000)
     client = FakeClient([])
     db = JobDatabase(tmp_path / "job.sqlite3")
     transcriber = ElevenLabsTranscriber(

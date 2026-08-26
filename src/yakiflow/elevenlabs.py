@@ -45,10 +45,9 @@ PAUSE_SPLIT_SECONDS = 0.8
 SENTENCE_END_CHARS = ".?!。？！…"
 _CLOSING_QUOTES = "\"'”’»›』」）)]"
 
-# The batch API accepts files up to 5 GB, but 16 kHz mono PCM reaches that
-# only after far more audio than a session should hold; 4.5 hours is the
-# documented duration ceiling.
-MAX_UPLOAD_SECONDS = 16200.0
+# The documented ceilings are 10 hours of audio in a file of at most 3 GB.
+# Duration is the binding one here: 10 hours of 16 kHz mono PCM is ~1.2 GB.
+MAX_UPLOAD_SECONDS = 36000.0
 
 _NO_KEY_ERROR = (
     "no ElevenLabs API key is configured; provide one via "

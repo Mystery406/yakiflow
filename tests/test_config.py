@@ -475,6 +475,7 @@ def test_whisper_server_url_must_be_http(monkeypatch: pytest.MonkeyPatch) -> Non
         ({"subtitles": {"max-cue-seconds": 0}}, "max-cue-seconds"),
         ({"subtitles": {"max-cue-chars": 4}}, "max-cue-chars"),
         ({"elevenlabs": {"num-speakers": 0}}, "num-speakers"),
+        ({"elevenlabs": {"num-speakers": 33}}, "num-speakers"),
         ({"stream": {"chunk-seconds": 0}}, "stream.chunk-seconds"),
         ({"stream": {"context-seconds": -1}}, "stream.context-seconds"),
         ({"output_mode": "both"}, "output-mode"),
