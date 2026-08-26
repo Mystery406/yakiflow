@@ -268,7 +268,9 @@ def test_transcribe_sends_the_documented_parameters(tmp_path: Path) -> None:
     ], language_code="pt-BR")
     client = FakeClient([response])
     db = JobDatabase(tmp_path / "job.sqlite3")
-    settings = _settings(elevenlabs={"num-speakers": 3})
+    settings = _settings(
+        elevenlabs={"num-speakers": 3, "use-speaker-library": True}
+    )
     transcriber = ElevenLabsTranscriber(
         settings, tmp_path, db, client_factory=lambda: client
     )
@@ -280,6 +282,7 @@ def test_transcribe_sends_the_documented_parameters(tmp_path: Path) -> None:
     assert call["language_code"] == "en"
     assert call["diarize"] is True
     assert call["num_speakers"] == 3
+    assert call["use_speaker_library"] is True
     assert call["tag_audio_events"] is False
     assert "file" in call
     assert db.get_checkpoint("detected_source_language") == "pt"
@@ -289,14 +292,16 @@ def test_transcribe_sends_the_documented_parameters(tmp_path: Path) -> None:
     db.close()
 
 
-def test_transcribe_omits_auto_language_and_unset_num_speakers(
+def test_transcribe_omits_auto_language_and_unrequested_options(
     tmp_path: Path,
 ) -> None:
     audio = tmp_path / "reference.wav"
     _write_wav(audio)
     client = FakeClient([FakeConvertResponse([])])
     db = JobDatabase(tmp_path / "job.sqlite3")
-    settings = _settings(source_language="auto")
+    settings = _settings(
+        source_language="auto", elevenlabs={"use-speaker-library": False}
+    )
     transcriber = ElevenLabsTranscriber(
         settings, tmp_path, db, client_factory=lambda: client
     )
@@ -306,6 +311,7 @@ def test_transcribe_omits_auto_language_and_unset_num_speakers(
     call = client.speech_to_text.calls[0]
     assert "language_code" not in call
     assert "num_speakers" not in call
+    assert "use_speaker_library" not in call
     db.close()
 
 
@@ -317,7 +323,10 @@ def test_chunks_force_diarization_off(tmp_path: Path) -> None:
     ])])
     db = JobDatabase(tmp_path / "job.sqlite3")
     transcriber = ElevenLabsTranscriber(
-        _settings(), tmp_path, db, client_factory=lambda: client
+        _settings(elevenlabs={"num-speakers": 3, "use-speaker-library": True}),
+        tmp_path,
+        db,
+        client_factory=lambda: client,
     )
 
     incoming = asyncio.run(transcriber.submit_chunk(audio, 30.0))
@@ -325,6 +334,7 @@ def test_chunks_force_diarization_off(tmp_path: Path) -> None:
     call = client.speech_to_text.calls[0]
     assert call["diarize"] is False
     assert "num_speakers" not in call
+    assert "use_speaker_library" not in call
     assert [cue.start for cue in incoming] == [30.1]
     db.close()
 

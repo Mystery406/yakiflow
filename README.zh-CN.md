@@ -294,6 +294,7 @@ backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenla
 # realtime-model = "scribe_v2_realtime"
 # diarize = true          # 说话人识别（仅批量 API）
 # num-speakers = 3        # 可选的说话人数提示
+# use-speaker-library = true  # 与工作区的说话人库比对，识别已知说话人
 
 [alignment]
 # backend = "vad"         # vad | whisperx | none

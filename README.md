@@ -312,6 +312,7 @@ backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenla
 # realtime-model = "scribe_v2_realtime"
 # diarize = true          # speaker recognition (batch API only)
 # num-speakers = 3        # optional speaker-count hint
+# use-speaker-library = true  # match speakers against the workspace library
 
 [alignment]
 # backend = "vad"         # vad | whisperx | none

@@ -78,6 +78,7 @@ class ElevenLabsSettings:
     realtime_model: str = "scribe_v2_realtime"
     diarize: bool = True
     num_speakers: int | None = None
+    use_speaker_library: bool = True
     # Set by ``load_settings`` when the command line won the API-key slot, so
     # key resolution can rank that ahead of the environment variable. Internal:
     # a configuration file cannot set it, but a stored job round-trips it.

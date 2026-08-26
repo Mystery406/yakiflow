@@ -471,6 +471,8 @@ class ElevenLabsTranscriber(Transcriber):
             kwargs["language_code"] = self.settings.source_language
         if diarize and self.settings.elevenlabs.num_speakers is not None:
             kwargs["num_speakers"] = self.settings.elevenlabs.num_speakers
+        if diarize and self.settings.elevenlabs.use_speaker_library:
+            kwargs["use_speaker_library"] = True
         return kwargs
 
     async def _convert(self, audio: Path, *, diarize: bool) -> Any:
