@@ -215,6 +215,48 @@ def _get(item: Any, key: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
+def _jsonable(value: Any) -> Any:
+    """Best plain-data rendering of an SDK typed object, for ``json.dumps``."""
+    for method in ("model_dump", "dict"):
+        fn = getattr(value, method, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                break
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return str(value)
+
+
+def save_raw_response(
+    work_dir: Path, name: str, payload: Any, *, append: bool = False
+) -> None:
+    """Keep a complete API response on disk under ``stt-responses/``.
+
+    Transcription consumes only a few fields of each response and discards
+    the rest, so the verbatim payload is what settles questions like "did the
+    API really return those zero-width words". Best-effort by design: a
+    serialization or filesystem hiccup must never disturb transcription.
+    """
+    import json
+
+    try:
+        directory = work_dir / "stt-responses"
+        directory.mkdir(parents=True, exist_ok=True)
+        if append:
+            line = json.dumps(payload, ensure_ascii=False, default=_jsonable)
+            with (directory / name).open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        else:
+            text = json.dumps(
+                payload, ensure_ascii=False, indent=2, default=_jsonable
+            )
+            (directory / name).write_text(text + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def words_from_response(items: Sequence[Any], *, offset: float = 0.0) -> list[Word]:
     """Normalize an API word list: fold spacing, drop audio events.
 
@@ -555,6 +597,7 @@ class ElevenLabsTranscriber(Transcriber):
             response = await self._convert(
                 audio, diarize=self.settings.elevenlabs.diarize
             )
+        save_raw_response(self.work_dir, "transcribe.json", response)
         language = normalize_source_language(_get(response, "language_code"))
         if language:
             self.db.checkpoint("detected_source_language", language)
@@ -575,6 +618,7 @@ class ElevenLabsTranscriber(Transcriber):
         # stable between independent requests, and the preview is provisional
         # anyway.
         response = await self._convert(wav, diarize=False)
+        save_raw_response(self.work_dir, f"chunk-{offset:.2f}s.json", response)
         words = words_from_response(
             _get(response, "words", []) or [], offset=offset
         )
@@ -817,10 +861,26 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
 
     # --- shared event handling ---
 
+    def _log_raw_event(self, kind: str, data: Any) -> None:
+        """Append one received event to the raw session log.
+
+        The full session log, not just words: close/error events are exactly
+        what a post-mortem of a broken stream needs. Times in word events are
+        session-relative; session_base recovers the media timeline across
+        reconnects.
+        """
+        save_raw_response(
+            self.work_dir,
+            "realtime-events.jsonl",
+            {"kind": kind, "session_base": self._session_base, "event": data},
+            append=True,
+        )
+
     def _handle_events(self, events: Sequence[tuple[str, Any]]) -> bool:
         """Fold received events into the word stream; True when words changed."""
         changed = False
         for kind, data in events:
+            self._log_raw_event(kind, data)
             if kind == "words":
                 incoming = words_from_response(
                     _get(data, "words", []) or [], offset=self._session_base
@@ -874,6 +934,9 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
         session, self._session = self._session, None
         events = session.pending_events()
         await session.close()
+        for kind, data in events:
+            if kind in _SESSION_END_KINDS:
+                self._log_raw_event(kind, data)
         details = [reason] + [
             _describe_event(kind, data)
             for kind, data in events
@@ -1117,6 +1180,7 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
             if event[0] in _SESSION_END_KINDS:
                 # The audio was already fully fed; whatever was committed is
                 # in, so the session ending now is completion, not failure.
+                self._log_raw_event(*event)
                 break
             if self._handle_events([event]):
                 await emit_new_preview()

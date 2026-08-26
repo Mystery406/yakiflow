@@ -158,6 +158,37 @@ def test_transcribe_feeds_frames_and_persists_words_incrementally(
     db.close()
 
 
+def test_raw_realtime_events_are_logged_with_their_session_base(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    audio = tmp_path / "reference.wav"
+    _write_wav(audio, 1.0)
+    session = FakeSession()
+
+    def on_commit() -> None:
+        session.push("words", {"words": [_word_payload("hi", 0.2, 0.6)]})
+        session.push("closed")
+
+    session.on_commit = on_commit
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=lambda: session
+    )
+
+    asyncio.run(transcriber.transcribe(audio))
+
+    log = tmp_path / "stt-responses" / "realtime-events.jsonl"
+    entries = [json.loads(line) for line in log.read_text().splitlines()]
+    words = next(entry for entry in entries if entry["kind"] == "words")
+    assert words["session_base"] == 0.0
+    assert words["event"]["words"][0]["text"] == "hi"
+    # The session log includes lifecycle events, not just transcripts.
+    assert any(entry["kind"] == "closed" for entry in entries)
+    db.close()
+
+
 def test_session_limit_reconnects_with_context_and_deduplicates(
     tmp_path: Path,
 ) -> None:

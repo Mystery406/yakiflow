@@ -367,6 +367,33 @@ def test_chunks_force_diarization_off(tmp_path: Path) -> None:
     db.close()
 
 
+def test_raw_responses_are_saved_verbatim(tmp_path: Path) -> None:
+    import json
+
+    audio = tmp_path / "reference.wav"
+    _write_wav(audio)
+    word = {"type": "word", "text": "hi", "start": 11.44, "end": 11.44}
+    client = FakeClient([
+        FakeConvertResponse([dict(word, speaker_id="speaker_1")]),
+        FakeConvertResponse([word]),
+    ])
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsTranscriber(
+        _settings(), tmp_path, db, client_factory=lambda: client
+    )
+
+    asyncio.run(transcriber.transcribe(audio))
+    asyncio.run(transcriber.submit_chunk(audio, 30.0))
+
+    full = json.loads((tmp_path / "stt-responses" / "transcribe.json").read_text())
+    assert full["words"][0]["speaker_id"] == "speaker_1"
+    assert full["words"][0]["end"] == 11.44
+    chunk = json.loads((tmp_path / "stt-responses" / "chunk-30.00s.json").read_text())
+    # Verbatim: the chunk offset is not folded into the stored timestamps.
+    assert chunk["words"][0]["start"] == 11.44
+    db.close()
+
+
 @pytest.mark.parametrize("status", [401, 403])
 def test_auth_errors_report_the_key_without_retrying(
     tmp_path: Path, status: int
