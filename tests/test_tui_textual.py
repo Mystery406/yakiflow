@@ -55,6 +55,7 @@ def test_pipeline_failure_renders_traceback_in_conversation(tmp_path) -> None:
             self.db = JobDatabase(tmp_path / "job.sqlite3")
             self.work_dir = tmp_path
             self.listener = None
+            self.diarization_enabled = False
 
         async def run(self):
             raise RuntimeError("timing adjustment exploded")
@@ -83,6 +84,7 @@ def test_alignment_model_failure_dialog_requires_retry_or_fallback(tmp_path) -> 
             self.db = JobDatabase(tmp_path / "job.sqlite3")
             self.work_dir = tmp_path
             self.listener = None
+            self.diarization_enabled = False
             self.alignment_model_failure_listener = None
             self.decisions: list[str] = []
 
@@ -116,6 +118,40 @@ def test_alignment_model_failure_dialog_requires_retry_or_fallback(tmp_path) -> 
             assert job.decisions == ["retry", "fallback"]
             assert app.succeeded
         job.db.close()
+
+    asyncio.run(exercise())
+
+
+def test_speaker_column_exists_only_for_diarized_jobs() -> None:
+    class TableApp(App[None]):
+        def compose(self) -> ComposeResult:
+            yield SubtitleTable(id="plain")
+            yield SubtitleTable(id="diarized", show_speaker=True)
+
+    async def exercise() -> None:
+        app = TableApp()
+        async with app.run_test(size=(80, 20)) as pilot:
+            plain = app.query_one("#plain", SubtitleTable)
+            diarized = app.query_one("#diarized", SubtitleTable)
+            assert [str(column.label) for column in plain.columns.values()] == [
+                "No.", "Start", "Source", "Translation",
+            ]
+            assert [str(column.label) for column in diarized.columns.values()] == [
+                "No.", "Start", "Speaker", "Source", "Translation",
+            ]
+
+            cue = Cue("1", 0.0, 1.0, "hello", speaker="Alice")
+            plain.add_subtitle(cue)
+            diarized.add_subtitle(cue)
+            await pilot.pause()
+            assert diarized.get_cell("1", "speaker").plain.strip() == "Alice"
+
+            diarized.update_subtitle(
+                Cue("1", 0.0, 1.0, "hello", speaker="Bob")
+            )
+            plain.update_subtitle(cue)
+            await pilot.pause()
+            assert diarized.get_cell("1", "speaker").plain.strip() == "Bob"
 
     asyncio.run(exercise())
 
@@ -206,6 +242,7 @@ def test_successful_pipeline_exits_for_interactive_agent_handoff(tmp_path) -> No
             self.settings = None
             self.backend = None
             self.listener = None
+            self.diarization_enabled = False
             self.work_dir = tmp_path
 
         async def run(self):
@@ -233,6 +270,7 @@ def test_stop_shortcut_cancels_pipeline_without_immediately_exiting_tui(
             self.db = JobDatabase(tmp_path / "job.sqlite3")
             self.work_dir = tmp_path
             self.listener = None
+            self.diarization_enabled = False
             self.alignment_model_failure_listener = None
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
@@ -284,6 +322,7 @@ def test_resumed_app_loads_all_existing_subtitles(tmp_path) -> None:
             self.settings = None
             self.backend = None
             self.listener = None
+            self.diarization_enabled = False
             self.work_dir = tmp_path
 
         async def run(self):
@@ -322,6 +361,7 @@ def test_timeline_replaced_event_reloads_and_renumbers_rows(tmp_path) -> None:
             self.settings = None
             self.backend = None
             self.listener = None
+            self.diarization_enabled = False
             self.work_dir = tmp_path
 
         async def run(self):
@@ -358,6 +398,7 @@ def test_f2_agent_inspector_shows_conversation_and_tool_calls(tmp_path) -> None:
             self.settings = None
             self.backend = None
             self.listener = None
+            self.diarization_enabled = False
             self.work_dir = tmp_path
 
         async def run(self):

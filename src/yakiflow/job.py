@@ -247,6 +247,18 @@ class YakiFlowJob:
         return self.settings.transcription.backend.startswith("elevenlabs")
 
     @property
+    def diarization_enabled(self) -> bool:
+        """Whether cues can carry speakers.
+
+        Only the batch ElevenLabs backend diarizes; the realtime backend and
+        the Whisper backends never label speakers.
+        """
+        return (
+            self.settings.transcription.backend == "elevenlabs"
+            and self.settings.elevenlabs.diarize
+        )
+
+    @property
     def media_path(self) -> Path | None:
         """The original or downloaded media file used by this job."""
         if self._artifact is not None:

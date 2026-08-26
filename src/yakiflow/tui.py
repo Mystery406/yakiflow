@@ -50,10 +50,18 @@ def subtitle_text_widths(
     *,
     start_width: int = 8,
     ordinal_width: int = 5,
+    speaker_width: int = 0,
     cell_padding: int = 1,
 ) -> tuple[int, int]:
-    """Split the actual table viewport without creating horizontal overflow."""
+    """Split the actual table viewport without creating horizontal overflow.
+
+    ``speaker_width`` is 0 when the table has no Speaker column; the column's
+    two cell paddings are then not rendered either, so they are counted only
+    alongside a real width.
+    """
     fixed_render_width = start_width + ordinal_width + 4 * cell_padding
+    if speaker_width:
+        fixed_render_width += speaker_width + 2 * cell_padding
     text_column_padding = 4 * cell_padding
     available = max(2, viewport_width - fixed_render_width - text_column_padding)
     source_width = available // 2
@@ -244,13 +252,18 @@ class FollowTailMixin:
 class SubtitleTable(FollowTailMixin, DataTable, can_focus=True):
     """Virtualized subtitle rows, keyed by the stable Whisper cue ID."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, show_speaker: bool = False, **kwargs):
         super().__init__(
             show_cursor=False, cursor_type="none", zebra_stripes=True,
             cell_padding=1, **kwargs,
         )
+        # Only present when the backend diarizes: every other run would show a
+        # permanently empty column and waste subtitle width on it.
+        self.show_speaker = show_speaker
         self.add_column("No.", width=5, key="ordinal")
         self.add_column("Start", width=8, key="start")
+        if show_speaker:
+            self.add_column("Speaker", width=10, key="speaker")
         self.add_column("Source", width=30, key="source")
         self.add_column("Translation", width=30, key="translation")
         self._init_follow_tail()
@@ -260,6 +273,9 @@ class SubtitleTable(FollowTailMixin, DataTable, can_focus=True):
             self.scrollable_content_region.width,
             start_width=self.columns["start"].width,
             ordinal_width=self.columns["ordinal"].width,
+            speaker_width=(
+                self.columns["speaker"].width if self.show_speaker else 0
+            ),
             cell_padding=self.cell_padding,
         )
         source = self.columns["source"]
@@ -272,14 +288,15 @@ class SubtitleTable(FollowTailMixin, DataTable, can_focus=True):
         self._remeasure_rows(self.rows)
 
     def add_subtitle(self, cue: Cue) -> None:
-        self.add_row(
+        cells = [
             subtitle_cell(subtitle_ordinal(cue), no_wrap=True),
             subtitle_cell(format_start_time(cue.start), no_wrap=True),
-            subtitle_cell(cue.source),
-            subtitle_cell((cue.translated or "").strip()),
-            height=None,
-            key=cue.id,
-        )
+        ]
+        if self.show_speaker:
+            cells.append(subtitle_cell(cue.speaker or ""))
+        cells.append(subtitle_cell(cue.source))
+        cells.append(subtitle_cell((cue.translated or "").strip()))
+        self.add_row(*cells, height=None, key=cue.id)
 
     def update_subtitle(self, cue: Cue) -> None:
         self.update_cell(
@@ -288,6 +305,8 @@ class SubtitleTable(FollowTailMixin, DataTable, can_focus=True):
         self.update_cell(
             cue.id, "start", subtitle_cell(format_start_time(cue.start), no_wrap=True)
         )
+        if self.show_speaker:
+            self.update_cell(cue.id, "speaker", subtitle_cell(cue.speaker or ""))
         self.update_cell(cue.id, "source", subtitle_cell(cue.source))
         self.update_cell(
             cue.id,
@@ -642,7 +661,9 @@ class YakiFlowApp(App[None]):
             yield Static("Current stage · Starting…", id="status")
             yield Static("Overall progress", id="progress-label")
             yield PipelineProgressBar(total=100, id="progress")
-            recent = SubtitleTable(id="recent")
+            recent = SubtitleTable(
+                id="recent", show_speaker=self.job.diarization_enabled
+            )
             recent.border_title = "Subtitles"
             recent.border_subtitle = "↑/↓ · PgUp/PgDn · ^Home/^End"
             yield recent
