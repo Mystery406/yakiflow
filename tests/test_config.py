@@ -1,3 +1,4 @@
+import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -584,6 +585,43 @@ def test_keyring_is_the_last_resort(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = make_settings().resolved()
     assert elevenlabs_api_key(settings) == "sk-keyring"
     assert elevenlabs_api_key_source(settings) == "keyring"
+
+
+def test_keyring_key_is_fetched_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeKeyring:
+        @staticmethod
+        def get_password(service: str, entry: str) -> str:
+            calls.append((service, entry))
+            return "sk-cached"
+
+    monkeypatch.setitem(sys.modules, "keyring", FakeKeyring())
+    monkeypatch.setattr(elevenlabs_module, "_keyring_cached_key", None)
+    assert elevenlabs_module._keyring_key() == "sk-cached"
+    assert elevenlabs_module._keyring_key() == "sk-cached"
+    assert len(calls) == 1
+
+
+def test_keyring_key_missing_result_is_not_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only a found key is worth caching: a lookup that produced nothing may
+    # be a transient Secret Service failure, and pinning it would turn every
+    # later call into "no key" for the rest of the process.
+    results = [None, "sk-late"]
+
+    class FakeKeyring:
+        @staticmethod
+        def get_password(service: str, entry: str) -> str | None:
+            return results.pop(0)
+
+    monkeypatch.setitem(sys.modules, "keyring", FakeKeyring())
+    monkeypatch.setattr(elevenlabs_module, "_keyring_cached_key", None)
+    assert elevenlabs_module._keyring_key() is None
+    assert elevenlabs_module._keyring_key() == "sk-late"
 
 
 def test_missing_key_lists_every_source(monkeypatch: pytest.MonkeyPatch) -> None:

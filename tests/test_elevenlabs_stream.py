@@ -11,6 +11,7 @@ from yakiflow.database import JobDatabase
 from yakiflow.elevenlabs import (
     ElevenLabsRealtimeTranscriber,
     _RealtimeSession,
+    _SessionEnded,
     merge_streamed_words,
 )
 from yakiflow.models import Word
@@ -275,6 +276,147 @@ def test_chunks_share_one_session_and_send_only_new_bytes(tmp_path: Path) -> Non
     asyncio.run(transcriber.close_chunks())
     assert session.committed and session.closed
     db.close()
+
+
+def test_start_chunks_defers_the_connection(tmp_path: Path) -> None:
+    chunk = tmp_path / "chunk.wav"
+    _write_wav(chunk, 1.0)
+    made: list[FakeSession] = []
+
+    def factory() -> FakeSession:
+        made.append(FakeSession())
+        return made[-1]
+
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=factory
+    )
+
+    async def exercise() -> None:
+        # The download spins up for many seconds before the first chunk; a
+        # socket opened here would sit idle until the server closed it.
+        await transcriber.start_chunks()
+        assert made == []
+        await transcriber.submit_chunk(chunk, 0.0)
+
+    asyncio.run(exercise())
+    assert len(made) == 1
+    db.close()
+
+
+def test_preview_send_failure_reconnects_on_the_next_chunk(
+    tmp_path: Path,
+) -> None:
+    chunk1 = tmp_path / "chunk1.wav"
+    chunk2 = tmp_path / "chunk2.wav"
+    _write_wav(chunk1, 1.0)
+    _write_wav(chunk2, 1.0)
+    first = FakeSession()
+    second = FakeSession()
+    sessions = deque([first, second])
+
+    def failing_send(count: int) -> None:
+        raise _SessionEnded("connection closed: received 1000 (OK)")
+
+    first.on_send = failing_send
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=lambda: sessions.popleft()
+    )
+
+    async def exercise() -> None:
+        assert await transcriber.submit_chunk(chunk1, 0.0) == []
+        await transcriber.submit_chunk(chunk2, 1.0)
+
+    asyncio.run(exercise())
+    assert first.closed
+    # The dead session was discarded, not resent to: the next chunk opened a
+    # fresh session and fed its full second of audio.
+    assert [len(chunk) for chunk in second.sent] == [32000]
+    db.close()
+
+
+def test_preview_send_failure_surfaces_the_servers_error(
+    tmp_path: Path,
+) -> None:
+    chunk = tmp_path / "chunk.wav"
+    _write_wav(chunk, 1.0)
+    session = FakeSession()
+
+    def failing_send(count: int) -> None:
+        session.push("error", {"message_type": "auth_error"})
+        session.push("closed")
+        raise _SessionEnded("connection closed")
+
+    session.on_send = failing_send
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=lambda: session
+    )
+
+    with pytest.raises(RuntimeError, match="realtime error.*auth_error"):
+        asyncio.run(transcriber.submit_chunk(chunk, 0.0))
+    assert session.closed
+    db.close()
+
+
+def test_session_end_error_event_stops_the_reconnect_loop(
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "reference.wav"
+    _write_wav(audio, 2.0)
+    made: list[FakeSession] = []
+
+    def factory() -> FakeSession:
+        session = FakeSession()
+
+        def on_send(count: int) -> None:
+            session.push("error", {"message_type": "quota_exceeded"})
+            raise _SessionEnded("connection closed")
+
+        session.on_send = on_send
+        made.append(session)
+        return session
+
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=factory
+    )
+
+    # A quota or auth error will fail every reconnect the same way; surface
+    # it immediately instead of burning the retry budget on it.
+    with pytest.raises(RuntimeError, match="realtime error.*quota_exceeded"):
+        asyncio.run(transcriber.transcribe(audio))
+    assert len(made) == 1
+    assert made[0].closed
+    db.close()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("websockets") is None,
+    reason="the websockets package is not installed",
+)
+def test_transport_turns_a_closed_connection_into_a_session_end() -> None:
+    from websockets import frames
+    from websockets.exceptions import ConnectionClosedOK
+
+    closed = ConnectionClosedOK(
+        frames.Close(1000, ""), frames.Close(1000, ""), True
+    )
+
+    class DeadConnection:
+        async def send(self, payload) -> None:
+            raise closed
+
+        async def commit(self) -> None:
+            raise closed
+
+    session = _RealtimeSession(_settings())
+    session._connection = DeadConnection()
+    with pytest.raises(_SessionEnded):
+        asyncio.run(session.send_pcm(b"\x00\x00"))
+    with pytest.raises(_SessionEnded):
+        asyncio.run(session.commit())
 
 
 @pytest.mark.skipif(

@@ -119,17 +119,31 @@ def _slot_key(settings: Settings) -> str | None:
     return key
 
 
+_keyring_cached_key: str | None = None
+
+
 def _keyring_key() -> str | None:
+    """Fetch the keyring key at most once per process.
+
+    A key that resolved when the job started must keep resolving for the rest
+    of the run: a Secret Service hiccup hours in would otherwise resurface as
+    "no API key is configured" and fail work the key already authorized.
+    """
+    global _keyring_cached_key
+    if _keyring_cached_key is not None:
+        return _keyring_cached_key
     try:
         import keyring
     except ImportError:
         return None
     try:
-        return keyring.get_password(KEYRING_SERVICE, KEYRING_ENTRY) or None
+        key = keyring.get_password(KEYRING_SERVICE, KEYRING_ENTRY) or None
     except Exception:
         # An unavailable Secret Service backend means this layer has no key,
         # the same as when the optional dependency is not installed at all.
-        return None
+        key = None
+    _keyring_cached_key = key
+    return key
 
 
 def elevenlabs_api_key(settings: Settings) -> str:
@@ -679,16 +693,26 @@ class _RealtimeSession:
     async def send_pcm(self, pcm: bytes) -> None:
         import base64
 
+        from websockets.exceptions import ConnectionClosed
+
         payload: dict[str, Any] = {
             "audio_base_64": base64.b64encode(pcm).decode("ascii"),
         }
         if self._first_send and self._previous_text:
             payload["previous_text"] = self._previous_text
         self._first_send = False
-        await self._connection.send(payload)
+        try:
+            await self._connection.send(payload)
+        except ConnectionClosed as exc:
+            raise _SessionEnded(f"connection closed: {exc}") from exc
 
     async def commit(self) -> None:
-        await self._connection.commit()
+        from websockets.exceptions import ConnectionClosed
+
+        try:
+            await self._connection.commit()
+        except ConnectionClosed as exc:
+            raise _SessionEnded(f"connection closed: {exc}") from exc
 
     def pending_events(self) -> list[tuple[str, Any]]:
         events: list[tuple[str, Any]] = []
@@ -779,17 +803,35 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
             max_cue_chars=self.settings.subtitles.max_cue_chars,
         )
 
+    async def _absorb_session_end(self) -> None:
+        """Close the ended session, but read what the server said first.
+
+        The close often trails an explicit error event (auth, quota, terms);
+        replaying the drained events turns that into the RuntimeError the
+        caller sees instead of a bare disconnect.
+        """
+        session, self._session = self._session, None
+        self._fed_end = None
+        events = [
+            event for event in session.pending_events()
+            if event[0] not in {"session_limit", "closed"}
+        ]
+        await session.close()
+        self._handle_events(events)
+
     # --- chunk previews: one continuous session, new bytes only ---
 
     async def start_chunks(self) -> None:
-        self._session = self._session_factory()
-        await self._session.open()
+        # The server closes a session that sits idle while the download spins
+        # up, so the socket opens lazily with the first chunk instead.
+        return
 
     async def submit_chunk(self, wav: Path, offset: float) -> list[Cue]:
         import wave
 
         if self._session is None:
-            await self.start_chunks()
+            self._session = self._session_factory()
+            await self._session.open()
         with wave.open(str(wav), "rb") as reader:
             parameters = reader.getparams()
             frames = reader.readframes(parameters.nframes)
@@ -805,17 +847,15 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
         skip_seconds = max(0.0, self._fed_end - offset)
         skip_bytes = min(len(frames), round(skip_seconds * bytes_per_second))
         fresh = frames[skip_bytes:]
-        if fresh:
-            await self._session.send_pcm(fresh)
-            self._fed_end = max(self._fed_end, offset + duration)
         try:
+            if fresh:
+                await self._session.send_pcm(fresh)
+                self._fed_end = max(self._fed_end, offset + duration)
             self._handle_events(self._session.pending_events())
         except _SessionEnded:
             # A capped preview session simply reconnects on the next chunk;
             # the authoritative pass owns durable delivery.
-            await self._session.close()
-            self._session = None
-            self._fed_end = None
+            await self._absorb_session_end()
         preview = self._preview()
         self._chunk_timeline.cues = preview
         fresh_cues = [
@@ -870,8 +910,7 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
                 await self._feed(audio, start_at, duration, on_event, on_progress)
                 break
             except _SessionEnded:
-                await self._session.close()
-                self._session = None
+                await self._absorb_session_end()
                 reconnects += 1
                 if reconnects > _MAX_RECONNECTS:
                     raise RuntimeError(
