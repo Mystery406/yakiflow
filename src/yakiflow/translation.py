@@ -1530,6 +1530,7 @@ class TranslationPipeline:
         preceding: Sequence[Cue],
         following: Sequence[Word],
         errors: Sequence[str] = (),
+        previous: dict[str, Any] | None = None,
     ) -> str:
         def word_payload(word: Word) -> dict[str, Any]:
             payload: dict[str, Any] = {
@@ -1562,6 +1563,10 @@ class TranslationPipeline:
                 "validation. Fix these problems and answer again:\n"
                 + "\n".join(f"- {error}" for error in errors)
             )
+            if previous is not None:
+                text += "\nThe rejected response, for reference:\n" + json.dumps(
+                    previous, ensure_ascii=False
+                )
         return text
 
     def _cues_from_word_response(
@@ -1717,13 +1722,16 @@ class TranslationPipeline:
         effort = draft.effort or "low"
         attempts = draft.max_attempts
         errors: list[str] = []
+        previous: dict[str, Any] | None = None
         summary = f"Segment and translate {label}"
         await self._emit_agent(
             operation_id, "user_message", summary,
             model=model, attempt=1, max_attempts=attempts,
         )
         for attempt in range(1, attempts + 1):
-            prompt = self._word_prompt(batch_words, preceding, following, errors)
+            prompt = self._word_prompt(
+                batch_words, preceding, following, errors, previous
+            )
             batch_id = self.db.start_batch(
                 [label],
                 self.backend.name,
@@ -1749,6 +1757,7 @@ class TranslationPipeline:
                     event_id=event.event_id, detail=event.detail,
                 )
 
+            raw: dict[str, Any] | None = None
             try:
                 async with asyncio.timeout(draft.timeout_seconds):
                     raw = await self.backend.invoke_with_trace(
@@ -1799,9 +1808,11 @@ class TranslationPipeline:
                         raise
                     raise error from exc
                 if isinstance(exc, ValueError):
-                    # The mechanical findings ride along on the retry so the
-                    # agent fixes what was actually wrong.
+                    # The mechanical findings and the rejected response ride
+                    # along on the retry so the agent fixes what was actually
+                    # wrong. ``raw`` stays None when the response never parsed.
                     errors = [str(exc)]
+                    previous = raw
                 await self._emit_agent(
                     operation_id, "lifecycle",
                     f"Retrying attempt {attempt + 1}/{attempts}",

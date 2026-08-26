@@ -165,6 +165,9 @@ def test_invalid_response_is_fed_back_with_word_ordinals_and_retried(
     assert "mechanical validation" in retry_prompt
     # The uncovered word ordinals are quoted back.
     assert "not covered by any cue: [1, 2, 5]" in retry_prompt
+    # The rejected response itself rides along for reference.
+    assert "The rejected response" in retry_prompt
+    assert "T:incomplete" in retry_prompt
     db.close()
 
 
