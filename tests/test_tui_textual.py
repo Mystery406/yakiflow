@@ -390,6 +390,82 @@ def test_timeline_replaced_event_reloads_and_renumbers_rows(tmp_path) -> None:
     asyncio.run(exercise())
 
 
+def test_resumed_app_sorts_mid_draft_word_rows_by_time(tmp_path) -> None:
+    class FakeJob:
+        def __init__(self) -> None:
+            self.db = JobDatabase(tmp_path / "job.sqlite3")
+            # Batches land in completion order, not time order.
+            self.db.upsert_cues([
+                Cue("w40-59", 8.0, 11.0, "tail", "尾"),
+                Cue("w0-19", 0.0, 3.0, "head", "头"),
+            ])
+            self.memory_store = MemoryStore(tmp_path / "memory.md")
+            self.settings = None
+            self.backend = None
+            self.listener = None
+            self.diarization_enabled = False
+            self.work_dir = tmp_path
+
+        async def run(self):
+            return []
+
+        def finish_review(self) -> None:
+            pass
+
+    async def exercise() -> None:
+        job = FakeJob()
+        app = YakiFlowApp(job)
+        async with app.run_test(size=(80, 30)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#recent", SubtitleTable)
+            assert list(table.rows) == ["w0-19", "w40-59"]
+        job.db.close()
+
+    asyncio.run(exercise())
+
+
+def test_timeline_replaced_event_with_cues_uses_the_payload_view(tmp_path) -> None:
+    class FakeJob:
+        def __init__(self) -> None:
+            self.db = JobDatabase(tmp_path / "job.sqlite3")
+            # A stale durable row proves the payload, not the database, wins.
+            self.db.upsert_cues([Cue("stale", 0, 1, "stale")])
+            self.memory_store = MemoryStore(tmp_path / "memory.md")
+            self.settings = None
+            self.backend = None
+            self.listener = None
+            self.diarization_enabled = False
+            self.work_dir = tmp_path
+
+        async def run(self):
+            await self.listener(JobEvent(
+                "timeline-replaced",
+                "partial draft timeline updated",
+                cues=[
+                    Cue("w0-2", 0.1, 0.6, "first words", "第一句"),
+                    Cue("preview-1", 0.6, 1.2, "still transcribing"),
+                ],
+            ))
+            return []
+
+        def finish_review(self) -> None:
+            pass
+
+    async def exercise() -> None:
+        job = FakeJob()
+        app = YakiFlowApp(job)
+        async with app.run_test(size=(80, 30)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#recent", SubtitleTable)
+            assert list(table.rows) == ["w0-2", "preview-1"]
+            assert table.get_cell("w0-2", "translation").plain.rstrip() == "第一句"
+            assert app.whisper_cues == 2
+            assert app.processed_ids == {"w0-2"}
+        job.db.close()
+
+    asyncio.run(exercise())
+
+
 def test_f2_agent_inspector_shows_conversation_and_tool_calls(tmp_path) -> None:
     class FakeJob:
         def __init__(self) -> None:

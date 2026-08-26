@@ -1,4 +1,4 @@
-from yakiflow.models import Cue, preview_cue_id
+from yakiflow.models import Cue, preview_cue_id, word_cue_id
 from yakiflow.tui import (
     format_start_time,
     subtitle_ordinal,
@@ -38,4 +38,7 @@ def test_subtitle_columns_make_room_for_the_speaker_column() -> None:
 
 def test_subtitle_ordinal_is_blank_until_the_cue_split_is_settled() -> None:
     assert subtitle_ordinal(Cue(preview_cue_id(3), 0.0, 1.0, "hello")) == ""
+    # Word-range agent cues are renumbered at install, so their provisional
+    # IDs stay out of the No. column as well.
+    assert subtitle_ordinal(Cue(word_cue_id(12, 208), 0.0, 1.0, "hello")) == ""
     assert subtitle_ordinal(Cue("3", 0.0, 1.0, "hello")) == "3"

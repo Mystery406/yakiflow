@@ -13,7 +13,7 @@ from yakiflow.alignment import AlignmentResult
 from yakiflow.job import YakiFlowJob
 from yakiflow.media import MediaArtifact, MediaSource
 from yakiflow.memory import MemoryDestinationConflict
-from yakiflow.models import AgentTraceEvent, Cue, TranscriptEvent
+from yakiflow.models import AgentTraceEvent, Cue, JobEvent, TranscriptEvent
 from yakiflow.process import ProcessResult
 from yakiflow.subtitles import ASS_HEADER, AssEvent, render_ass, render_events
 from yakiflow.translation import AgentBackend
@@ -1429,6 +1429,43 @@ def test_external_whisper_server_job_needs_no_local_model(tmp_path: Path) -> Non
     job.close()
 
 
+def test_word_timeline_view_maintains_time_order_incrementally() -> None:
+    from yakiflow.job import WordTimelineView
+
+    preview = [
+        Cue("preview-1", 0.0, 3.0, "one", metadata={"word_range": [0, 5]}),
+        Cue("preview-2", 4.0, 7.0, "two", metadata={"word_range": [6, 11]}),
+        Cue("preview-3", 8.0, 11.0, "three", metadata={"word_range": [12, 17]}),
+    ]
+    view = WordTimelineView([], preview)
+    assert [cue.id for cue in view.cues()] == ["preview-1", "preview-2", "preview-3"]
+
+    # A middle batch lands first: it retires exactly the preview rows whose
+    # words it covers and enters at its time position, no re-sort involved.
+    view.apply([
+        Cue("w9-11", 5.5, 7.0, "two b", "二乙", metadata={"word_range": [9, 11]}),
+        Cue("w6-8", 4.0, 5.5, "two a", "二甲", metadata={"word_range": [6, 8]}),
+    ])
+    assert [cue.id for cue in view.cues()] == [
+        "preview-1", "w6-8", "w9-11", "preview-3",
+    ]
+
+    # A junction repair replaces both halves with one combined cue.
+    view.apply(
+        [Cue("w6-11", 4.0, 7.0, "two", "二", metadata={"word_range": [6, 11]})],
+        ["w6-8", "w9-11"],
+    )
+    assert [cue.id for cue in view.cues()] == ["preview-1", "w6-11", "preview-3"]
+
+    view.apply([Cue("w0-5", 0.0, 3.0, "one", "一", metadata={"word_range": [0, 5]})])
+    view.apply([Cue("w12-17", 8.0, 11.0, "three", "三", metadata={"word_range": [12, 17]})])
+    assert [cue.id for cue in view.cues()] == ["w0-5", "w6-11", "w12-17"]
+
+    # Seeding treats already-covered preview rows as retired.
+    seeded = WordTimelineView(view.cues(), preview)
+    assert [cue.id for cue in seeded.cues()] == ["w0-5", "w6-11", "w12-17"]
+
+
 def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1501,6 +1538,12 @@ def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
     job = YakiFlowJob("input.mp4", settings, backend=WordBackend())
     # The alignment default for word-level backends is none.
     assert job.settings.alignment.backend == "none"
+    events: list[JobEvent] = []
+
+    async def listener(event: JobEvent) -> None:
+        events.append(event)
+
+    job.listener = listener
     artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
 
     async def run_stages() -> list[Cue]:
@@ -1509,6 +1552,15 @@ def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
         return await job._alignment_stage(artifact, cues)
 
     final = asyncio.run(run_stages())
+
+    # Word-mode cue IDs churn as the agent supersedes the preview, so partial
+    # draft results reach the TUI as whole-view timeline replacements.
+    views = [event.cues for event in events if event.cues is not None]
+    assert views, "no timeline-replaced event carried a replacement view"
+    assert any(
+        all(cue.translated for cue in view) for view in views if view
+    ), "no view showed the drafted batch before the stage finished"
+    assert [cue.id for cue in views[-1]] == ["1", "2"]
 
     assert job.db.get_checkpoint("detected_source_language") == "en"
     assert len(job.db.list_transcript_words()) == 4

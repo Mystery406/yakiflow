@@ -105,12 +105,18 @@ def test_segment_and_translate_replaces_preview_cues_with_a_sorted_timeline(
     db.upsert_cues(preview, stable=False)
     backend = SegmentingBackend()
     pipeline = _pipeline(db, backend)
-    snapshots: list[list[str]] = []
+    deltas: list[tuple[list[str], list[str]]] = []
 
-    async def on_batch(cues) -> None:
-        snapshots.append([cue.id for cue in cues])
+    async def on_batch(added, removed_ids) -> None:
+        deltas.append(([cue.id for cue in added], list(removed_ids)))
 
     final = asyncio.run(pipeline.segment_and_translate(on_batch))
+
+    # Every batch reports its delta, and every added cue is a word-range cue.
+    assert deltas
+    assert all(
+        cue_id.startswith("w") for added, _ in deltas for cue_id in added
+    )
 
     assert [cue.id for cue in final] == [str(i) for i in range(1, len(final) + 1)]
     assert [cue.speaker for cue in final] == ["1", "2", "1"]

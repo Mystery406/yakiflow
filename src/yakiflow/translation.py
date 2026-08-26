@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
 from .config import Settings
 from .database import JobDatabase
-from .models import AgentTraceEvent, Cue, Word
+from .models import AgentTraceEvent, Cue, Word, word_cue_id
 from .process import CommandRunner
 
 if TYPE_CHECKING:
@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
+# One landed word batch as a delta: the cues it added, the IDs it replaced.
+WordBatchCallback = Callable[[list[Cue], list[str]], Awaitable[None]]
 RetryCallback = Callable[[str], Awaitable[None]]
 AgentTraceCallback = Callable[[AgentTraceEvent], Awaitable[None] | None]
 _AGENT_OUTPUT_DETAIL_LIMIT = 100_000
@@ -1056,7 +1058,7 @@ class TranslationPipeline:
 
     def dispatch_ready_word_batches(
         self,
-        on_batch: Callable[[list[Cue]], Awaitable[None]] | None = None,
+        on_batch: WordBatchCallback | None = None,
     ) -> list[asyncio.Task[None]]:
         """Start agent work for word batches a running stream has completed.
 
@@ -1089,25 +1091,28 @@ class TranslationPipeline:
         self,
         batch: WordBatch,
         all_words: Sequence[Word],
-        on_batch: Callable[[list[Cue]], Awaitable[None]] | None,
+        on_batch: WordBatchCallback | None,
     ) -> None:
         async with self._agent_semaphore:
             cues = await self._run_word_batch(list(batch.words), all_words)
         async with self._write_lock:
             self.db.upsert_cues(cues, stable=True)
             if on_batch:
-                await on_batch(self.db.list_cues(stable_only=True))
+                await on_batch(cues, [])
 
     async def segment_and_translate(
         self,
-        on_batch: Callable[[list[Cue]], Awaitable[None]] | None = None,
+        on_batch: WordBatchCallback | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> list[Cue]:
         """Segment the stored word transcript into cues and translate them.
 
-        Returns the finished timeline: sorted by start, renumbered, and
-        installed as the authoritative transcript. The provisional preview
-        cues remain in the database only as retired (non-stable) rows.
+        ``on_batch`` receives each landed batch as a delta — the cues it
+        added and the IDs it replaced — so the caller can maintain its own
+        view without rescanning the timeline. Returns the finished timeline:
+        sorted by start, renumbered, and installed as the authoritative
+        transcript. The provisional preview cues remain in the database only
+        as retired (non-stable) rows.
         """
         words = self.db.list_transcript_words()
         if not words:
@@ -1129,7 +1134,7 @@ class TranslationPipeline:
             async with self._write_lock:
                 self.db.upsert_cues(cues, stable=True)
                 if on_batch:
-                    await on_batch(self.db.list_cues(stable_only=True))
+                    await on_batch(cues, [])
                 completed += 1
                 if on_progress:
                     await on_progress(completed, len(batches))
@@ -1175,7 +1180,7 @@ class TranslationPipeline:
         self,
         words: Sequence[Word],
         boundaries: Sequence[tuple[int, bool]],
-        on_batch: Callable[[list[Cue]], Awaitable[None]] | None,
+        on_batch: WordBatchCallback | None,
     ) -> None:
         """Re-cut suspicious batch boundaries with a small dedicated call.
 
@@ -1221,7 +1226,7 @@ class TranslationPipeline:
                 self.db.delete_cues(replaced)
                 self.db.upsert_cues(new_cues, stable=True)
                 if on_batch:
-                    await on_batch(self.db.list_cues(stable_only=True))
+                    await on_batch(new_cues, replaced)
 
     def _word_system(self) -> str:
         subtitles = self.settings.subtitles
@@ -1397,7 +1402,7 @@ class TranslationPipeline:
                         "the cue"
                     )
             cues.append(Cue(
-                f"w{first}-{last}",
+                word_cue_id(first, last),
                 start,
                 end,
                 source,

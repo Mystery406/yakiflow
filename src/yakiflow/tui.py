@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from .alignment import AlignmentModelFailureDecision
 from .job import YakiFlowJob
 from .media_player import open_media
-from .models import AgentTraceEvent, Cue, JobEvent, is_preview_cue_id
+from .models import (
+    AgentTraceEvent,
+    Cue,
+    JobEvent,
+    is_preview_cue_id,
+    is_word_cue_id,
+)
 
 from rich.text import Text
 from textual import events
@@ -39,10 +45,14 @@ def format_start_time(seconds: float) -> str:
 def subtitle_ordinal(cue: Cue) -> str:
     """Render the No. column, blank while the cue split is still provisional.
 
-    A preview cue is renumbered on every re-segmentation, so showing its ID
-    would only offer a sequence that keeps shifting under the reader.
+    A preview cue is renumbered on every re-segmentation, and a word-range
+    agent cue only gets its real number when the finished timeline is
+    installed, so showing either ID would only offer a sequence that keeps
+    shifting under the reader.
     """
-    return "" if is_preview_cue_id(cue.id) else str(cue.id)
+    if is_preview_cue_id(cue.id) or is_word_cue_id(cue.id):
+        return ""
+    return str(cue.id)
 
 
 def subtitle_text_widths(
@@ -106,6 +116,10 @@ class AgentTaskState:
         if self.cue_ids:
             span = self.cue_ids[0] if len(self.cue_ids) == 1 else f"{self.cue_ids[0]}–{self.cue_ids[-1]}"
             label += f" · cues {span}"
+        elif self.events:
+            # Word-batch agents have no cue IDs before they run; their opening
+            # summary ("Segment and translate words 12–411") is the task name.
+            label = self.events[0].message
         return label
 
     @property
@@ -688,7 +702,12 @@ class YakiFlowApp(App[None]):
     def _load_existing_subtitles(self) -> None:
         """Load the durable subtitle timeline into the subtitle table."""
         table = self.query_one("#recent", SubtitleTable)
-        for cue in self.job.db.list_cues(stable_only=True):
+        # The database orders by insertion ordinal, which mid-draft on a
+        # resumed word-mode job is batch-completion order, not time order.
+        for cue in sorted(
+            self.job.db.list_cues(stable_only=True),
+            key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
+        ):
             table.add_subtitle(cue)
             self.whisper_cues += 1
             if cue.translated:
@@ -760,11 +779,21 @@ class YakiFlowApp(App[None]):
             table.clear(columns=False)
             self.whisper_cues = 0
             self.processed_ids.clear()
-            self._load_existing_subtitles()
+            if event.cues is not None:
+                for cue in event.cues:
+                    table.add_subtitle(cue)
+                    self.whisper_cues += 1
+                    if cue.translated:
+                        self.processed_ids.add(cue.id)
+                status = (
+                    f"Agent processed: {len(self.processed_ids)}"
+                    f" / {self.whisper_cues} subtitles"
+                )
+            else:
+                self._load_existing_subtitles()
+                status = f"aligned timeline: {self.whisper_cues} subtitles"
             table.restore_scroll_after_update(previous_y)
-            self.query_one("#status", Static).update(
-                f"Current stage · aligned timeline: {self.whisper_cues} subtitles"
-            )
+            self.query_one("#status", Static).update(f"Current stage · {status}")
             return
         if event.kind in {"transcript", "subtitle"} and event.cue:
             table = self.query_one("#recent", SubtitleTable)

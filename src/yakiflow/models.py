@@ -101,6 +101,9 @@ class JobEvent:
     estimated_remaining: int | None = None
     agent_trace: AgentTraceEvent | None = None
     error_traceback: str | None = None
+    # For "timeline-replaced": the complete replacement view. None means the
+    # durable timeline in the database is the view to load.
+    cues: list[Cue] | None = None
 
 
 def cue_id(ordinal: int) -> str:
@@ -119,3 +122,19 @@ def preview_cue_id(position: int) -> str:
 def is_preview_cue_id(value: str) -> bool:
     """Whether ``value`` names a provisional cue the agent has not segmented."""
     return value.startswith(PREVIEW_CUE_PREFIX)
+
+
+def word_cue_id(first: int, last: int) -> str:
+    """Return the provisional ID of an agent cue covering words first..last."""
+    return f"w{first}-{last}"
+
+
+def is_word_cue_id(value: str) -> bool:
+    """Whether ``value`` names an agent cue still awaiting final renumbering."""
+    first, dash, last = value[1:].partition("-")
+    return (
+        value.startswith("w")
+        and dash == "-"
+        and first.isdigit()
+        and last.isdigit()
+    )

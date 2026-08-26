@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from bisect import bisect_left
 from dataclasses import asdict
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -106,6 +107,75 @@ def _temporary_workdir() -> Path:
             # workspace instead of probing a parent directory each time.
             (root / ".git").mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="job-", dir=root))
+
+
+def _cue_time_key(cue: Cue) -> tuple[float, float, str]:
+    return (cue.start, cue.end, cue.speaker or "")
+
+
+class WordTimelineView:
+    """Time-ordered view of the agent's cues over the preview skeleton.
+
+    Order is guaranteed by construction rather than by re-sorting: the seed
+    is sorted once, and afterwards each agent cue enters at its bisect
+    position while the rows it supersedes — replaced agent cues by ID,
+    preview cues through the word→owner map — leave individually.
+    """
+
+    def __init__(self, stable: Sequence[Cue], preview: Sequence[Cue]) -> None:
+        covered: set[int] = set()
+        for cue in stable:
+            covered.update(self._word_span(cue))
+        live_preview = [
+            cue for cue in preview if covered.isdisjoint(self._word_span(cue))
+        ]
+        self._cues = sorted([*stable, *live_preview], key=_cue_time_key)
+        self._keys = [_cue_time_key(cue) for cue in self._cues]
+        self._by_id = {cue.id: cue for cue in self._cues}
+        self._preview_owner = {
+            ordinal: cue.id
+            for cue in live_preview
+            for ordinal in self._word_span(cue)
+        }
+
+    @staticmethod
+    def _word_span(cue: Cue) -> range:
+        word_range = cue.metadata.get("word_range")
+        if not word_range:
+            return range(0)
+        return range(int(word_range[0]), int(word_range[1]) + 1)
+
+    def apply(self, added: Sequence[Cue], removed_ids: Sequence[str] = ()) -> None:
+        """Fold one agent batch in: new cues arrive, superseded rows leave."""
+        for cue_id in removed_ids:
+            self._remove(cue_id)
+        for cue in added:
+            for ordinal in self._word_span(cue):
+                owner = self._preview_owner.pop(ordinal, None)
+                if owner is not None:
+                    self._remove(owner)
+            self._remove(cue.id)
+            self._insert(cue)
+
+    def _insert(self, cue: Cue) -> None:
+        key = _cue_time_key(cue)
+        index = bisect_left(self._keys, key)
+        self._keys.insert(index, key)
+        self._cues.insert(index, cue)
+        self._by_id[cue.id] = cue
+
+    def _remove(self, cue_id: str) -> None:
+        cue = self._by_id.pop(cue_id, None)
+        if cue is None:
+            return
+        index = bisect_left(self._keys, _cue_time_key(cue))
+        while self._cues[index].id != cue_id:
+            index += 1
+        del self._keys[index]
+        del self._cues[index]
+
+    def cues(self) -> list[Cue]:
+        return list(self._cues)
 
 
 class YakiFlowJob:
@@ -207,6 +277,7 @@ class YakiFlowJob:
         self._translation_batches_total = 0
         self._artifact: MediaArtifact | None = None
         self._partial_write_lock = asyncio.Lock()
+        self._word_timeline: WordTimelineView | None = None
 
     def _staged_context_files(self) -> tuple[Path, ...]:
         context_dir = self.work_dir / "context"
@@ -340,6 +411,7 @@ class YakiFlowJob:
         estimated_remaining: int | None = None,
         agent_trace: AgentTraceEvent | None = None,
         error_traceback: str | None = None,
+        cues: Sequence[Cue] | None = None,
     ) -> None:
         if not self.listener:
             return
@@ -353,6 +425,7 @@ class YakiFlowJob:
                 estimated_remaining=estimated_remaining,
                 agent_trace=agent_trace,
                 error_traceback=error_traceback,
+                cues=list(cues) if cues is not None else None,
             )
         )
         if inspect.isawaitable(maybe):
@@ -412,7 +485,9 @@ class YakiFlowJob:
             # Word-mode completeness is word coverage, not cue translations:
             # a fresh word transcript has no stable cues at all yet.
             words = self.db.list_transcript_words()
-            covered = self._covered_word_ordinals(existing_cues)
+            covered: set[int] = set()
+            for cue in existing_cues:
+                covered.update(WordTimelineView._word_span(cue))
             has_missing_translation = not words or any(
                 word.ordinal not in covered for word in words
             )
@@ -761,7 +836,7 @@ class YakiFlowJob:
         partial_path = self._draft_partial_path(artifact)
         if self.db.get_checkpoint("transcribed"):
             if self._word_mode and self.db.list_transcript_words():
-                await self._write_partial(partial_path, self._word_partial_view())
+                await self._write_partial(partial_path, self._word_view().cues())
                 await self._begin_stage("transcribe", "using cached transcription")
                 await self._finish_stage("transcribe", "transcription ready")
                 return self.db.list_cues(stable_only=True)
@@ -913,32 +988,28 @@ class YakiFlowJob:
             await self._finish_stage("transcribe", "authoritative transcription ready")
         return self.db.list_cues(stable_only=True)
 
-    @staticmethod
-    def _covered_word_ordinals(cues: Sequence[Cue]) -> set[int]:
-        covered: set[int] = set()
-        for cue in cues:
-            word_range = cue.metadata.get("word_range")
-            if word_range:
-                covered.update(range(int(word_range[0]), int(word_range[1]) + 1))
-        return covered
+    def _word_view(self) -> WordTimelineView:
+        """The maintained word-mode timeline, seeded from the database.
 
-    def _word_partial_view(self) -> list[Cue]:
-        """Finished agent cues, plus preview cues where no agent cue exists yet."""
-        stable = self.db.list_cues(stable_only=True)
-        covered = self._covered_word_ordinals(stable)
-        preview: list[Cue] = []
-        for cue in self.db.list_cues():
-            if not is_preview_cue_id(cue.id):
-                continue
-            word_range = cue.metadata.get("word_range")
-            if word_range is None or covered.isdisjoint(
-                range(int(word_range[0]), int(word_range[1]) + 1)
-            ):
-                preview.append(cue)
-        return sorted(
-            [*stable, *preview],
-            key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
-        )
+        The seed is the only full sort; afterwards ``apply`` folds each agent
+        batch in incrementally. Reset to ``None`` whenever the skeleton
+        changes wholesale (preview cues land, the final timeline is
+        installed) so the next reader reseeds.
+        """
+        if self._word_timeline is None:
+            self._word_timeline = WordTimelineView(
+                self.db.list_cues(stable_only=True),
+                [cue for cue in self.db.list_cues() if is_preview_cue_id(cue.id)],
+            )
+        return self._word_timeline
+
+    async def _emit_word_timeline(
+        self, view: Sequence[Cue], message: str = "partial draft timeline updated"
+    ) -> None:
+        # Word-mode cue IDs churn (preview-N → w{a}-{b} → 1..N) as the agent's
+        # cues supersede preview rows, so per-cue "subtitle" events would leave
+        # stale rows behind; ship the whole view for a full-table refresh.
+        await self.emit("timeline-replaced", message, cues=view)
 
     async def _word_transcription_stage(
         self,
@@ -953,9 +1024,18 @@ class YakiFlowJob:
         # the Whisper flow.
         incremental_dispatch = transcriber.name == "elevenlabs-stream"
         translation_tasks: list[asyncio.Task[None]] = []
+        preview_persisted = False
 
-        async def on_batch(_cues: Sequence[Cue]) -> None:
-            await self._write_partial(partial_path, self._word_partial_view())
+        async def on_batch(added: Sequence[Cue], removed_ids: Sequence[str]) -> None:
+            view = self._word_view()
+            view.apply(added, removed_ids)
+            cues = view.cues()
+            await self._write_partial(partial_path, cues)
+            # While the stream still runs the preview cues live only in the
+            # transcriber (and the TUI table), not the database, so the view
+            # would wipe them from the table; refresh only once they landed.
+            if preview_persisted:
+                await self._emit_word_timeline(cues)
 
         async def event(item: TranscriptEvent) -> None:
             await self.emit("transcript", "provisional preview subtitle", cue=item.cue)
@@ -983,7 +1063,15 @@ class YakiFlowJob:
             # segmentation of the stored words produces the real cues.
             if preview:
                 self.db.upsert_cues(preview, stable=False)
-            await self._write_partial(partial_path, self._word_partial_view())
+            preview_persisted = True
+            # The preview skeleton just landed: reseed the maintained view so
+            # it merges the preview rows with the batches drafted mid-stream.
+            self._word_timeline = None
+            view = self._word_view().cues()
+            await self._write_partial(partial_path, view)
+            # Reconciles the table with the merged view: batches drafted while
+            # the stream was still running replace their preview rows here.
+            await self._emit_word_timeline(view)
             self.db.checkpoint("transcribed", True)
             # Land the in-flight batches before the translation stage computes
             # what is still missing, or their ranges would be dispatched twice.
@@ -1006,8 +1094,12 @@ class YakiFlowJob:
         pipeline = self._translation_pipeline()
         partial_path = self._draft_partial_path(artifact)
 
-        async def on_batch(_cues: list[Cue]) -> None:
-            await self._write_partial(partial_path, self._word_partial_view())
+        async def on_batch(added: Sequence[Cue], removed_ids: Sequence[str]) -> None:
+            view = self._word_view()
+            view.apply(added, removed_ids)
+            cues = view.cues()
+            await self._write_partial(partial_path, cues)
+            await self._emit_word_timeline(cues)
 
         async def on_progress(completed: int, total: int) -> None:
             await self._report_progress(
@@ -1017,8 +1109,10 @@ class YakiFlowJob:
             )
 
         final = await pipeline.segment_and_translate(on_batch, on_progress)
+        # The install renumbered every ID; the maintained view is stale now.
+        self._word_timeline = None
         await self._write_partial(partial_path, final)
-        await self._emit_agent_cues(final)
+        await self._emit_word_timeline(final, "draft timeline ready")
         await self._finish_stage("translate", "draft segmentation and translation ready")
         return final
 
