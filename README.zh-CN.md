@@ -303,8 +303,8 @@ backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenla
 
 [stream]
 # enabled = false         # 等同于 --stream
-# chunk-seconds = 15      # 直播转录片段的时长
-# context-seconds = 5     # 每个片段前保留的音频上下文
+# chunk-seconds = 15      # 直播转录片段的时长（elevenlabs-stream 连续喂送，不使用）
+# context-seconds = 5     # 每个片段前保留的音频上下文（elevenlabs-stream 不使用）
 
 [subtitles]
 # max-cue-seconds = 8.0   # 单条字幕的最长时长（ElevenLabs 后端）

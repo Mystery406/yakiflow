@@ -249,7 +249,7 @@ def test_chunks_share_one_session_and_send_only_new_bytes(tmp_path: Path) -> Non
     session = FakeSession()
 
     def on_send(count: int) -> None:
-        if count == 2:
+        if count == 3:
             session.push("words", {"words": [_word_payload("late", 2.2, 2.6)]})
 
     session.on_send = on_send
@@ -266,8 +266,9 @@ def test_chunks_share_one_session_and_send_only_new_bytes(tmp_path: Path) -> Non
     first, second = asyncio.run(exercise())
 
     assert len(session.previous_texts) == 1
-    # 2 s, then only the 2 s past the already-fed end (offset 1 + 3 − fed 2).
-    assert [len(chunk) for chunk in session.sent] == [64000, 64000]
+    # Realtime frames of at most one second: 2 s, then only the 2 s past the
+    # already-fed end (offset 1 + 3 − fed 2).
+    assert [len(chunk) for chunk in session.sent] == [32000] * 4
     assert first == []
     assert [cue.source for cue in second] == ["late"]
     assert [cue.source for cue in transcriber.chunk_cues] == ["late"]
@@ -304,7 +305,7 @@ def test_start_chunks_defers_the_connection(tmp_path: Path) -> None:
     db.close()
 
 
-def test_preview_send_failure_reconnects_on_the_next_chunk(
+def test_preview_send_failure_refeeds_the_lost_audio_on_reconnect(
     tmp_path: Path,
 ) -> None:
     chunk1 = tmp_path / "chunk1.wav"
@@ -323,6 +324,12 @@ def test_preview_send_failure_reconnects_on_the_next_chunk(
     transcriber = ElevenLabsRealtimeTranscriber(
         _settings(), tmp_path, db, session_factory=lambda: sessions.popleft()
     )
+    warnings: list[str] = []
+
+    async def on_warning(message: str) -> None:
+        warnings.append(message)
+
+    transcriber.on_warning = on_warning
 
     async def exercise() -> None:
         assert await transcriber.submit_chunk(chunk1, 0.0) == []
@@ -330,9 +337,118 @@ def test_preview_send_failure_reconnects_on_the_next_chunk(
 
     asyncio.run(exercise())
     assert first.closed
-    # The dead session was discarded, not resent to: the next chunk opened a
-    # fresh session and fed its full second of audio.
-    assert [len(chunk) for chunk in second.sent] == [32000]
+    # The dead session was discarded and the next chunk opened a fresh one,
+    # re-feeding the buffered second the failed send never delivered before
+    # the new audio.
+    assert [len(chunk) for chunk in second.sent] == [32000, 32000]
+    assert any("session ended" in message for message in warnings)
+    db.close()
+
+
+def test_server_close_refeeds_only_the_uncommitted_tail(tmp_path: Path) -> None:
+    chunk1 = tmp_path / "chunk1.wav"
+    chunk2 = tmp_path / "chunk2.wav"
+    _write_wav(chunk1, 7.0)
+    _write_wav(chunk2, 1.0)
+    first = FakeSession()
+    second = FakeSession()
+    sessions = deque([first, second])
+
+    def first_send(count: int) -> None:
+        if count == 7:
+            first.push("words", {"words": [_word_payload("early ", 0.2, 6.0)]})
+            first.push("closed")
+
+    def second_send(count: int) -> None:
+        if count == 7:
+            # Relative to the re-fed audio, which restarted at the committed
+            # end minus the five-second overlap: absolute 1.0 + 5.5 = 6.5.
+            second.push("words", {"words": [_word_payload("late", 5.5, 5.9)]})
+
+    first.on_send = first_send
+    second.on_send = second_send
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=lambda: sessions.popleft()
+    )
+
+    async def exercise() -> None:
+        await transcriber.submit_chunk(chunk1, 0.0)
+        await transcriber.submit_chunk(chunk2, 7.0)
+
+    asyncio.run(exercise())
+
+    assert first.closed
+    # The buffer had dropped the committed audio up to 6.0 − 5.0 = 1.0 and
+    # kept the uncommitted [1.0, 8.0), re-fed with the committed words as
+    # context ahead of the fresh chunk.
+    assert [len(chunk) for chunk in second.sent] == [32000] * 7
+    assert second.previous_texts == ["early"]
+    words = [(word.text, word.start) for word in transcriber._words]
+    assert words == [("early ", 0.2), ("late", 6.5)]
+    db.close()
+
+
+def test_preview_commits_manually_when_the_server_never_does(
+    tmp_path: Path,
+) -> None:
+    chunk = tmp_path / "chunk.wav"
+    _write_wav(chunk, 30.0)
+    session = FakeSession()
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=lambda: session
+    )
+
+    # Background music can keep the server-side VAD from ever committing;
+    # without a nudge the whole stretch would stay uncommitted and die with
+    # the session.
+    asyncio.run(transcriber.submit_chunk(chunk, 0.0))
+    assert session.committed
+    db.close()
+
+
+def test_audio_starvation_close_is_absorbed_with_its_reason(
+    tmp_path: Path,
+) -> None:
+    chunk1 = tmp_path / "chunk1.wav"
+    chunk2 = tmp_path / "chunk2.wav"
+    _write_wav(chunk1, 1.0)
+    _write_wav(chunk2, 1.0)
+    first = FakeSession()
+    second = FakeSession()
+    sessions = deque([first, second])
+
+    def first_send(count: int) -> None:
+        first.push(
+            "insufficient_audio_activity",
+            {"message_type": "insufficient_audio_activity"},
+        )
+
+    first.on_send = first_send
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsRealtimeTranscriber(
+        _settings(), tmp_path, db, session_factory=lambda: sessions.popleft()
+    )
+    warnings: list[str] = []
+
+    async def on_warning(message: str) -> None:
+        warnings.append(message)
+
+    transcriber.on_warning = on_warning
+
+    async def exercise() -> None:
+        await transcriber.submit_chunk(chunk1, 0.0)
+        await transcriber.submit_chunk(chunk2, 1.0)
+
+    asyncio.run(exercise())
+
+    # The pacing complaint is not a fatal configuration error: the session is
+    # replaced, and the reason reaches the warning instead of vanishing as a
+    # bare disconnect.
+    assert first.closed
+    assert second.sent
+    assert any("insufficient_audio_activity" in message for message in warnings)
     db.close()
 
 

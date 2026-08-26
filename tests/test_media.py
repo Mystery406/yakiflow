@@ -113,6 +113,47 @@ def test_stream_drain_cuts_each_chunk_with_its_leading_context(tmp_path: Path) -
     assert emitted == 45
 
 
+def test_continuous_drain_hands_over_all_available_audio(tmp_path: Path) -> None:
+    tail = tmp_path / "tail.wav"
+    # A tail decoded from 29s onwards: one second of context before the 30
+    # seconds already emitted, plus 17 fresh seconds.
+    _write_tone(tail, 18)
+    excerpt = tmp_path / "chunk.wav"
+    cuts: list[tuple[float, float | None, int]] = []
+
+    async def on_chunk(path: Path, start: float) -> None:
+        cuts.append((start, media.pcm_audio_duration(path), _first_sample(path)))
+
+    emitted = asyncio.run(
+        media._drain_stream_available(
+            media.StreamTail(tail, 29.0, 47.0), 30.0, 1.0, 1.0, excerpt, on_chunk
+        )
+    )
+
+    # Everything new goes out in a single excerpt with its one-second context.
+    assert cuts == [(29.0, 18, 0)]
+    assert emitted == 47.0
+
+
+def test_continuous_drain_waits_for_the_minimum_new_audio(tmp_path: Path) -> None:
+    tail = tmp_path / "tail.wav"
+    _write_tone(tail, 1.5)
+    excerpt = tmp_path / "chunk.wav"
+    handed: list[float] = []
+
+    async def on_chunk(path: Path, start: float) -> None:
+        handed.append(start)
+
+    emitted = asyncio.run(
+        media._drain_stream_available(
+            media.StreamTail(tail, 29.0, 30.5), 30.0, 1.0, 1.0, excerpt, on_chunk
+        )
+    )
+
+    assert handed == []
+    assert emitted == 30.0
+
+
 def test_stream_drain_indexes_chunks_against_the_tail_offset(tmp_path: Path) -> None:
     tail = tmp_path / "tail.wav"
     # A tail decoded from 25s onwards, as the loop requests once it has emitted

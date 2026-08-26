@@ -658,10 +658,13 @@ class YakiFlowJob:
         transcriber = make_transcriber(
             self.settings, self.work_dir, self.db, self.runner
         )
+        transcriber.on_warning = media_warning
         await transcriber.start_chunks()
         pipeline = self._translation_pipeline()
         partial_path = self._live_partial_path(source)
         completed_chunks = 0
+        last_timeline_state: list[tuple[str, float, float, str]] | None = None
+        last_progress_key = -1
         translation_tasks: list[asyncio.Task[None]] = []
         scheduled_translation_ids: set[str] = set()
 
@@ -691,40 +694,56 @@ class YakiFlowJob:
             await self._emit_agent_cues(cue for cue in updated if cue.id in translated_ids)
 
         async def chunk(excerpt: Path, start: float) -> None:
-            nonlocal completed_chunks
+            nonlocal completed_chunks, last_timeline_state, last_progress_key
             new_cues = await transcriber.submit_chunk(excerpt, start)
-            self.db.replace_transcript(transcriber.chunk_cues)
-            timeline = self.db.list_cues(stable_only=True)
-            await self._write_partial(partial_path, timeline)
-            for cue in new_cues:
-                await self.emit("transcript", "live subtitle", cue=cue)
-            # An Agent round trip runs an order of magnitude longer than the
-            # Whisper call above. Awaiting it here would leave the transcriber
-            # idle until it returned, so let the next chunk start while this
-            # one is still being translated. Finished previews are dropped:
-            # ``translate_live`` reports its own failures, and a stream can run
-            # for hours at one batch per chunk.
-            translation_tasks[:] = [
-                task for task in translation_tasks if not task.done()
+            # A continuous feed hands audio over every second, and most of
+            # those passes commit no new words; persisting, rewriting the
+            # partial file, and rescanning for translation batches only when
+            # the preview actually moved keeps the per-second cost flat.
+            timeline_state = [
+                (cue.id, cue.start, cue.end, cue.source)
+                for cue in transcriber.chunk_cues
             ]
-            for batch, context, following in self._missing_translation_batches(
-                timeline, excluded_ids=scheduled_translation_ids
-            ):
-                scheduled_translation_ids.update(cue.id for cue in batch)
-                translation_tasks.append(
-                    asyncio.create_task(translate_live(batch, context, following))
-                )
+            if timeline_state != last_timeline_state:
+                last_timeline_state = timeline_state
+                self.db.replace_transcript(transcriber.chunk_cues)
+                timeline = self.db.list_cues(stable_only=True)
+                await self._write_partial(partial_path, timeline)
+                for cue in new_cues:
+                    await self.emit("transcript", "live subtitle", cue=cue)
+                # An Agent round trip runs an order of magnitude longer than
+                # the transcriber call above. Awaiting it here would leave the
+                # transcriber idle until it returned, so let the next chunk
+                # start while this one is still being translated. Finished
+                # previews are dropped: ``translate_live`` reports its own
+                # failures, and a stream can run for hours at one batch per
+                # chunk.
+                translation_tasks[:] = [
+                    task for task in translation_tasks if not task.done()
+                ]
+                for batch, context, following in self._missing_translation_batches(
+                    timeline, excluded_ids=scheduled_translation_ids
+                ):
+                    scheduled_translation_ids.update(cue.id for cue in batch)
+                    translation_tasks.append(
+                        asyncio.create_task(translate_live(batch, context, following))
+                    )
+                await self.emit("stream", f"updated {partial_path}")
             completed_chunks += 1
-            await self._report_progress(
-                "acquire",
-                min(0.9, 0.15 + completed_chunks * 0.04),
-                f"streaming media · {completed_chunks} chunks analyzed",
-            )
-            await self.emit("stream", f"updated {partial_path}")
+            progress_key = int(start) // 15
+            if progress_key != last_progress_key:
+                last_progress_key = progress_key
+                await self._report_progress(
+                    "acquire",
+                    min(0.9, 0.15 + progress_key * 0.04),
+                    f"streaming media · {int(start)}s analyzed",
+                )
 
         stream_succeeded = False
         try:
-            artifact = await acquirer.acquire_stream(source, chunk)
+            artifact = await acquirer.acquire_stream(
+                source, chunk, continuous=transcriber.continuous_feed
+            )
             stream_succeeded = True
         finally:
             await transcriber.close_chunks()
@@ -763,6 +782,11 @@ class YakiFlowJob:
         transcriber = make_transcriber(
             self.settings, self.work_dir, self.db, self.runner
         )
+
+        async def transcriber_warning(message: str) -> None:
+            await self.emit("warning", message)
+
+        transcriber.on_warning = transcriber_warning
         if resume_from:
             await self._begin_stage(
                 "transcribe",

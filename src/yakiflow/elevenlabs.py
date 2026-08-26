@@ -590,6 +590,16 @@ _MAX_RECONNECTS = 3
 # for the server to catch up.
 _FLOW_CONTROL_WINDOW_SECONDS = 30.0
 _EVENT_QUIET_TIMEOUT_SECONDS = 30.0
+# The server wants realtime frames of 0.1–1 s; one oversized message risks the
+# chunk-size cap, and long silent stretches between sends starve the session.
+_REALTIME_FRAME_SECONDS = 1.0
+# The preview keeps this much sent-but-uncommitted PCM so a server-side session
+# close can re-feed it to the next session instead of losing the words.
+_PREVIEW_BUFFER_MAX_SECONDS = 60.0
+# Background music can keep the server's VAD from ever committing; after this
+# much uncommitted audio the preview asks for a manual commit so subtitles keep
+# flowing and the re-feed buffer stays bounded.
+_FALLBACK_COMMIT_SECONDS = 25.0
 
 
 def merge_streamed_words(
@@ -626,6 +636,19 @@ def merge_streamed_words(
 
 class _SessionEnded(Exception):
     """The realtime session ended before the audio did (limit or disconnect)."""
+
+
+# Event kinds that mean the session is over but a fresh one may continue the
+# work, as opposed to the fatal ``error`` kind (auth, quota, terms, …).
+_SESSION_END_KINDS = {
+    "session_limit", "closed", "insufficient_audio_activity", "commit_throttled",
+}
+
+
+def _describe_event(kind: str, data: Any) -> str:
+    if data is None:
+        return kind
+    return f"{kind}: {str(data)[:300]}"
 
 
 class _RealtimeSession:
@@ -687,6 +710,12 @@ class _RealtimeSession:
             "session_time_limit_exceeded", enqueue("session_limit")
         )
         self._connection.on("close", enqueue("closed"))
+        # These end the session but are the server's fault or pacing feedback,
+        # not a broken configuration: a fresh session may simply continue.
+        self._connection.on(
+            "insufficient_audio_activity", enqueue("insufficient_audio_activity")
+        )
+        self._connection.on("commit_throttled", enqueue("commit_throttled"))
         for event in self._ERROR_EVENTS:
             self._connection.on(event, enqueue("error"))
 
@@ -769,6 +798,15 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
         self._session_base = 0.0
         self._fed_end: float | None = None
         self._emitted_preview_ids: set[str] = set()
+        # Preview re-feed buffer: PCM already ingested from chunks but not yet
+        # safely committed by the server, so a closed session can be replayed
+        # into its replacement instead of losing those words.
+        self._buffer = bytearray()
+        self._buffer_start = 0.0
+        self._pending_index = 0
+        self._commit_floor = 0.0
+        self._frame_rate = 16000
+        self._bytes_per_frame = 2
 
     # --- shared event handling ---
 
@@ -790,8 +828,11 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
                     if self._persist:
                         # Append-only merges make the delta exactly the tail.
                         self.db.append_transcript_words(fresh)
-            elif kind in {"session_limit", "closed"}:
-                raise _SessionEnded(kind)
+                    durable_end = self._words[-1].end
+                    self._commit_floor = max(self._commit_floor, durable_end)
+                    self._trim_buffer(durable_end - RECONNECT_OVERLAP_SECONDS)
+            elif kind in _SESSION_END_KINDS:
+                raise _SessionEnded(_describe_event(kind, data))
             elif kind == "error":
                 raise RuntimeError(f"ElevenLabs realtime error: {data}")
         return changed
@@ -803,23 +844,44 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
             max_cue_chars=self.settings.subtitles.max_cue_chars,
         )
 
-    async def _absorb_session_end(self) -> None:
+    def _trim_buffer(self, cut: float) -> None:
+        """Drop buffered PCM before ``cut`` seconds of the media timeline."""
+        if not self._buffer:
+            return
+        frames = round((cut - self._buffer_start) * self._frame_rate)
+        drop = min(frames * self._bytes_per_frame, len(self._buffer))
+        if drop <= 0:
+            return
+        del self._buffer[:drop]
+        self._pending_index = max(0, self._pending_index - drop)
+        self._buffer_start += drop / (self._frame_rate * self._bytes_per_frame)
+
+    async def _absorb_session_end(self, reason: str) -> None:
         """Close the ended session, but read what the server said first.
 
-        The close often trails an explicit error event (auth, quota, terms);
-        replaying the drained events turns that into the RuntimeError the
-        caller sees instead of a bare disconnect.
+        The close often trails an explicit event naming the cause; folding the
+        drained events into the reason (or, for a fatal error, into the
+        RuntimeError the caller sees) keeps it from being lost as a bare
+        disconnect the way it would be otherwise.
         """
         session, self._session = self._session, None
-        self._fed_end = None
-        events = [
-            event for event in session.pending_events()
-            if event[0] not in {"session_limit", "closed"}
-        ]
+        events = session.pending_events()
         await session.close()
-        self._handle_events(events)
+        details = [reason] + [
+            _describe_event(kind, data)
+            for kind, data in events
+            if kind in _SESSION_END_KINDS and data is not None
+        ]
+        message = f"ElevenLabs realtime session ended ({'; '.join(details)})"
+        self.db.log("elevenlabs-stream", "stderr", message)
+        await self._warn(message)
+        self._handle_events(
+            [event for event in events if event[0] not in _SESSION_END_KINDS]
+        )
 
-    # --- chunk previews: one continuous session, new bytes only ---
+    # --- chunk previews: buffered continuous feed in realtime frames ---
+
+    continuous_feed = True
 
     async def start_chunks(self) -> None:
         # The server closes a session that sits idle while the download spins
@@ -829,33 +891,39 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
     async def submit_chunk(self, wav: Path, offset: float) -> list[Cue]:
         import wave
 
-        if self._session is None:
-            self._session = self._session_factory()
-            await self._session.open()
         with wave.open(str(wav), "rb") as reader:
             parameters = reader.getparams()
             frames = reader.readframes(parameters.nframes)
-        bytes_per_second = (
-            parameters.framerate * parameters.sampwidth * parameters.nchannels
-        )
+        self._frame_rate = parameters.framerate
+        self._bytes_per_frame = parameters.sampwidth * parameters.nchannels
         duration = parameters.nframes / parameters.framerate
         if self._fed_end is None:
-            self._session_base = offset
             self._fed_end = offset
-        # The excerpt re-carries a few context seconds already sent to this
-        # continuous session; only the bytes past the fed end are new.
-        skip_seconds = max(0.0, self._fed_end - offset)
-        skip_bytes = min(len(frames), round(skip_seconds * bytes_per_second))
-        fresh = frames[skip_bytes:]
+            self._buffer_start = offset
+            self._commit_floor = offset
+        # The excerpt re-carries a short overlap already ingested; only the
+        # samples past the fed end are new.
+        skip_frames = min(
+            parameters.nframes,
+            max(0, round((self._fed_end - offset) * parameters.framerate)),
+        )
+        fresh = frames[skip_frames * self._bytes_per_frame:]
+        if fresh:
+            if not self._buffer:
+                self._buffer_start = self._fed_end
+                self._pending_index = 0
+            self._buffer.extend(fresh)
+            self._fed_end = max(self._fed_end, offset + duration)
+            # A server that stops committing would grow the buffer without
+            # bound; beyond the cap the oldest audio is surrendered to the
+            # authoritative pass, exactly like before the buffer existed.
+            self._trim_buffer(self._fed_end - _PREVIEW_BUFFER_MAX_SECONDS)
         try:
-            if fresh:
-                await self._session.send_pcm(fresh)
-                self._fed_end = max(self._fed_end, offset + duration)
-            self._handle_events(self._session.pending_events())
-        except _SessionEnded:
-            # A capped preview session simply reconnects on the next chunk;
-            # the authoritative pass owns durable delivery.
-            await self._absorb_session_end()
+            await self._pump()
+        except _SessionEnded as exc:
+            # The next chunk opens a fresh session and re-feeds the buffered
+            # audio; the authoritative pass owns durable delivery.
+            await self._absorb_session_end(str(exc))
         preview = self._preview()
         self._chunk_timeline.cues = preview
         fresh_cues = [
@@ -864,15 +932,55 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
         self._emitted_preview_ids.update(cue.id for cue in fresh_cues)
         return fresh_cues
 
+    async def _pump(self) -> None:
+        """Deliver un-sent buffered PCM to the session in realtime frames."""
+        if self._session is None:
+            if not self._buffer:
+                # Nothing to say yet; an idle session would only be closed as
+                # starved by the server.
+                return
+            self._session = self._session_factory()
+            self._session_base = self._buffer_start
+            self._pending_index = 0
+            self._commit_floor = self._buffer_start
+            previous_text = "".join(
+                word.text for word in self._words[-60:]
+            ).strip()[-500:]
+            await self._session.open(previous_text)
+        frame_bytes = round(
+            self._frame_rate * _REALTIME_FRAME_SECONDS
+        ) * self._bytes_per_frame
+        while self._pending_index < len(self._buffer):
+            frame = bytes(
+                self._buffer[self._pending_index:self._pending_index + frame_bytes]
+            )
+            await self._session.send_pcm(frame)
+            self._pending_index += len(frame)
+        self._handle_events(self._session.pending_events())
+        sent_end = self._buffer_start + self._pending_index / (
+            self._frame_rate * self._bytes_per_frame
+        )
+        if sent_end - self._commit_floor >= _FALLBACK_COMMIT_SECONDS:
+            await self._session.commit()
+            self._commit_floor = sent_end
+
     async def close_chunks(self) -> None:
         if self._session is None:
             return
         try:
             await self._session.commit()
+            # Give the final commit a moment to come back as words so the last
+            # preview cues are not cut off mid-sentence.
+            while True:
+                event = await self._session.next_event(2.0)
+                if event is None:
+                    break
+                self._handle_events([event])
         except Exception:
             pass
         await self._session.close()
         self._session = None
+        self._chunk_timeline.cues = self._preview()
 
     # --- the authoritative pass ---
 
@@ -909,8 +1017,8 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
             try:
                 await self._feed(audio, start_at, duration, on_event, on_progress)
                 break
-            except _SessionEnded:
-                await self._absorb_session_end()
+            except _SessionEnded as exc:
+                await self._absorb_session_end(str(exc))
                 reconnects += 1
                 if reconnects > _MAX_RECONNECTS:
                     raise RuntimeError(
@@ -999,9 +1107,7 @@ class ElevenLabsRealtimeTranscriber(Transcriber):
             event = await self._session.next_event(_EVENT_QUIET_TIMEOUT_SECONDS)
             if event is None:
                 break
-            if event[0] == "closed":
-                break
-            if event[0] == "session_limit":
+            if event[0] in _SESSION_END_KINDS:
                 # The audio was already fully fed; whatever was committed is
                 # in, so the session ending now is completion, not failure.
                 break

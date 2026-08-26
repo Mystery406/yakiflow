@@ -49,6 +49,14 @@ DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?:~\s*)?(?P<percent>\d+(?:\.
 # counts as a broken extraction rather than rounding.
 TAIL_SHORTFALL_TOLERANCE = 0.25
 STREAM_POLL_SECONDS = 1.0
+# Continuous feeding (transcribers with ``continuous_feed``): every pass hands
+# over all newly decoded audio once at least this much is new, so the realtime
+# transport never sits idle a whole chunk interval. The context absorbs any
+# seek imprecision at the decode boundary; the byte-exact trim against the fed
+# end in the transcriber keeps the delivered PCM gapless. The chunk-seconds
+# and context-seconds stream settings do not apply in this mode.
+CONTINUOUS_FEED_SECONDS = 1.0
+CONTINUOUS_CONTEXT_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +138,30 @@ async def _drain_stream_chunks(
         await on_chunk(excerpt, start)
         emitted_duration = end
     return emitted_duration
+
+
+async def _drain_stream_available(
+    tail: StreamTail,
+    emitted_duration: float,
+    min_seconds: float,
+    context_seconds: float,
+    excerpt: Path,
+    on_chunk: ChunkCallback,
+) -> float:
+    """Hand over all newly decoded audio in one excerpt, however much it is.
+
+    The continuous-feed counterpart of ``_drain_stream_chunks``: one slice per
+    pass keeps the per-second cost at a single byte-range copy while the
+    transcriber cuts its own transport frames out of it.
+    """
+    if tail.end < emitted_duration + min_seconds:
+        return emitted_duration
+    start = max(0.0, emitted_duration - context_seconds)
+    await asyncio.to_thread(
+        slice_pcm_wav, tail.path, excerpt, start - tail.start, tail.end - tail.start
+    )
+    await on_chunk(excerpt, start)
+    return tail.end
 
 
 class MediaAcquirer:
@@ -227,13 +259,21 @@ class MediaAcquirer:
         args += ["-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", output]
         await self.runner.run(args, on_line=lambda stream, line: self.db.log("ffmpeg", stream, line))
 
-    async def acquire_stream(self, source: MediaSource, on_chunk: ChunkCallback) -> MediaArtifact:
+    async def acquire_stream(
+        self,
+        source: MediaSource,
+        on_chunk: ChunkCallback,
+        *,
+        continuous: bool = False,
+    ) -> MediaArtifact:
         """Download once, feeding the growing audio to a streaming transcriber.
 
         Each pass decodes only the audio it has not handed over yet and cuts the
         ready chunks out of it. Extraction is opportunistic: formats that ffmpeg
         cannot read while growing simply become available at a later pass or at
-        finalization.
+        finalization. With ``continuous`` every pass hands over all newly
+        available audio instead of fixed chunks (the stream chunk settings do
+        not apply); the transcriber paces its own transport.
         """
         self.work_dir.mkdir(parents=True, exist_ok=True)
         if not source.is_url:
@@ -261,8 +301,12 @@ class MediaAcquirer:
         result = None
         interrupted = False
         emitted_duration = 0.0
-        chunk_seconds = self.settings.stream.chunk_seconds
-        context_seconds = self.settings.stream.context_seconds
+        if continuous:
+            chunk_seconds: float = CONTINUOUS_FEED_SECONDS
+            context_seconds: float = CONTINUOUS_CONTEXT_SECONDS
+        else:
+            chunk_seconds = self.settings.stream.chunk_seconds
+            context_seconds = self.settings.stream.context_seconds
         tail_path = self.work_dir / "stream-tail.wav"
         excerpt = self.work_dir / "stream-chunk.wav"
         # A wall-clock deadline, not a poll count: decoding and transcribing a
@@ -271,11 +315,21 @@ class MediaAcquirer:
         next_pass = monotonic()
         try:
             while not task.done():
-                await asyncio.sleep(STREAM_POLL_SECONDS)
+                # Sleep right up to the deadline instead of in fixed poll
+                # ticks: a tick landing just before the deadline would stretch
+                # every interval by most of a poll. The floor keeps a passed
+                # deadline from turning the loop hot, and the poll cap keeps
+                # the download's completion checked regularly.
+                delay = min(
+                    STREAM_POLL_SECONDS, max(0.0, next_pass - monotonic())
+                )
+                await asyncio.sleep(max(delay, STREAM_POLL_SECONDS / 20))
                 if monotonic() < next_pass:
                     continue
+                pass_started = monotonic()
                 sized = _sizes(target_dir.glob(f"{download_stem}.*"))
                 if not sized:
+                    next_pass = pass_started + STREAM_POLL_SECONDS
                     continue
                 growing = max(sized, key=lambda item: item[1])[0]
                 # Decode only what is still unprocessed. Re-decoding the whole
@@ -302,7 +356,11 @@ class MediaAcquirer:
                             f"{tail_path.name} decoded only {available_end:.2f}s "
                             f"of audio already processed to {emitted_duration:.2f}s"
                         )
-                    emitted_duration = await _drain_stream_chunks(
+                    drain = (
+                        _drain_stream_available if continuous
+                        else _drain_stream_chunks
+                    )
+                    emitted_duration = await drain(
                         StreamTail(tail_path, tail_start, available_end),
                         emitted_duration,
                         chunk_seconds,
@@ -317,9 +375,16 @@ class MediaAcquirer:
                     self.db.log("stream-extract", "stderr", str(exc))
                     if self.on_warning:
                         await self.on_warning(f"stream chunk skipped: {exc}")
-                # Wait only for the audio the next chunk is still missing. A
-                # backlog leaves this in the past and drains on the next poll.
-                next_pass = monotonic() + max(
+                    # Retry a failed pass at poll pace even when a backlog
+                    # would otherwise ask for an immediate one.
+                    next_pass = pass_started + STREAM_POLL_SECONDS
+                    continue
+                # Wait only for the audio the next chunk is still missing,
+                # counted from when this pass measured the download: the audio
+                # that arrived while the pass ran already counts toward the
+                # next chunk. A backlog leaves this in the past and drains on
+                # the next poll.
+                next_pass = pass_started + max(
                     0.0, emitted_duration + chunk_seconds - available_end
                 )
             result = await task

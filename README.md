@@ -321,8 +321,8 @@ backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenla
 
 [stream]
 # enabled = false         # same as --stream
-# chunk-seconds = 15      # live transcription chunk length
-# context-seconds = 5     # audio overlap kept before each chunk
+# chunk-seconds = 15      # live transcription chunk length (unused by elevenlabs-stream)
+# context-seconds = 5     # audio overlap kept before each chunk (unused by elevenlabs-stream)
 
 [subtitles]
 # max-cue-seconds = 8.0   # longest single subtitle (ElevenLabs backends)

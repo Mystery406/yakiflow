@@ -22,6 +22,7 @@ from .process import CommandRunner, ProcessError, terminate_process
 
 EventCallback = Callable[[TranscriptEvent], Awaitable[None]]
 ProgressCallback = Callable[[float], Awaitable[None]]
+WarningCallback = Callable[[str], Awaitable[None]]
 LINE_RE = re.compile(
     r"\[\s*(?P<start>\d\d:\d\d:\d\d[.,]\d{3})\s*-->\s*(?P<end>\d\d:\d\d:\d\d[.,]\d{3})\s*\]\s*(?P<text>.*)"
 )
@@ -299,9 +300,18 @@ class Transcriber(ABC):
     """
 
     name: ClassVar[str]
+    # A continuous-feed backend paces its own transport (small realtime
+    # frames), so the streaming acquirer hands over every new second of audio
+    # as it appears instead of cutting fixed chunks with overlap context.
+    continuous_feed: ClassVar[bool] = False
 
     def __init__(self) -> None:
         self._chunk_timeline = ChunkTimeline()
+        self.on_warning: WarningCallback | None = None
+
+    async def _warn(self, message: str) -> None:
+        if self.on_warning is not None:
+            await self.on_warning(message)
 
     @property
     def chunk_cues(self) -> list[Cue]:
