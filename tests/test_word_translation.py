@@ -457,23 +457,43 @@ def test_validation_enforces_subtitle_limits_and_nonempty_translation(
     slow = [_word(0, 0.0, 0.4, "a ", "1"), _word(1, 9.5, 9.9, "b", "1")]
     with pytest.raises(ValueError, match="above the 8s limit"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 1, "translated": "t"}]},
+            {"cues": [{"first_word": 0, "last_word": 1, "translated": "长" * 25}]},
             slow,
             tmp_path,
         )
-    words = [_word(0, 0.0, 0.4, "a", "1")]
+    words = [_word(0, 0.0, 5.0, "a", "1")]
     with pytest.raises(ValueError, match="empty translation"):
         _validate(
             {"cues": [{"first_word": 0, "last_word": 0, "translated": "  "}]},
             words,
             tmp_path,
         )
-    with pytest.raises(ValueError, match="characters"):
+    # 50 wide characters weigh 100: over the 84 limit despite len() below it.
+    with pytest.raises(ValueError, match="weighs 100 characters"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 0, "translated": "长" * 120}]},
+            {"cues": [{"first_word": 0, "last_word": 0, "translated": "长" * 50}]},
             words,
             tmp_path,
         )
+
+
+def test_validation_relaxes_one_limit_while_the_other_is_under_half(
+    tmp_path: Path,
+) -> None:
+    # 9.9 s of sparse speech: both texts weigh under half the 84-char limit.
+    slow = [_word(0, 0.0, 0.4, "a ", "1"), _word(1, 9.5, 9.9, "b", "1")]
+    assert len(_validate(
+        {"cues": [{"first_word": 0, "last_word": 1, "translated": "t"}]},
+        slow,
+        tmp_path,
+    )) == 1
+    # A quick dense remark: over the character limit, under half of 8 s.
+    quick = [_word(0, 0.0, 0.4, "a", "1")]
+    assert len(_validate(
+        {"cues": [{"first_word": 0, "last_word": 0, "translated": "长" * 50}]},
+        quick,
+        tmp_path,
+    )) == 1
 
 
 def test_cue_derivation_is_mechanical(tmp_path: Path) -> None:

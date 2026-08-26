@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -104,6 +105,17 @@ class JobEvent:
     # For "timeline-replaced": the complete replacement view. None means the
     # durable timeline in the database is the view to load.
     cues: list[Cue] | None = None
+
+
+def cue_text_weight(text: str) -> int:
+    """Display-width weight of ``text`` for the cue length limit.
+
+    CJK and other wide glyphs render about twice as wide as Latin letters, so
+    East-Asian-Wide and Fullwidth characters count as two.
+    """
+    return sum(
+        2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text
+    )
 
 
 def cue_id(ordinal: int) -> str:

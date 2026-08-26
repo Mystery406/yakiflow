@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Sequence
 
 from .config import Settings
 from .database import JobDatabase
-from .models import AgentTraceEvent, Cue, Word, word_cue_id
+from .models import AgentTraceEvent, Cue, Word, cue_text_weight, word_cue_id
 from .process import CommandRunner
 
 if TYPE_CHECKING:
@@ -1497,7 +1497,11 @@ class TranslationPipeline:
             "words mechanically.\n"
             "Cut cues at natural phrase boundaries. A cue may span at most "
             f"{subtitles.max_cue_seconds:g} seconds and carry at most "
-            f"{subtitles.max_cue_chars} characters per language.\n"
+            f"{subtitles.max_cue_chars} characters per language, where CJK "
+            "and other wide characters count as two. One of the two limits "
+            "may be exceeded while the other measure stays under half of its "
+            "own limit — slow sparse speech may run long, and a dense quick "
+            "remark may run wide.\n"
             "`source` is optional and defaults to the covered words joined "
             "verbatim. Provide it only to correct highly certain "
             "ASR/transcription errors whose correction remains phonetically "
@@ -1621,23 +1625,35 @@ class TranslationPipeline:
             taken.update(ordinals)
             start = cue_words[0].start
             end = max(start, max(word.end for word in cue_words))
-            if end - start > subtitles.max_cue_seconds:
-                errors.append(
-                    f"{label} spans {end - start:.2f}s, above the "
-                    f"{subtitles.max_cue_seconds:g}s limit; split it"
-                )
             source = str(item.get("source") or "").strip() or "".join(
                 word.text for word in cue_words
             ).strip()
             translated = str(item.get("translated") or "").strip()
             if not translated:
                 errors.append(f"{label} has an empty translation")
+            # Either limit may run over while the other measure stays under
+            # half of its own limit — slow sparse speech may run long, and a
+            # dense quick remark may run wide.
+            duration = end - start
+            widest = max(cue_text_weight(source), cue_text_weight(translated))
+            if (
+                duration > subtitles.max_cue_seconds
+                and 2 * widest >= subtitles.max_cue_chars
+            ):
+                errors.append(
+                    f"{label} spans {duration:.2f}s, above the "
+                    f"{subtitles.max_cue_seconds:g}s limit; split it"
+                )
             for text_label, text in (("source", source), ("translation", translated)):
-                if len(text) > subtitles.max_cue_chars:
+                weight = cue_text_weight(text)
+                if (
+                    weight > subtitles.max_cue_chars
+                    and 2 * duration >= subtitles.max_cue_seconds
+                ):
                     errors.append(
-                        f"{label} {text_label} is {len(text)} characters, "
-                        f"above the {subtitles.max_cue_chars} limit; split "
-                        "the cue"
+                        f"{label} {text_label} weighs {weight} characters "
+                        "(wide characters count as two), above the "
+                        f"{subtitles.max_cue_chars} limit; split the cue"
                     )
             cues.append(Cue(
                 word_cue_id(first, last),

@@ -326,7 +326,7 @@ backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenla
 
 [subtitles]
 # max-cue-seconds = 8.0   # longest single subtitle (ElevenLabs backends)
-# max-cue-chars = 84      # longest subtitle text per language
+# max-cue-chars = 84      # longest subtitle text per language (CJK counts double)
 
 [agent]                   # shared by both translation stages
 backend = "codex"         # codex | claude

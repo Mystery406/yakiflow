@@ -308,7 +308,7 @@ backend = "whisper-cli"   # whisper-cli | whisper-server | elevenlabs | elevenla
 
 [subtitles]
 # max-cue-seconds = 8.0   # 单条字幕的最长时长（ElevenLabs 后端）
-# max-cue-chars = 84      # 单条字幕单语言的最长字符数
+# max-cue-chars = 84      # 单条字幕单语言的最长字符数（CJK 按 2 个计）
 
 [agent]                   # 两个翻译阶段共享
 backend = "codex"         # codex | claude

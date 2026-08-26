@@ -22,7 +22,7 @@ from typing import Any, Callable, Sequence
 
 from .config import Settings
 from .database import JobDatabase
-from .models import Cue, TranscriptEvent, Word, preview_cue_id
+from .models import Cue, TranscriptEvent, Word, cue_text_weight, preview_cue_id
 from .process import CommandRunner
 from .transcription import (
     ElapsedProgressTicker,
@@ -339,6 +339,11 @@ def cues_from_words(
     translated the words, and never reach the final output. Each speaker is
     segmented on their own track, so the result legitimately contains
     overlapping cues when people talk over each other.
+
+    Text length is width-weighted (CJK counts double), and either limit may
+    run over while the other measure is still under half of its own limit —
+    sparse slow speech keeps its long pause-free cue, and a dense quick
+    remark keeps its text together.
     """
     tracks: dict[str | None, list[Word]] = {}
     for word in words:
@@ -366,11 +371,13 @@ def cues_from_words(
                 gap = word.start - current[-1].end
                 previous = current[-1].text.rstrip().rstrip(_CLOSING_QUOTES)
                 combined = "".join(w.text for w in current) + word.text
+                duration = word.end - current[0].start
+                weight = cue_text_weight(combined.strip())
                 if (
                     gap >= PAUSE_SPLIT_SECONDS
                     or (previous and previous[-1] in SENTENCE_END_CHARS)
-                    or word.end - current[0].start > max_cue_seconds
-                    or len(combined.strip()) > max_cue_chars
+                    or (duration > max_cue_seconds and 2 * weight >= max_cue_chars)
+                    or (weight > max_cue_chars and 2 * duration >= max_cue_seconds)
                 ):
                     flush()
             current.append(word)

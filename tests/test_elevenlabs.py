@@ -99,13 +99,40 @@ def test_cues_from_words_splits_on_duration_and_length_limits() -> None:
         _word(index, index * 1.0, index * 1.0 + 0.9, f"w{index} ")
         for index in range(12)
     ]
-    by_duration = cues_from_words(long_words, max_cue_seconds=5.0, max_cue_chars=999)
+    by_duration = cues_from_words(long_words, max_cue_seconds=5.0, max_cue_chars=30)
     assert len(by_duration) > 1
     assert all(cue.end - cue.start <= 5.0 for cue in by_duration)
 
-    by_length = cues_from_words(long_words, max_cue_seconds=999.0, max_cue_chars=12)
+    by_length = cues_from_words(long_words, max_cue_seconds=7.0, max_cue_chars=12)
     assert len(by_length) > 1
     assert all(len(cue.source) <= 12 for cue in by_length)
+
+
+def test_cues_from_words_counts_wide_characters_double() -> None:
+    words = [
+        _word(index, index * 0.5, index * 0.5 + 0.4, "字") for index in range(8)
+    ]
+    # len("字" * 8) fits within 8, but the weighted width does not.
+    cues = cues_from_words(words, max_cue_seconds=4.0, max_cue_chars=8)
+    assert [cue.source for cue in cues] == ["字字字字", "字字字字"]
+
+
+def test_cues_from_words_relaxes_one_limit_while_the_other_is_under_half() -> None:
+    sparse = [
+        _word(index, index * 2.0, index * 2.0 + 1.5, f"w{index} ")
+        for index in range(3)
+    ]
+    # 5.5 s of slow speech, but the text is under half the character limit.
+    slow = cues_from_words(sparse, max_cue_seconds=2.0, max_cue_chars=84)
+    assert [cue.source for cue in slow] == ["w0 w1 w2"]
+
+    dense = [
+        _word(index, index * 0.2, index * 0.2 + 0.15, f"w{index} ")
+        for index in range(6)
+    ]
+    # 17 characters of quick speech, but under half the duration limit.
+    quick = cues_from_words(dense, max_cue_seconds=8.0, max_cue_chars=12)
+    assert [cue.source for cue in quick] == ["w0 w1 w2 w3 w4 w5"]
 
 
 def test_cues_from_words_keeps_overlapping_speaker_tracks() -> None:
