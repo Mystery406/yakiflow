@@ -1,4 +1,9 @@
-from yakiflow.tui import format_start_time, subtitle_text_widths
+from yakiflow.models import Cue, preview_cue_id
+from yakiflow.tui import (
+    format_start_time,
+    subtitle_ordinal,
+    subtitle_text_widths,
+)
 
 
 def test_format_start_time_uses_minutes_and_centiseconds() -> None:
@@ -19,3 +24,8 @@ def test_subtitle_columns_fit_the_table_viewport_with_padding() -> None:
     rendered_width = (5 + 2) + (8 + 2) + (source + 2) + (translation + 2)
     assert rendered_width == 76
     assert (source, translation) == (27, 28)
+
+
+def test_subtitle_ordinal_is_blank_until_the_cue_split_is_settled() -> None:
+    assert subtitle_ordinal(Cue(preview_cue_id(3), 0.0, 1.0, "hello")) == ""
+    assert subtitle_ordinal(Cue("3", 0.0, 1.0, "hello")) == "3"

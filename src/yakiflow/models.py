@@ -106,3 +106,16 @@ class JobEvent:
 def cue_id(ordinal: int) -> str:
     """Return a simple one-based sequence number for a generated cue."""
     return str(ordinal + 1)
+
+
+PREVIEW_CUE_PREFIX = "preview-"
+
+
+def preview_cue_id(position: int) -> str:
+    """Return the ID of the provisional preview cue at ``position``."""
+    return f"{PREVIEW_CUE_PREFIX}{position}"
+
+
+def is_preview_cue_id(value: str) -> bool:
+    """Whether ``value`` names a provisional cue the agent has not segmented."""
+    return value.startswith(PREVIEW_CUE_PREFIX)

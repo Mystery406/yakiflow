@@ -35,7 +35,14 @@ from .media import (
     pcm_audio_duration,
 )
 from .memory import MemoryDestinationConflict, MemoryFileSnapshot, MemoryStore
-from .models import AgentTraceEvent, Cue, JobEvent, JobStatus, TranscriptEvent
+from .models import (
+    AgentTraceEvent,
+    Cue,
+    JobEvent,
+    JobStatus,
+    TranscriptEvent,
+    is_preview_cue_id,
+)
 from .process import CommandRunner
 from .progress import ProgressPlan, StageTimeEstimator, make_progress_plan
 from .subtitles import (
@@ -885,7 +892,7 @@ class YakiFlowJob:
         covered = self._covered_word_ordinals(stable)
         preview: list[Cue] = []
         for cue in self.db.list_cues():
-            if not cue.id.startswith("preview-"):
+            if not is_preview_cue_id(cue.id):
                 continue
             word_range = cue.metadata.get("word_range")
             if word_range is None or covered.isdisjoint(

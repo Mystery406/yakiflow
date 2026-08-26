@@ -21,7 +21,7 @@ from typing import Any, Callable, Sequence
 
 from .config import Settings
 from .database import JobDatabase
-from .models import Cue, TranscriptEvent, Word
+from .models import Cue, TranscriptEvent, Word, preview_cue_id
 from .process import CommandRunner
 from .transcription import (
     ElapsedProgressTicker,
@@ -364,7 +364,7 @@ def cues_from_words(
     collected.sort(key=lambda item: (item[0], item[1], item[2] or ""))
     return [
         Cue(
-            f"preview-{position}",
+            preview_cue_id(position),
             start,
             end,
             source,

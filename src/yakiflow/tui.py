@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from .alignment import AlignmentModelFailureDecision
 from .job import YakiFlowJob
 from .media_player import open_media
-from .models import AgentTraceEvent, Cue, JobEvent
+from .models import AgentTraceEvent, Cue, JobEvent, is_preview_cue_id
 
 from rich.text import Text
 from textual import events
@@ -34,6 +34,15 @@ def format_start_time(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}.{fraction:02d}"
+
+
+def subtitle_ordinal(cue: Cue) -> str:
+    """Render the No. column, blank while the cue split is still provisional.
+
+    A preview cue is renumbered on every re-segmentation, so showing its ID
+    would only offer a sequence that keeps shifting under the reader.
+    """
+    return "" if is_preview_cue_id(cue.id) else str(cue.id)
 
 
 def subtitle_text_widths(
@@ -264,7 +273,7 @@ class SubtitleTable(FollowTailMixin, DataTable, can_focus=True):
 
     def add_subtitle(self, cue: Cue) -> None:
         self.add_row(
-            subtitle_cell(str(cue.id), no_wrap=True),
+            subtitle_cell(subtitle_ordinal(cue), no_wrap=True),
             subtitle_cell(format_start_time(cue.start), no_wrap=True),
             subtitle_cell(cue.source),
             subtitle_cell((cue.translated or "").strip()),
@@ -274,7 +283,7 @@ class SubtitleTable(FollowTailMixin, DataTable, can_focus=True):
 
     def update_subtitle(self, cue: Cue) -> None:
         self.update_cell(
-            cue.id, "ordinal", subtitle_cell(str(cue.id), no_wrap=True)
+            cue.id, "ordinal", subtitle_cell(subtitle_ordinal(cue), no_wrap=True)
         )
         self.update_cell(
             cue.id, "start", subtitle_cell(format_start_time(cue.start), no_wrap=True)
