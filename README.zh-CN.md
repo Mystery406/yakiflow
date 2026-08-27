@@ -220,6 +220,17 @@ yakiflow run 'https://example.com/live' \
 字幕。在 TUI 中按 `s` 停止采集并把已收到的内容收尾；非 TUI 运行按一次 Ctrl-C。
 直播进行中可以按 `o`，在媒体播放器中打开目前已录到的部分并挂上当前的实时字幕。
 
+播放器只会加载一次字幕文件。要让 mpv 自动跟进实时字幕的更新，把本仓库的
+`contrib/mpv/sub-autoreload.lua` 复制到 mpv 的脚本目录（通常是
+`~/.config/mpv/scripts/`），或在 `review.video-open-command` 中加上
+`--script=/path/to/contrib/mpv/sub-autoreload.lua`。设置该选项会完全替换默认
+命令，可以在默认命令的基础上修改：
+
+```toml
+[review]
+video-open-command = "mpv --script=/path/to/contrib/mpv/sub-autoreload.lua --no-sub-auto --no-resume-playback --sub-file={subtitle} --sid=auto --sub-visibility=yes {file}"
+```
+
 ### 选择字幕形式
 
 使用 `--output-mode` 或在 TOML 中设置 `output-mode`：

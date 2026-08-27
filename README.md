@@ -231,6 +231,19 @@ press `s` to stop capture and finalize what has been received; press Ctrl-C
 once in a non-TUI run. While the stream is still running, press `o` to open
 the recording so far with the current live subtitles in the media player.
 
+The player loads the subtitle file only once. To make mpv pick up live
+subtitle updates automatically, copy `contrib/mpv/sub-autoreload.lua` from
+this repository into mpv's scripts directory (usually
+`~/.config/mpv/scripts/`), or add
+`--script=/path/to/contrib/mpv/sub-autoreload.lua` to
+`review.video-open-command`. Setting that option replaces the default
+command entirely, so start from it:
+
+```toml
+[review]
+video-open-command = "mpv --script=/path/to/contrib/mpv/sub-autoreload.lua --no-sub-auto --no-resume-playback --sub-file={subtitle} --sid=auto --sub-visibility=yes {file}"
+```
+
 ### Choose the subtitle format
 
 Use `--output-mode` or set `output-mode` in TOML:
