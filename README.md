@@ -228,7 +228,8 @@ yakiflow run 'https://example.com/live' \
 Live subtitles are provisional. After capture ends, YakiFlow transcribes the
 complete recording again before publishing the final subtitles. In the TUI,
 press `s` to stop capture and finalize what has been received; press Ctrl-C
-once in a non-TUI run.
+once in a non-TUI run. While the stream is still running, press `o` to open
+the recording so far with the current live subtitles in the media player.
 
 ### Choose the subtitle format
 

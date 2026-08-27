@@ -7,7 +7,10 @@ pytest.importorskip("textual")
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, RichLog
 
+from conftest import make_settings
+from yakiflow import tui
 from yakiflow.database import JobDatabase
+from yakiflow.job import YakiFlowJob
 from yakiflow.memory import MemoryStore
 from yakiflow.models import AgentTraceEvent, Cue, JobEvent
 from yakiflow.subtitle_preview import SubtitlePreviewApp
@@ -308,6 +311,58 @@ def test_stop_shortcut_cancels_pipeline_without_immediately_exiting_tui(
         job.db.close()
 
     asyncio.run(exercise())
+
+
+def test_open_media_shortcut_opens_growing_stream_media(tmp_path, monkeypatch) -> None:
+    job = YakiFlowJob(
+        "https://example.test/live",
+        make_settings(
+            agent={"backend": "codex"},
+            work_dir=tmp_path / "work",
+            memory=tmp_path / "memory.md",
+        ),
+        backend=object(),
+    )
+    growing = tmp_path / "downloads" / "source-abc.mkv.part"
+    growing.parent.mkdir()
+    growing.write_bytes(b"media")
+    partial = job.work_dir / "source.live.incomplete.ass"
+    partial.write_text(_subtitle(["hello"]), encoding="utf-8")
+
+    started = asyncio.Event()
+
+    async def fake_run():
+        # What _media_stage does once the stream's download decodes.
+        job._stream_media_path = growing
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(job, "run", fake_run)
+    calls: list[tuple] = []
+
+    def fake_open_media(command, media_path, subtitle_path, *, cwd=None):
+        calls.append((command, media_path, subtitle_path, cwd))
+        return True
+
+    monkeypatch.setattr(tui, "open_media", fake_open_media)
+
+    async def exercise() -> None:
+        app = YakiFlowApp(job)
+        async with app.run_test(size=(80, 30)) as pilot:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await pilot.press("o")
+            await pilot.pause()
+            assert calls == [
+                (
+                    job.settings.review.video_open_command,
+                    growing,
+                    partial,
+                    job.work_dir,
+                )
+            ]
+
+    asyncio.run(exercise())
+    job.close()
 
 
 def test_resumed_app_loads_all_existing_subtitles(tmp_path) -> None:

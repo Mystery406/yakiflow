@@ -211,11 +211,15 @@ def test_stream_decodes_only_the_audio_it_has_not_processed(
 
     runner = GrowingRunner()
     starts: list[float] = []
+    media_files: list[Path] = []
 
     async def on_chunk(_path: Path, start: float) -> None:
         starts.append(start)
         if len(starts) == 4:
             runner.finished.set()
+
+    async def on_media_file(path: Path) -> None:
+        media_files.append(path)
 
     db = JobDatabase(tmp_path / "db.sqlite3")
     asyncio.run(
@@ -224,6 +228,7 @@ def test_stream_decodes_only_the_audio_it_has_not_processed(
             tmp_path / "work",
             db,
             runner,
+            on_media_file=on_media_file,
         ).acquire_stream(MediaSource.parse("https://example.test/live"), on_chunk)
     )
 
@@ -232,6 +237,10 @@ def test_stream_decodes_only_the_audio_it_has_not_processed(
     # decoding the whole download over again.
     assert runner.tail_seeks[:2] == [0.0, 25.0]
     assert all(seek > 0 for seek in runner.tail_seeks[1:])
+    # The growing download is reported once it decodes, and only once while the
+    # path stays the same across passes.
+    assert [path.name.startswith("source-") for path in media_files] == [True]
+    assert media_files[0].suffix == ".mkv"
     db.close()
 
 

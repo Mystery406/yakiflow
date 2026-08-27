@@ -276,6 +276,7 @@ class YakiFlowJob:
         self._translation_batches_completed = 0
         self._translation_batches_total = 0
         self._artifact: MediaArtifact | None = None
+        self._stream_media_path: Path | None = None
         self._partial_write_lock = asyncio.Lock()
         self._word_timeline: WordTimelineView | None = None
 
@@ -331,10 +332,17 @@ class YakiFlowJob:
 
     @property
     def media_path(self) -> Path | None:
-        """The original or downloaded media file used by this job."""
+        """The original or downloaded media file used by this job.
+
+        While a stream is still being acquired, no artifact is recorded yet,
+        so the growing download stands in to keep the media openable.
+        """
         if self._artifact is not None:
             return self._artifact.media_path
-        return self.db.artifact("source_media")
+        recorded = self.db.artifact("source_media")
+        if recorded is not None:
+            return recorded
+        return self._stream_media_path
 
     @property
     def subtitle_path(self) -> Path | None:
@@ -717,6 +725,9 @@ class YakiFlowJob:
         async def media_warning(message: str) -> None:
             await self.emit("warning", message)
 
+        async def media_file(path: Path) -> None:
+            self._stream_media_path = path
+
         acquirer = MediaAcquirer(
             self.settings,
             self.work_dir,
@@ -724,6 +735,7 @@ class YakiFlowJob:
             self.runner,
             on_progress=media_progress,
             on_warning=media_warning,
+            on_media_file=media_file,
         )
         if not self.settings.stream.enabled:
             artifact = await acquirer.acquire(source)

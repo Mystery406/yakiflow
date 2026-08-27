@@ -44,6 +44,9 @@ class MediaArtifact:
 ChunkCallback = Callable[[Path, float], Awaitable[None]]
 ProgressCallback = Callable[[float], Awaitable[None]]
 WarningCallback = Callable[[str], Awaitable[None]]
+# Receives the still-growing media file of a stream once it holds decodable
+# audio, and again whenever the download switches files (rename, remux).
+MediaFileCallback = Callable[[Path], Awaitable[None]]
 DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?:~\s*)?(?P<percent>\d+(?:\.\d+)?)%")
 # How far a decoded tail may fall short of the audio already processed before it
 # counts as a broken extraction rather than rounding.
@@ -173,6 +176,7 @@ class MediaAcquirer:
         runner: CommandRunner | None = None,
         on_progress: ProgressCallback | None = None,
         on_warning: WarningCallback | None = None,
+        on_media_file: MediaFileCallback | None = None,
     ):
         self.settings = settings
         self.work_dir = work_dir
@@ -180,6 +184,7 @@ class MediaAcquirer:
         self.runner = runner or CommandRunner()
         self.on_progress = on_progress
         self.on_warning = on_warning
+        self.on_media_file = on_media_file
 
     async def _progress(self, fraction: float) -> None:
         if self.on_progress:
@@ -301,6 +306,7 @@ class MediaAcquirer:
         result = None
         interrupted = False
         emitted_duration = 0.0
+        reported_media: Path | None = None
         if continuous:
             chunk_seconds: float = CONTINUOUS_FEED_SECONDS
             context_seconds: float = CONTINUOUS_CONTEXT_SECONDS
@@ -379,6 +385,11 @@ class MediaAcquirer:
                     # would otherwise ask for an immediate one.
                     next_pass = pass_started + STREAM_POLL_SECONDS
                     continue
+                if self.on_media_file is not None and growing != reported_media:
+                    # Only after a successful decode: a player pointed at the
+                    # file is then guaranteed to find playable content.
+                    reported_media = growing
+                    await self.on_media_file(growing)
                 # Wait only for the audio the next chunk is still missing,
                 # counted from when this pass measured the download: the audio
                 # that arrived while the pass ran already counts toward the
