@@ -41,6 +41,7 @@ def _preview_command(
     marker: Path,
     media_path: Path | None = None,
     video_open_command: str | None = None,
+    show_speaker: bool = False,
 ) -> list[str]:
     return [
         sys.executable,
@@ -50,6 +51,7 @@ def _preview_command(
         str(marker),
         str(media_path) if media_path else "",
         video_open_command or "",
+        "1" if show_speaker else "",
     ]
 
 
@@ -141,7 +143,8 @@ async def start_agent_file_display(
         return AgentFileDisplay()
     command = _split_window_args()
     command.extend(("--", *_preview_command(
-        file_path, marker, media_path, settings.review.video_open_command
+        file_path, marker, media_path, settings.review.video_open_command,
+        settings.diarization_enabled,
     )))
     try:
         process = await asyncio.create_subprocess_exec(
@@ -442,7 +445,7 @@ async def run_interactive_agent(
     ):
         return await _run_in_new_tmux_session(
             command, work_dir, outputs, _source_media(work_dir),
-            settings.review.video_open_command,
+            settings.review.video_open_command, settings.diarization_enabled,
         )
     return await runner.run_interactive(command, cwd=work_dir)
 
@@ -453,6 +456,7 @@ async def _run_in_new_tmux_session(
     outputs: Sequence[Path],
     media_path: Path | None = None,
     video_open_command: str | None = None,
+    show_speaker: bool = False,
 ) -> ProcessResult:
     """Run Agent and preview in a tmux session created by YakiFlow itself."""
     session = f"yakiflow-review-{uuid.uuid4().hex[:8]}"
@@ -461,7 +465,9 @@ async def _run_in_new_tmux_session(
     marker.unlink(missing_ok=True)
     status_file.unlink(missing_ok=True)
     file_path = outputs[0] if outputs else work_dir / "memory.md"
-    preview = _preview_command(file_path, marker, media_path, video_open_command)
+    preview = _preview_command(
+        file_path, marker, media_path, video_open_command, show_speaker
+    )
     wrapped_agent = (
         f"{shlex.join(command)}; status=$?; "
         f"printf '%s' \"$status\" > {shlex.quote(str(status_file))}; "

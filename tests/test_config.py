@@ -227,6 +227,17 @@ def test_stage_extra_options_inherit_from_shared_table() -> None:
     assert settings.agent.final.extra_options == ("--final-only",)
 
 
+def test_only_the_batch_elevenlabs_backend_reports_diarization() -> None:
+    assert make_settings(transcription={"backend": "elevenlabs"}).diarization_enabled
+    assert not make_settings(
+        transcription={"backend": "elevenlabs"}, elevenlabs={"diarize": False}
+    ).diarization_enabled
+    assert not make_settings(
+        transcription={"backend": "elevenlabs-realtime"}
+    ).diarization_enabled
+    assert not make_settings().diarization_enabled
+
+
 def test_resolved_is_idempotent() -> None:
     settings = _validatable()
     assert settings.resolved() == settings

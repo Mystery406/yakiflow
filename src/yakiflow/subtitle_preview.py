@@ -57,16 +57,18 @@ class SubtitlePreviewApp(App[None]):
         marker: Path,
         media_path: Path | None = None,
         video_open_command: str | None = None,
+        show_speaker: bool = False,
     ):
         super().__init__()
         self.path = path
         self.marker = marker
         self.media_path = media_path
         self.video_open_command = video_open_command
+        self.show_speaker = show_speaker
         self._signature: tuple[int, int] | None = None
 
     def compose(self) -> ComposeResult:
-        table = SubtitleTable(id="recent")
+        table = SubtitleTable(id="recent", show_speaker=self.show_speaker)
         table.border_title = "Live subtitles"
         table.border_subtitle = "↑/↓ · PgUp/PgDn · ^Home/^End"
         yield table
@@ -110,11 +112,17 @@ class SubtitlePreviewApp(App[None]):
         table.follow_tail = follow_tail
         table.restore_scroll_after_update(previous_y)
 def main() -> int:
-    if len(sys.argv) != 5:
+    if len(sys.argv) != 6:
         return 2
     media = Path(sys.argv[3]) if sys.argv[3] else None
     command = sys.argv[4] or None
-    SubtitlePreviewApp(Path(sys.argv[1]), Path(sys.argv[2]), media, command).run()
+    SubtitlePreviewApp(
+        Path(sys.argv[1]),
+        Path(sys.argv[2]),
+        media,
+        command,
+        show_speaker=bool(sys.argv[5]),
+    ).run()
     return 0
 
 

@@ -237,6 +237,39 @@ def test_live_subtitle_reload_preserves_user_scroll_position(tmp_path) -> None:
     asyncio.run(exercise())
 
 
+def test_live_preview_shows_speakers_only_for_diarized_jobs(tmp_path) -> None:
+    subtitle = tmp_path / "review.ass"
+    marker = tmp_path / "done"
+    subtitle.write_text(
+        render_ass(
+            [
+                Cue("1", 0.0, 1.0, "hello", speaker="Alice"),
+                Cue("2", 1.0, 2.0, "hi", speaker="Bob"),
+            ],
+            "source",
+        ),
+        encoding="utf-8",
+    )
+
+    async def exercise() -> None:
+        diarized = SubtitlePreviewApp(subtitle, marker, show_speaker=True)
+        async with diarized.run_test(size=(80, 20)) as pilot:
+            await pilot.pause()
+            table = diarized.query_one("#recent", SubtitleTable)
+            assert table.get_cell("1", "speaker").plain.strip() == "Alice"
+            assert table.get_cell("2", "speaker").plain.strip() == "Bob"
+
+        plain = SubtitlePreviewApp(subtitle, marker)
+        async with plain.run_test(size=(80, 20)) as pilot:
+            await pilot.pause()
+            table = plain.query_one("#recent", SubtitleTable)
+            assert [str(column.label) for column in table.columns.values()] == [
+                "No.", "Start", "Source", "Translation",
+            ]
+
+    asyncio.run(exercise())
+
+
 def test_successful_pipeline_exits_for_interactive_agent_handoff(tmp_path) -> None:
     class FakeJob:
         def __init__(self) -> None:

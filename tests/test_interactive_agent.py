@@ -447,6 +447,26 @@ def test_both_display_mode_opens_external_command_and_tmux_preview(
     assert display.marker == tmp_path / ".agent-display-done"
 
 
+def test_preview_command_carries_the_speaker_column_flag(tmp_path: Path) -> None:
+    subtitle = tmp_path / "movie.ass"
+
+    diarized = make_settings(
+        transcription={"backend": "elevenlabs"}, elevenlabs={"api_key": "k"}
+    )
+    plain = make_settings(
+        transcription={"backend": "elevenlabs"},
+        elevenlabs={"api_key": "k", "diarize": False},
+    )
+    marker = tmp_path / ".agent-display-done"
+
+    assert interactive_agent._preview_command(
+        subtitle, marker, None, None, diarized.diarization_enabled
+    )[-1] == "1"
+    assert interactive_agent._preview_command(
+        subtitle, marker, None, None, plain.diarization_enabled
+    )[-1] == ""
+
+
 def test_interactive_commands_append_final_extra_options() -> None:
     codex = build_interactive_command(
         make_settings(

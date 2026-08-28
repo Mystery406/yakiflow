@@ -188,6 +188,18 @@ class Settings:
     review: ReviewSettings = _grp(ReviewSettings)
     commands: CommandsSettings = _grp(CommandsSettings)
 
+    @property
+    def diarization_enabled(self) -> bool:
+        """Whether cues can carry speakers.
+
+        Only the batch ElevenLabs backend diarizes; the realtime backend and
+        the Whisper backends never label speakers.
+        """
+        return (
+            self.transcription.backend == "elevenlabs"
+            and self.elevenlabs.diarize
+        )
+
     def resolved(self) -> Settings:
         """Fill derived defaults; safe to apply to already-resolved settings."""
 
