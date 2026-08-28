@@ -139,8 +139,9 @@ yakiflow run video.mp4 \
 但每个片段都要重新加载模型，预览会明显落后于直播。
 
 `elevenlabs` 后端支持说话人识别（`elevenlabs.diarize`，默认开启）：每条字幕的
-说话人标签写入 ASS 的 `Name` 字段，同时说话会成为时间上重叠的字幕。实时 API
-不支持说话人识别。使用 ElevenLabs 后端时，字幕的分行断句和翻译由 draft Agent
+说话人标签写入 ASS 的 `Name` 字段，同时说话会成为时间上重叠的字幕。有人被打断
+时，他的字幕会继续显示在插话的字幕下面，而不是就此中断。实时 API 不支持说话人
+识别。使用 ElevenLabs 后端时，字幕的分行断句和翻译由 draft Agent
 根据词级转录一并完成。
 
 连接已运行的 whisper-server 而不是本地启动：
@@ -467,7 +468,8 @@ open-command = "code --reuse-window {workdir} {subtitle} {memory}"
 ## 可选：改善字幕时间轴
 
 以下选项适用于 Whisper 后端。ElevenLabs 后端本身提供词级精度的时间轴，默认
-`alignment.backend = "none"`。
+`alignment.backend = "none"`；即使如此，每条字幕仍会在最后一个词说完后多留
+一会儿，而不是立刻消失。
 
 ### VAD
 
@@ -512,6 +514,9 @@ yakiflow doctor -c alignment.backend=whisperx
 
 首次运行可能下载 NLTK 数据和语言专用的对齐模型。如果对齐初始化在交互式运行中
 失败，YakiFlow 允许重试或退回 VAD；非交互式运行会保留任务供以后恢复。
+
+`whisperx` 可以和 `elevenlabs.diarize` 同时使用。与另一位说话人重叠的字幕保留
+原始时间，同时说话的效果得以保留；其余字幕照常对齐。
 
 ## 疑难解答
 

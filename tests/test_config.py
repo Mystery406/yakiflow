@@ -424,17 +424,18 @@ def test_vad_alignment_is_rejected_for_word_level_backends(
         )
 
 
-def test_diarized_elevenlabs_requires_alignment_none(
+def test_diarized_elevenlabs_accepts_whisperx_alignment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Forced alignment leaves crosstalk cues at their ASR times, so it no
+    # longer has to be refused outright when diarization is on.
     monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-test")
-    with pytest.raises(ValueError, match="elevenlabs.diarize"):
-        validate_run_settings(
-            _validatable(
-                transcription={"backend": "elevenlabs"},
-                alignment={"backend": "whisperx"},
-            )
+    validate_run_settings(
+        _validatable(
+            transcription={"backend": "elevenlabs"},
+            alignment={"backend": "whisperx"},
         )
+    )
     validate_run_settings(
         _validatable(
             transcription={"backend": "elevenlabs"},

@@ -16,6 +16,7 @@ from yakiflow.alignment import (
     WhisperVadAlignmentBackend,
     WhisperXAlignmentBackend,
     adjust_cue_starts_for_long_vad_silences,
+    crosstalk_cue_ids,
     extend_cue_ends,
 )
 from yakiflow.models import Cue
@@ -1102,6 +1103,10 @@ def test_shared_end_extension_uses_final_mixed_timeline_starts(
     forced_start: float,
     expected_fallback_end: float,
 ) -> None:
+    # Deliberately without speakers: only two different named speakers are
+    # crosstalk, so these two are ordinary cues whose ends the pass still
+    # decides — including the second case, where pulling the first end back
+    # to the next start is how an illegitimate overlap gets repaired.
     extended = extend_cue_ends(
         [
             Cue(
@@ -1140,3 +1145,150 @@ def test_alignment_preserves_cue_content_and_metadata() -> None:
         "translated",
     )
     assert aligned.metadata is metadata
+
+
+# --- crosstalk stays where the ASR put it ---
+
+
+@pytest.mark.parametrize(
+    ("second", "expected"),
+    [
+        (Cue("b", 1, 3, "b", speaker="2"), {"a", "b"}),
+        (Cue("b", 1, 3, "b", speaker="1"), set()),
+        (Cue("b", 1, 3, "b"), set()),
+        (Cue("b", 2, 3, "b", speaker="2"), set()),
+    ],
+    ids=["two-speakers", "same-speaker", "one-unnamed", "touching-endpoints"],
+)
+def test_crosstalk_cue_ids(second: Cue, expected: set[str]) -> None:
+    assert crosstalk_cue_ids([Cue("a", 0, 2, "a", speaker="1"), second]) == expected
+
+
+def test_end_extension_freezes_crosstalk_and_extends_everything_else() -> None:
+    alone = Cue("alone", 0.0, 0.5, "alone", speaker="1")
+    first = Cue("a", 2.0, 4.0, "a", speaker="1", metadata={"keep": True})
+    # Ends past the audio duration below: media length and ASR word times can
+    # disagree by a hair, and clamping would pin the pair to one shared end.
+    second = Cue("b", 3.0, 6.4, "b", speaker="2")
+
+    extended = extend_cue_ends([alone, first, second], duration=6.0)
+
+    assert [(cue.start, cue.end) for cue in extended] == [
+        (0.0, 1.0), (2.0, 4.0), (3.0, 6.4),
+    ]
+    assert extended[1] is first and extended[2] is second
+    assert extended[1].metadata is first.metadata
+
+
+def test_end_extension_still_repairs_a_same_speaker_overlap() -> None:
+    cues = [
+        Cue("a", 0.0, 4.0, "a", speaker="1"),
+        Cue("b", 2.0, 6.0, "b", speaker="1"),
+    ]
+
+    extended = extend_cue_ends(cues)
+
+    # One person cannot talk over themselves, so this overlap is a defect and
+    # end extension keeps repairing it.
+    assert extended[0].end == 2.0
+
+
+def test_whisper_vad_alignment_leaves_crosstalk_alone() -> None:
+    cues = [
+        Cue("a", 0.0, 1.0, "one", speaker="1", timing_confidence=0.55),
+        Cue("b", 0.5, 2.5, "two", speaker="2"),
+        Cue("c", 3.0, 4.0, "three", speaker="1"),
+    ]
+
+    result = WhisperVadAlignmentBackend._align(
+        Path("unused.wav"), cues, [(0, 0.8), (1.5, 2.3), (3.4, 3.9)]
+    )
+
+    assert result.cues[0] is cues[0] and result.cues[1] is cues[1]
+    assert result.cues[0].timing_confidence == 0.55
+    # The free cue is aligned as usual, with the frozen ones as boundaries.
+    assert (result.cues[2].start, result.cues[2].end) == (3.4, 3.9)
+    # A frozen cue was never asked for a start, so it is not a missing one.
+    assert result.low_confidence_ids == []
+
+
+def test_pre_alignment_start_leaves_crosstalk_alone() -> None:
+    cues = [
+        Cue("a", 1, 50, "one", speaker="1"),
+        Cue("b", 40, 60, "two", speaker="2"),
+        Cue("c", 61, 110, "three", speaker="1"),
+    ]
+
+    adjusted = adjust_cue_starts_for_long_vad_silences(
+        cues, [(0, 2), (30, 32), (40, 45), (90, 105)]
+    )
+
+    assert adjusted[0] is cues[0] and adjusted[1] is cues[1]
+    assert adjusted[2].start == 87
+
+
+def test_volume_refiner_skips_crosstalk_cues(tmp_path: Path) -> None:
+    audio = tmp_path / "quiet-then-loud.wav"
+    _volume_wav(
+        audio,
+        lambda time: (
+            12
+            if 0.5 <= time < 0.9
+            else 8_000
+            if time < 0.4 or 1.2 <= time < 1.6
+            else 2
+        ),
+    )
+    # The same cue the test above moves to ~0.44, now overlapped by another
+    # speaker: two voices at once is exactly what an envelope cannot read.
+    cues = [
+        Cue("a", 0.4, 1.8, "quiet speech", speaker="1"),
+        Cue("b", 1.0, 1.9, "the other voice", speaker="2"),
+    ]
+
+    refined = PcmVolumeStartRefiner._refine(audio, cues)
+
+    assert refined[0] is cues[0] and refined[1] is cues[1]
+    assert "volume_start" not in refined[0].metadata
+
+
+def test_whisperx_skips_crosstalk_without_falling_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def result(segments, _call):
+        return {
+            "segments": [{
+                "text": segments[0]["text"],
+                "words": [{"word": "alone", "start": 0.4, "end": 0.9, "score": 0.9}],
+            }]
+        }
+
+    fake = FakeWhisperX(result)
+    monkeypatch.setattr(alignment_module, "import_module", lambda _name: fake)
+    vad = FakeVadBackend()
+    backend = WhisperXAlignmentBackend(language="en", device="cpu", vad_backend=vad)
+    progress: list[tuple[int, int]] = []
+
+    aligned = asyncio.run(
+        backend.align(
+            tmp_path / "audio.wav",
+            [
+                Cue("a", 1.0, 3.0, "one", speaker="1"),
+                Cue("b", 2.0, 4.0, "two", speaker="2"),
+                Cue("c", 6.0, 7.0, "alone", speaker="1"),
+            ],
+            on_progress=lambda completed, total: progress.append((completed, total)),
+        )
+    )
+
+    # Only the free cue was force-aligned, and skipping the other two is not a
+    # failure: counting it as one would drag the whole timeline into the VAD
+    # fallback. The progress count still reaches its total.
+    assert fake.excerpt_durations == pytest.approx([1.7])
+    assert vad.calls == 0
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+    assert [(cue.start, cue.end) for cue in aligned.cues] == [
+        (1.0, 3.0), (2.0, 4.0), pytest.approx((6.2, 6.7)),
+    ]
+    assert [cue.metadata["parent_id"] for cue in aligned.cues] == ["a", "b", "c"]
+    assert aligned.low_confidence_ids == []

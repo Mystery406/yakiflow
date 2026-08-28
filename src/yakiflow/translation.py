@@ -9,6 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass, replace
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Sequence
 
@@ -558,10 +559,13 @@ class WordSettlement:
     sides land — and hands out renames to the exact IDs the final install
     will assign, so they can be shown (and persisted) early.
 
-    Ties with future work are excluded structurally: word start times never
-    decrease with the ordinal, so any cue a later batch or repair may still
-    produce starts at or after the first mutable word, and only cues
-    starting strictly earlier settle.
+    Ties with future work are excluded by a frontier: any cue a later batch
+    or repair may still produce begins at one of the mutable words, so the
+    smallest of their starts bounds everything still to come, and only cues
+    starting strictly earlier settle. It really is the minimum over the whole
+    mutable suffix and not the first mutable word's start: starts no longer
+    rise with the ordinal, because an interrupted speaker's repaired words
+    legitimately run past the next speaker's first word.
     """
 
     def __init__(self, cues: Iterable[Cue]) -> None:
@@ -672,7 +676,9 @@ class WordSettlement:
             mutable_from = min(
                 _word_span(self._by_id[self._owner[j]]).start for j in barriers
             )
-            frontier_start = words[mutable_from].start
+            frontier_start = min(
+                word.start for word in islice(words, mutable_from, None)
+            )
         else:
             mutable_from = total
             frontier_start = math.inf

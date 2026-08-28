@@ -147,8 +147,9 @@ makes the preview lag well behind the stream.
 
 The `elevenlabs` backend recognizes speakers (`elevenlabs.diarize`, on by
 default): each subtitle's speaker label lands in the ASS `Name` field, and
-overlapping speech becomes overlapping subtitles. The realtime API does not
-diarize. With the ElevenLabs backends, subtitle line breaks and translations
+overlapping speech becomes overlapping subtitles. When someone is interrupted,
+their subtitle keeps running underneath the interrupting one instead of being
+cut short at that moment. The realtime API does not diarize. With the ElevenLabs backends, subtitle line breaks and translations
 are produced together by the draft Agent from the word-level transcript.
 
 To use an already-running whisper-server instead of starting one:
@@ -503,7 +504,9 @@ batch result is finalized directly.
 ## Optional: improve subtitle timing
 
 These options apply to the Whisper backends. The ElevenLabs backends deliver
-word-accurate timing already and default to `alignment.backend = "none"`.
+word-accurate timing already and default to `alignment.backend = "none"`, which
+still holds each subtitle a moment past its last word instead of cutting it
+there.
 
 ### VAD
 
@@ -551,6 +554,10 @@ yakiflow doctor -c alignment.backend=whisperx
 The first run may download NLTK data and a language-specific alignment model.
 If alignment setup fails interactively, YakiFlow lets you retry or fall back to
 VAD; a non-interactive run preserves the job for later resumption.
+
+`whisperx` may be used together with `elevenlabs.diarize`. Subtitles that
+overlap another speaker's keep their original times, so people talking over
+each other stay that way; every other subtitle is aligned as usual.
 
 ## Troubleshooting
 

@@ -1361,7 +1361,7 @@ def test_resuming_a_finished_job_does_not_republish_over_reviewed_files(
     resumed.close()
 
 
-def test_alignment_none_installs_the_timeline_without_touching_overlaps(
+def test_alignment_none_extends_ends_but_leaves_crosstalk_alone(
     tmp_path: Path,
 ) -> None:
     audio = tmp_path / "audio.wav"
@@ -1375,11 +1375,12 @@ def test_alignment_none_installs_the_timeline_without_touching_overlaps(
         work_dir=tmp_path / "work",
     )
     job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
-    # Two speakers talking over each other: any timing adjustment pass would
-    # "fix" this overlap, which is exactly why alignment none must not run one.
+    # The first two speak over each other, so their ASR timing stands; the
+    # third talks alone and still gets the shared end extension.
     cues = [
         Cue("1", 0.0, 4.0, "a", "甲", speaker="1"),
         Cue("2", 2.0, 6.0, "b", "乙", speaker="2"),
+        Cue("3", 8.0, 9.0, "c", "丙", speaker="1"),
     ]
     job.db.upsert_cues(cues)
     artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
@@ -1389,10 +1390,75 @@ def test_alignment_none_installs_the_timeline_without_touching_overlaps(
     assert [(cue.start, cue.end, cue.speaker) for cue in aligned] == [
         (0.0, 4.0, "1"),
         (2.0, 6.0, "2"),
+        (8.0, 9.5, "1"),
     ]
     assert job.db.get_checkpoint("alignment_complete") is True
     assert job.alignment_result is not None
     assert job.alignment_result.backend == "none"
+    job.close()
+
+
+def test_whisperx_alignment_returns_diarized_crosstalk_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yakiflow.alignment as alignment_module
+
+    class FakeWhisperX:
+        def load_audio(self, _path):
+            return [0.0] * (16_000 * 10)
+
+        def nltk_load(self, _resource):
+            return object()
+
+        def load_align_model(self, **_kwargs):
+            return object(), {"dictionary": "fake"}
+
+        def align(self, segments, _model, _metadata, _audio, _device, **_kwargs):
+            return {
+                "segments": [{
+                    "text": segments[0]["text"],
+                    "words": [{"word": "c", "start": 0.3, "end": 1.1, "score": 0.9}],
+                }]
+            }
+
+    monkeypatch.setattr(alignment_module, "import_module", lambda _name: FakeWhisperX())
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-test")
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\x00\x00" * 160000)
+    settings = make_settings(
+        source_language="en",
+        target_language="zh-CN",
+        transcription={"backend": "elevenlabs"},
+        agent={"backend": "codex"},
+        alignment={"backend": "whisperx"},
+        memory=tmp_path / "memory.md",
+        work_dir=tmp_path / "work",
+    )
+    job = YakiFlowJob("input.mp4", settings, backend=PipelineBackend())
+    assert job.settings.elevenlabs.diarize
+    cues = [
+        Cue("1", 1.0, 3.0, "a", "甲", speaker="1"),
+        Cue("2", 2.0, 4.0, "b", "乙", speaker="2"),
+        Cue("3", 8.0, 9.0, "c", "丙", speaker="1"),
+    ]
+    job.db.upsert_cues(cues)
+    artifact = MediaArtifact(MediaSource.parse("input.mp4"), audio)
+
+    aligned = asyncio.run(job._alignment_stage(artifact, cues))
+
+    # Forced alignment moves the cue that stands alone and hands the crosstalk
+    # pair back exactly as the ASR timed it, end extension included.
+    assert [(cue.start, cue.end, cue.speaker) for cue in aligned] == [
+        (1.0, 3.0, "1"),
+        (2.0, 4.0, "2"),
+        (pytest.approx(8.1), pytest.approx(9.4), "1"),
+    ]
+    assert job.alignment_result is not None
+    assert job.alignment_result.backend == "whisperx"
     job.close()
 
 
@@ -1568,7 +1634,11 @@ def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
         ("1", "How are you", "T:How are you"),
         ("2", "Fine", "T:Fine"),
     ]
-    # The crosstalk overlap survives all the way through alignment none.
+    # The crosstalk overlap survives all the way through alignment none, and
+    # the pair keeps the word times verbatim: the WAV above runs 1.0 s while
+    # the words run to 1.8 s, so a clamp to the audio duration would flatten
+    # both cues onto one end and erase the overlap.
     assert final[1].start < final[0].end
+    assert [(cue.start, cue.end) for cue in final] == [(0.0, 1.4), (1.2, 1.8)]
     assert job.db.get_checkpoint("alignment_complete") is True
     job.close()

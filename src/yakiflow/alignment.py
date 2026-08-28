@@ -108,6 +108,36 @@ def _read_pcm_window_levels(
     return levels, window, rate
 
 
+def crosstalk_cue_ids(cues: Sequence[Cue]) -> set[str]:
+    """IDs of the cues that overlap a cue of a different *named* speaker.
+
+    This is the criterion the subtitle module states, applied to timing: only
+    two different named speakers overlapping can be two people talking at
+    once. Any other overlap — same speaker, or either side unnamed — cannot
+    be, and stays fair game for the timing passes; end extension in
+    particular repairs exactly those by pulling an end back to the next start.
+
+    Every pass recomputes this for the cues it is about to touch rather than
+    receiving it: forced alignment splits and renumbers cues, so a set decided
+    outside would no longer name the same cues inside.
+    """
+    ordered = sorted(
+        (cue for cue in cues if cue.speaker), key=lambda cue: (cue.start, cue.end)
+    )
+    crosstalk: set[str] = set()
+    # Cues still running at the current start. Touching endpoints are not an
+    # overlap, so a cue leaves as soon as its end reaches the next start.
+    active: list[Cue] = []
+    for cue in ordered:
+        active = [other for other in active if other.end > cue.start]
+        for other in active:
+            if other.speaker != cue.speaker:
+                crosstalk.add(cue.id)
+                crosstalk.add(other.id)
+        active.append(cue)
+    return crosstalk
+
+
 @dataclass(slots=True)
 class AlignmentResult:
     cues: list[Cue]
@@ -203,13 +233,22 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
         if not intervals:
             raise ValueError("audio contains no speech activity")
 
+        # Crosstalk keeps the timing the ASR gave it, which is the best account
+        # of who spoke when; the pass only moves the cues around it, for which
+        # a frozen cue is an ordinary boundary.
+        frozen = crosstalk_cue_ids(cues)
         starts: list[float] = []
-        confidences: list[float] = []
+        confidences: list[float | None] = []
         low: list[str] = []
         previous_end = -math.inf
         pcm_confirmation_intervals: list[tuple[float, float]] | None = None
         pcm_confirmation_attempted = False
         for cue in cues:
+            if cue.id in frozen:
+                starts.append(cue.start)
+                confidences.append(cue.timing_confidence)
+                previous_end = cue.end
+                continue
             start: float | None = None
             if has_whisper_vad:
                 long_silence_candidates = cls._long_silence_start_candidates(
@@ -265,7 +304,9 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
             previous_end = cue.end
 
         refined_ends = [
-            cls._refined_end(
+            cue.end
+            if cue.id in frozen
+            else cls._refined_end(
                 intervals,
                 cue.end,
                 starts[index],
@@ -274,7 +315,9 @@ class WhisperVadAlignmentBackend(AlignmentBackend):
             for index, cue in enumerate(cues)
         ]
         output = [
-            cue.with_timing(
+            cue
+            if cue.id in frozen
+            else cue.with_timing(
                 starts[index],
                 max(starts[index], refined_ends[index]),
                 confidences[index],
@@ -527,13 +570,25 @@ def extend_cue_ends(
     *,
     duration: float | None = None,
 ) -> list[Cue]:
-    """Apply the shared subtitle end-extension policy to a final timeline."""
+    """Apply the shared subtitle end-extension policy to a final timeline.
+
+    Crosstalk cues pass through untouched — not extended, and not even clamped
+    to the audio duration: media length and ASR word times can disagree by a
+    hair, and clamping would pin a crosstalk pair to one shared end and erase
+    the overlap. Everything else is extended as usual, which is also how an
+    illegitimate overlap gets repaired here, by pulling the earlier end back
+    to the next start.
+    """
     if not cues:
         return []
+    frozen = crosstalk_cue_ids(cues)
     ordered = sorted(cues, key=lambda cue: (cue.start, cue.end))
     maximum = math.inf if duration is None else max(0.0, duration)
     output: list[Cue] = []
     for index, cue in enumerate(ordered):
+        if cue.id in frozen:
+            output.append(cue)
+            continue
         start = min(maximum, cue.start)
         base_end = min(maximum, max(start, cue.end))
         if index + 1 == len(ordered):
@@ -561,13 +616,20 @@ def adjust_cue_starts_for_long_vad_silences(
     cues: Sequence[Cue],
     vad_intervals: Sequence[tuple[float, float]],
 ) -> list[Cue]:
-    """Move starts near the end of the last long VAD silence in each cue."""
+    """Move starts near the end of the last long VAD silence in each cue.
+
+    Crosstalk cues keep the start the ASR gave them.
+    """
     intervals = WhisperVadAlignmentBackend._merge_intervals(vad_intervals)
     if not intervals:
         return list(cues)
 
+    frozen = crosstalk_cue_ids(cues)
     adjusted: list[Cue] = []
     for cue in cues:
+        if cue.id in frozen:
+            adjusted.append(cue)
+            continue
         previous_speech_end = cue.start
         last_long_silence_end: float | None = None
         for speech_start, speech_end in intervals:
@@ -641,8 +703,14 @@ class PcmVolumeStartRefiner:
         if not levels or max(levels) <= 0:
             return cues
         global_floor = cls._quantile(levels, cls._NOISE_QUANTILE)
+        # Two voices at once is exactly the case an envelope cannot read: the
+        # other speaker's onset would move this cue's start.
+        frozen = crosstalk_cue_ids(cues)
         output: list[Cue] = []
         for cue in cues:
+            if cue.id in frozen:
+                output.append(cue)
+                continue
             detected = cls._detect_onset(levels, step, cue, global_floor)
             if detected is None:
                 output.append(cue)
@@ -897,8 +965,19 @@ class WhisperXAlignmentBackend(AlignmentBackend):
             failed_ids: list[str] = []
             zero_first_token_ids: list[str] = []
             zero_score_words_by_parent: dict[str, list[dict[str, Any]]] = {}
+            frozen = crosstalk_cue_ids(original)
             total_cues = len(original)
             for completed_cues, cue in enumerate(original, start=1):
+                if cue.id in frozen:
+                    # Forced alignment assumes one voice at a time, so a
+                    # crosstalk cue keeps its ASR timing. Not an alignment
+                    # failure — recording it as one would drag the whole
+                    # timeline into the VAD fallback — but progress still
+                    # counts it, or the bar would stop short of its total.
+                    await self._notify_progress(
+                        on_progress, completed_cues, total_cues
+                    )
+                    continue
                 result: list[Cue] | None = None
                 attempts: list[dict[str, Any]] = []
                 zero_score_words: list[dict[str, Any]] | None = None
@@ -1004,6 +1083,9 @@ class WhisperXAlignmentBackend(AlignmentBackend):
                 forced = aligned_by_parent.get(parent.id)
                 if forced:
                     combined.extend(forced)
+                    continue
+                if parent.id in frozen:
+                    combined.append(parent)
                     continue
                 fallback_cue = fallback_by_id.get(parent.id, parent)
                 metadata = dict(fallback_cue.metadata)
@@ -1410,9 +1492,17 @@ class WhisperXAlignmentBackend(AlignmentBackend):
     ) -> list[Cue]:
         if not cues:
             return []
-        ordered = sorted(cues, key=lambda cue: (cue.start, cue.end))
+        frozen = crosstalk_cue_ids(cues)
+        # Same ordering as the word pipeline uses, speaker included, so a
+        # crosstalk pair that starts and ends together keeps one stable order.
+        ordered = sorted(cues, key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
         result: list[Cue] = []
         for cue in ordered:
+            if cue.id in frozen:
+                # Clamping a crosstalk pair against a duration that disagrees
+                # with the ASR by a hair would pin both to one end.
+                result.append(cue)
+                continue
             start = min(duration, max(0.0, cue.start))
             end = min(duration, max(start, cue.end))
             result.append(cue.with_timing(start, max(start, end), cue.timing_confidence))

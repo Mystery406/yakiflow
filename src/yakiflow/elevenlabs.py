@@ -16,8 +16,10 @@ import asyncio
 import os
 import subprocess
 from dataclasses import dataclass
+from itertools import islice
 from math import ceil
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable, Sequence
 
 from .config import Settings
@@ -286,6 +288,134 @@ def words_from_response(items: Sequence[Any], *, offset: float = 0.0) -> list[Wo
             logprob=float(logprob) if logprob is not None else None,
         ))
     return words
+
+
+# --- squeezed-word repair ---
+
+# A word shorter than this carries no usable duration: however fast somebody
+# speaks, no real syllable is over that quickly, while the squeezed words the
+# batch API emits before a speaker change are an order of magnitude shorter
+# again. A fixed threshold rather than one relative to the speaking rate: it is
+# predictable and adjustable, and measuring the rate would otherwise have to
+# start by excluding the very words this decides about.
+SQUEEZED_WORD_SECONDS = 0.05
+
+# However long the estimate says one squeezed run should have been, it never
+# gets more than this: a stray rate must not invent seconds of subtitle.
+MAX_REPAIRED_RUN_SECONDS = 5.0
+
+# Speaking rate used when neither the speaker nor the transcript as a whole
+# offers enough uncompressed words to measure one, in seconds per weight unit.
+_FALLBACK_SECONDS_PER_WEIGHT = 0.06
+_MIN_RATE_SAMPLES = 3
+
+
+def _word_weight(word: Word) -> int:
+    """Display-width weight of one word, the measure cue length also uses."""
+    return max(1, cue_text_weight(word.text.strip()))
+
+
+def _speech_rates(
+    words: Sequence[Word],
+) -> tuple[dict[str | None, float], float]:
+    """Per-speaker and overall median seconds per weight unit.
+
+    The median, not the mean: a word that swallowed a pause would drag an
+    average up, and there is always one. Words below the squeeze threshold are
+    left out of the measurement entirely — whatever produced them, their
+    duration says nothing about how fast anybody speaks.
+    """
+    samples: dict[str | None, list[float]] = {}
+    for word in words:
+        duration = word.end - word.start
+        if duration < SQUEEZED_WORD_SECONDS:
+            continue
+        samples.setdefault(word.speaker, []).append(duration / _word_weight(word))
+    everyone = [value for values in samples.values() for value in values]
+    overall = (
+        median(everyone)
+        if len(everyone) >= _MIN_RATE_SAMPLES
+        else _FALLBACK_SECONDS_PER_WEIGHT
+    )
+    rates = {
+        speaker: median(values) if len(values) >= _MIN_RATE_SAMPLES else overall
+        for speaker, values in samples.items()
+    }
+    return rates, overall
+
+
+def repair_squeezed_words(
+    words: Sequence[Word], *, duration: float | None = None
+) -> None:
+    """Give back a plausible duration to words squeezed by a speaker change.
+
+    The batch API keeps one monotonic timeline for the whole conversation, so
+    it has no way to say two people spoke at once. When B cuts in, the rest of
+    A's words are crushed into the sliver before B starts, each about 0.01 s
+    long. Cue times are derived mechanically from word times — by the preview
+    segmenter and by the draft agent's segmentation alike — so A's subtitle
+    would flash past while A is still audibly speaking.
+
+    The speaker change is the anchor, because the squeeze always ends at the
+    moment the other speaker starts. Walking back along the interrupted
+    speaker's own track from the last word before the change, every
+    consecutive word shorter than ``SQUEEZED_WORD_SECONDS`` joins the run,
+    which stops at the first word of ordinary length: a clean hand-off is left
+    alone, and a short word in the middle of somebody's turn never touches a
+    change point in the first place.
+
+    The run is re-spread over the duration its text deserves at that speaker's
+    measured pace, capped by ``MAX_REPAIRED_RUN_SECONDS``, by the speaker's own
+    next word — nobody overlaps themselves — and by the audio duration. Both
+    ends of every word in the run move: extending only the last word would let
+    words inside one run overlap each other, and a cue cut mid-run would then
+    publish two overlapping subtitles of one speaker, which this project
+    treats as a defect.
+
+    Ordinals never change, and the stream stops being sorted by start time.
+    That is the repair, not a side effect: A really did speak past B's start.
+    """
+    if len({word.speaker for word in words}) < 2:
+        return
+    rates, overall = _speech_rates(words)
+    for index in range(len(words) - 1):
+        speaker = words[index].speaker
+        if speaker is None or words[index + 1].speaker == speaker:
+            continue
+        run: list[int] = []
+        for candidate in range(index, -1, -1):
+            if words[candidate].speaker != speaker:
+                continue
+            if words[candidate].end - words[candidate].start >= SQUEEZED_WORD_SECONDS:
+                break
+            run.append(candidate)
+        run.reverse()
+        if not run:
+            continue
+        weights = [_word_weight(words[position]) for position in run]
+        total = sum(weights)
+        span_start = words[run[0]].start
+        end = span_start + total * rates.get(speaker, overall)
+        end = min(end, span_start + MAX_REPAIRED_RUN_SECONDS)
+        own_next = next(
+            (
+                other.start
+                for other in islice(words, index + 1, None)
+                if other.speaker == speaker
+            ),
+            None,
+        )
+        if own_next is not None:
+            end = min(end, own_next)
+        if duration is not None:
+            end = min(end, duration)
+        if end <= max(span_start, words[run[-1]].end):
+            continue
+        covered = 0
+        for position, weight in zip(run, weights):
+            words[position].start = span_start + (end - span_start) * covered / total
+            covered += weight
+            words[position].end = span_start + (end - span_start) * covered / total
 
 
 def qualified_silences(words: Sequence[Word]) -> list[tuple[int, float]]:
@@ -602,6 +732,11 @@ class ElevenLabsTranscriber(Transcriber):
         if language:
             self.db.checkpoint("detected_source_language", language)
         words = words_from_response(_get(response, "words", []) or [])
+        # Before anything else consumes the stream: cue times are derived from
+        # word times in both the preview and the agent segmentation, so the
+        # repair belongs to the words themselves. The verbatim API answer is
+        # already on disk above, and stays word-for-word what was returned.
+        repair_squeezed_words(words, duration=duration)
         self.db.replace_transcript_words(words)
         preview = cues_from_words(
             words,

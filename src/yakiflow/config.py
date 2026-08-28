@@ -559,16 +559,6 @@ def validate_run_settings(settings: Settings) -> None:
             "alignment.backend 'vad' needs Whisper's VAD intervals; use "
             "'none' (or 'whisperx') with an ElevenLabs transcription backend"
         )
-    if (
-        settings.transcription.backend == "elevenlabs"
-        and settings.elevenlabs.diarize
-        and settings.alignment.backend != "none"
-    ):
-        raise ValueError(
-            "alignment.backend must be 'none' when elevenlabs.diarize is "
-            "enabled: forced alignment assumes one non-overlapping timeline "
-            "and would destroy overlapping cues from different speakers"
-        )
     if settings.alignment.device not in {"auto", "cpu", "cuda"}:
         raise ValueError("alignment.device must be auto, cpu, or cuda")
     if word_level:

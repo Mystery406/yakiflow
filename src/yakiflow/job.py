@@ -1271,19 +1271,26 @@ class YakiFlowJob:
             await self._finish_stage("align", "alignment ready")
             return restored
         if self.settings.alignment.backend == "none":
-            # No timing adjustment at all: silence trimming, forced alignment,
-            # and end extension each assume one monotonic timeline, and every
-            # one of them would corrupt legitimately overlapping cues from
-            # different speakers. The timeline is still installed so the
+            # "none" means none of the passes that scan the audio: silence
+            # trimming, forced alignment, and volume start refinement. End
+            # extension is not one of them — it is a readability policy over
+            # the finished timeline, it leaves crosstalk cues alone, and
+            # without it every subtitle would vanish the instant its last word
+            # ends. The timeline is still installed so the
             # ``alignment_complete`` checkpoint keeps its resume meaning.
-            await self._begin_stage("align", "alignment disabled (none)")
-            self.alignment_result = AlignmentResult(list(cues), "none")
+            await self._begin_stage("align", "extending subtitle ends")
+            self.alignment_result = AlignmentResult(
+                extend_cue_ends(
+                    cues, duration=pcm_audio_duration(artifact.audio_path)
+                ),
+                "none",
+            )
             self.db.replace_aligned_timeline(self.alignment_result.cues)
             await self.emit("timeline-replaced", "subtitle timeline installed")
             await self._write_partial(
                 self._draft_partial_path(artifact), self.alignment_result.cues
             )
-            await self._finish_stage("align", "alignment skipped")
+            await self._finish_stage("align", "subtitle ends extended")
             return self.alignment_result.cues
         await self._begin_stage("align", "adjusting subtitle starts against silence")
         language = self.db.get_checkpoint("detected_source_language") or normalize_source_language(

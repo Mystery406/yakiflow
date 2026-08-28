@@ -7,12 +7,14 @@ import pytest
 from conftest import make_settings
 from yakiflow.database import JobDatabase
 from yakiflow.elevenlabs import (
+    SQUEEZED_WORD_SECONDS,
     ElevenLabsTranscriber,
     cues_from_words,
     dispatchable_word_count,
     estimate_convert_seconds,
     normalize_speaker,
     qualified_silences,
+    repair_squeezed_words,
     split_word_batches,
     words_from_response,
 )
@@ -66,6 +68,152 @@ def test_words_from_response_applies_the_chunk_offset() -> None:
         [{"type": "word", "text": "hi", "start": 1.0, "end": 1.5}], offset=100.0
     )
     assert (words[0].start, words[0].end) == (101.0, 101.5)
+
+
+# --- squeezed-word repair ---
+
+
+def _interrupted() -> list[Word]:
+    """Speaker 1 at 0.1 s per weight unit, cut off mid-sentence by speaker 2.
+
+    The three opening words are what the pace is measured from; the last four
+    are the API's squeeze, each 0.01 s long, crushed into the sliver before
+    the other speaker starts.
+    """
+    return [
+        _word(0, 10.80, 11.14, "我觉得", "1"),
+        _word(1, 11.14, 11.40, "这件", "1"),
+        _word(2, 11.40, 11.64, "东西", "1"),
+        _word(3, 11.64, 11.65, "事", "1"),
+        _word(4, 11.65, 11.66, "情", "1"),
+        _word(5, 11.66, 11.67, "很", "1"),
+        _word(6, 11.67, 11.68, "重要", "1"),
+        _word(7, 11.75, 12.30, "那个", "2"),
+    ]
+
+
+def test_repair_respreads_the_squeezed_run_at_the_speaker_pace() -> None:
+    words = _interrupted()
+    repair_squeezed_words(words)
+
+    # Weight 10 ("事情很重要") at the measured 0.06 s per unit is 0.6 s.
+    assert words[3].start == 11.64, "the run keeps the start it was given"
+    assert words[6].end == pytest.approx(12.24)
+    run = words[3:7]
+    assert [word.end - word.start for word in run] == pytest.approx(
+        [0.12, 0.12, 0.12, 0.24]
+    )
+    # Redistributed, not merely stretched at the end: the words inside the run
+    # stay in order and never overlap each other.
+    assert [word.start for word in run] == pytest.approx(
+        [word.end for word in words[2:6]]
+    )
+    # The repair is the whole point: speaker 1 now runs past speaker 2's start.
+    assert words[6].end > words[7].start
+    assert [word.ordinal for word in words] == list(range(8))
+
+
+def test_repair_never_reaches_the_speakers_own_next_word() -> None:
+    words = _interrupted()
+    words.append(_word(8, 12.00, 12.40, "所以", "1"))
+    repair_squeezed_words(words)
+
+    # 0.6 s would land at 12.24; nobody overlaps themselves.
+    assert words[6].end == pytest.approx(12.00)
+    assert [word.end - word.start for word in words[3:7]] == pytest.approx(
+        [0.072, 0.072, 0.072, 0.144]
+    )
+
+
+def test_repair_is_capped_by_the_audio_duration() -> None:
+    words = _interrupted()
+    repair_squeezed_words(words, duration=12.0)
+
+    assert words[6].end == pytest.approx(12.0)
+
+
+def test_repair_leaves_a_single_speaker_transcript_alone() -> None:
+    for speaker in ("1", None):
+        words = [
+            _word(0, 0.0, 0.40, "我觉得", speaker),
+            _word(1, 0.40, 0.66, "这件", speaker),
+            _word(2, 0.66, 0.90, "东西", speaker),
+            _word(3, 0.90, 0.91, "很", speaker),
+            _word(4, 0.91, 0.92, "重要", speaker),
+        ]
+        before = [(word.start, word.end) for word in words]
+        repair_squeezed_words(words)
+        assert [(word.start, word.end) for word in words] == before
+
+
+def test_repair_skips_a_clean_hand_off() -> None:
+    words = _interrupted()
+    # The word before the change has an ordinary duration, so the hand-off was
+    # clean and the short words earlier in the turn are none of this pass's
+    # business.
+    words[6] = _word(6, 11.67, 11.95, "重要", "1")
+    before = [(word.start, word.end) for word in words]
+    repair_squeezed_words(words)
+
+    assert [(word.start, word.end) for word in words] == before
+
+
+def test_repair_leaves_a_short_word_inside_a_turn_alone() -> None:
+    words = [
+        _word(0, 0.00, 0.34, "我觉得", "1"),
+        _word(1, 0.34, 0.36, "这", "1"),  # a clipped word mid-turn
+        _word(2, 0.40, 0.66, "件事", "1"),
+        _word(3, 0.66, 0.90, "东西", "1"),
+        _word(4, 1.00, 1.55, "那个", "2"),
+    ]
+    before = [(word.start, word.end) for word in words]
+    repair_squeezed_words(words)
+
+    assert [(word.start, word.end) for word in words] == before
+
+
+def test_repair_threshold_is_exclusive() -> None:
+    words = _interrupted()
+    words[6] = _word(6, 11.67, 11.67 + SQUEEZED_WORD_SECONDS, "重要", "1")
+    before = [(word.start, word.end) for word in words]
+    repair_squeezed_words(words)
+
+    # Exactly at the threshold still counts as a real duration, so the run
+    # ends before it starts and nothing moves.
+    assert [(word.start, word.end) for word in words] == before
+
+
+def test_repair_gives_each_speaker_their_own_pace() -> None:
+    words = [
+        # Speaker 1 speaks at 0.1 s per weight unit, speaker 2 at 0.03.
+        _word(0, 0.00, 0.60, "我觉得", "1"),
+        _word(1, 0.60, 1.00, "这件", "1"),
+        _word(2, 1.00, 1.40, "东西", "1"),
+        _word(3, 1.40, 1.41, "很重要", "1"),
+        _word(4, 1.50, 1.62, "不对", "2"),
+        _word(5, 1.62, 1.74, "其实", "2"),
+        _word(6, 1.74, 1.86, "这样", "2"),
+        _word(7, 1.86, 1.87, "很重要", "2"),
+        _word(8, 2.50, 2.70, "好吧", "1"),
+    ]
+    repair_squeezed_words(words)
+
+    # The same six weight units of text, restored to each speaker's own pace.
+    assert words[3].end - words[3].start == pytest.approx(0.6)
+    assert words[7].end - words[7].start == pytest.approx(0.18)
+
+
+def test_repair_opens_no_batch_cut_inside_the_crosstalk() -> None:
+    words = _interrupted()
+    words[7] = _word(7, 12.60, 13.10, "那个", "2")
+    # Before the repair the squeeze leaves the whole conversation looking
+    # silent from 11.68 to 12.60, which is a legal place to end an agent batch
+    # — right in the middle of speaker 1's sentence.
+    assert 6 in dict(qualified_silences(words))
+
+    repair_squeezed_words(words)
+
+    assert not any(3 <= index <= 6 for index, _gap in qualified_silences(words))
 
 
 # --- mechanical preview segmentation ---
@@ -391,6 +539,44 @@ def test_raw_responses_are_saved_verbatim(tmp_path: Path) -> None:
     chunk = json.loads((tmp_path / "stt-responses" / "chunk-30.00s.json").read_text())
     # Verbatim: the chunk offset is not folded into the stored timestamps.
     assert chunk["words"][0]["start"] == 11.44
+    db.close()
+
+
+def test_transcribe_persists_repaired_words(tmp_path: Path) -> None:
+    import json
+
+    audio = tmp_path / "reference.wav"
+    _write_wav(audio, 3.0)
+    client = FakeClient([FakeConvertResponse([
+        {"type": "word", "text": "我觉得", "start": 0.80, "end": 1.14,
+         "speaker_id": "speaker_1"},
+        {"type": "word", "text": "这件", "start": 1.14, "end": 1.40,
+         "speaker_id": "speaker_1"},
+        {"type": "word", "text": "东西", "start": 1.40, "end": 1.64,
+         "speaker_id": "speaker_1"},
+        {"type": "word", "text": "很重要", "start": 1.64, "end": 1.65,
+         "speaker_id": "speaker_1"},
+        {"type": "word", "text": "那个", "start": 1.75, "end": 2.30,
+         "speaker_id": "speaker_2"},
+    ])])
+    db = JobDatabase(tmp_path / "job.sqlite3")
+    transcriber = ElevenLabsTranscriber(
+        _settings(), tmp_path, db, client_factory=lambda: client
+    )
+
+    preview = asyncio.run(transcriber.transcribe(audio))
+
+    stored = db.list_transcript_words()
+    assert stored[3].end == pytest.approx(2.0)
+    # The preview cues are cut from the repaired words, so the interrupted
+    # speaker's line now overlaps the interrupting one.
+    assert [(cue.speaker, cue.end) for cue in preview] == [
+        ("1", pytest.approx(2.0)), ("2", 2.30),
+    ]
+    assert preview[0].end > preview[1].start
+    # The response on disk is still what the API said, squeeze and all.
+    raw = json.loads((tmp_path / "stt-responses" / "transcribe.json").read_text())
+    assert raw["words"][3]["end"] == 1.65
     db.close()
 
 

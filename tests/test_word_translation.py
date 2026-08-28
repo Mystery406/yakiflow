@@ -349,6 +349,37 @@ def test_settlement_holds_back_the_last_cue_while_the_stream_runs() -> None:
     assert [(old, cue.id) for old, cue in renames] == [("w2-3", "2")]
 
 
+def test_settlement_waits_for_a_later_word_that_starts_earlier() -> None:
+    # A repaired squeeze: speaker 1 was interrupted, so their last two words
+    # were re-spread past speaker 2's first word and the stream is no longer
+    # sorted by start time.
+    words = [
+        _word(0, 1.00, 1.40, "我们 ", "1"),
+        _word(1, 1.40, 1.60, "觉得 ", "1"),
+        _word(2, 1.60, 1.80, "这件 ", "1"),
+        _word(3, 1.80, 2.00, "事", "1"),
+        _word(4, 1.50, 1.90, "不对 ", "2"),
+        _word(5, 1.90, 2.30, "其实", "2"),
+    ]
+    settlement = WordSettlement([])
+    settlement.register(
+        [
+            _agent_cue(0, 1, 1.00, 1.60),
+            _agent_cue(2, 2, 1.60, 1.80),
+            _agent_cue(3, 3, 1.80, 2.00),
+        ],
+        [],
+    )
+
+    renames = settlement.advance(words, stream_complete=True)
+
+    # Words 3 onwards are still mutable, and the cue the agent will cut around
+    # word 4 starts at 1.50 — ahead of the cue at 1.60, which therefore cannot
+    # know its own number yet. Reading only the first mutable word's start
+    # (1.80) would settle it at the wrong one.
+    assert [(old, cue.id) for old, cue in renames] == [("w0-1", "1")]
+
+
 def test_settlement_waits_for_a_forced_junction_repair() -> None:
     words = [_word(i, i * 1.0, i * 1.0 + 0.4, f"w{i} ", "1") for i in range(4)]
     settlement = WordSettlement([])
