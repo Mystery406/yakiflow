@@ -5,9 +5,11 @@ import shlex
 import subprocess
 import importlib.util
 from dataclasses import dataclass
+from typing import Sequence
 from urllib.parse import urlparse
 
-from .config import Settings
+from .config import Settings, default_model_path
+from .transcription import needs_local_whisper
 
 
 @dataclass(slots=True)
@@ -15,11 +17,17 @@ class Check:
     name: str
     ok: bool
     detail: str
+    # Whether a failed check stops a run. An advisory check only degrades what
+    # surrounds the pipeline — a review preview, a downloader this input does
+    # not need — so a run may proceed without it.
+    fatal: bool = True
 
 
-def _which(checks: list[Check], label: str, command: str) -> None:
+def _which(
+    checks: list[Check], label: str, command: str, *, fatal: bool = True
+) -> None:
     path = shutil.which(command)
-    checks.append(Check(label, bool(path), path or "not found"))
+    checks.append(Check(label, bool(path), path or "not found", fatal))
 
 
 def _probe_server_url(url: str, timeout: float = 5.0) -> Check:
@@ -46,10 +54,18 @@ def _probe_server_url(url: str, timeout: float = 5.0) -> Check:
     )
 
 
-def run_doctor(settings: Settings) -> list[Check]:
+def run_doctor(
+    settings: Settings, *, source_is_url: bool | None = None
+) -> list[Check]:
+    """Check everything this configuration needs, fatal parts marked as such.
+
+    ``source_is_url`` tells the downloader check what kind of input the run
+    was given; left unset, as it is for the ``doctor`` command, every check
+    that some input could need stays fatal.
+    """
     checks: list[Check] = []
     _which(checks, "ffmpeg", settings.commands.ffmpeg)
-    _which(checks, "yt-dlp", settings.commands.yt_dlp)
+    _which(checks, "yt-dlp", settings.commands.yt_dlp, fatal=source_is_url is not False)
     backend = settings.transcription.backend
     if backend == "whisper-cli":
         _which(checks, "whisper-cli", settings.whisper.cli)
@@ -58,10 +74,24 @@ def run_doctor(settings: Settings) -> list[Check]:
             checks.append(_probe_server_url(settings.whisper.server_url))
         else:
             _which(checks, "whisper-server", settings.whisper.server)
-    if backend in {"whisper-cli", "whisper-server"}:
+    if needs_local_whisper(settings):
         model = settings.whisper.model
+        present = bool(model and model.is_file())
+        # The run downloads the default model itself, so only a configured
+        # path — which it never replaces — stops it when the file is missing.
+        downloadable = (
+            not present
+            and model is not None
+            and model.expanduser().resolve()
+            == default_model_path().expanduser().resolve()
+        )
         checks.append(
-            Check("whisper model", bool(model and model.is_file()), str(model))
+            Check(
+                "whisper model",
+                present,
+                f"{model}; the run downloads it" if downloadable else str(model),
+                not downloadable,
+            )
         )
         if settings.whisper.vad_model:
             checks.append(
@@ -71,7 +101,7 @@ def run_doctor(settings: Settings) -> list[Check]:
                     str(settings.whisper.vad_model),
                 )
             )
-    else:
+    elif backend.startswith("elevenlabs"):
         sdk_installed = importlib.util.find_spec("elevenlabs") is not None
         checks.append(
             Check(
@@ -138,9 +168,11 @@ def run_doctor(settings: Settings) -> list[Check]:
             checks.append(Check(f"{name} auth", result.returncode == 0, detail[-1] if detail else f"exit {result.returncode}"))
         except (OSError, subprocess.SubprocessError) as exc:
             checks.append(Check(f"{name} auth", False, str(exc)))
+    # Both review checks are advisory: without them the subtitles still get
+    # written, only the review has no preview to show them in.
     if settings.review.display_mode in {"split", "both"}:
         tmux = shutil.which("tmux")
-        checks.append(Check("tmux", bool(tmux), tmux or "not found (split review will have no preview)"))
+        checks.append(Check("tmux", bool(tmux), tmux or "not found (split review will have no preview)", False))
     if settings.review.display_mode in {"open", "both"}:
         command = settings.review.open_command or ""
         try:
@@ -148,5 +180,13 @@ def run_doctor(settings: Settings) -> list[Check]:
         except IndexError:
             executable = ""
         path = shutil.which(executable) if executable else None
-        checks.append(Check("review open command", bool(path), path or "not found"))
+        checks.append(Check("review open command", bool(path), path or "not found", False))
     return checks
+
+
+def fatal_failures(checks: Sequence[Check]) -> list[Check]:
+    return [check for check in checks if not check.ok and check.fatal]
+
+
+def advisory_failures(checks: Sequence[Check]) -> list[Check]:
+    return [check for check in checks if not check.ok and not check.fatal]

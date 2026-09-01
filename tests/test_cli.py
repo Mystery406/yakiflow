@@ -12,6 +12,7 @@ import yakiflow.cli as cli
 import yakiflow.tui as tui
 from conftest import make_settings
 from yakiflow.config import Settings
+from yakiflow.doctor import Check
 from yakiflow.job import YakiFlowJob
 from yakiflow.process import ProcessResult
 from yakiflow.translation import AgentBackend
@@ -153,6 +154,80 @@ def test_profile_option_is_available_on_config_loading_commands(monkeypatch) -> 
     assert selected == ["stream", "stream", "stream"]
 
 
+def _run_argv(*extra: str) -> list[str]:
+    return [
+        "run", "https://example.com/video", "-s", "en", "-t", "zh-CN",
+        "-c", "agent.backend=codex", *extra,
+    ]
+
+
+def test_run_stops_before_starting_on_fatal_health_check_failures(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    work_dir = tmp_path / "work"
+    seen: list[bool | None] = []
+
+    def fake_doctor(_settings, *, source_is_url):
+        seen.append(source_is_url)
+        return [
+            Check("ffmpeg", False, "not found"),
+            Check("tmux", False, "not found", False),
+            Check("codex auth", False, "not logged in"),
+        ]
+
+    monkeypatch.setattr(cli, "run_doctor", fake_doctor)
+
+    assert cli.main(_run_argv("--work-dir", str(work_dir))) == 2
+
+    err = capsys.readouterr().err
+    assert seen == [True]
+    # Every fatal failure is named at once, and the advisory one only warns.
+    assert "health check failed" in err
+    assert "ffmpeg: not found" in err
+    assert "codex auth: not logged in" in err
+    assert "warning: tmux: not found" in err
+    assert not work_dir.exists()
+
+
+def test_run_starts_despite_advisory_health_check_failures(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    def started(*args, **kwargs):
+        raise RuntimeError("job started")
+
+    monkeypatch.setattr(
+        cli, "run_doctor", lambda *args, **kwargs: [Check("tmux", False, "gone", False)]
+    )
+    monkeypatch.setattr(cli, "YakiFlowJob", started)
+
+    assert cli.main(_run_argv()) == 2
+
+    err = capsys.readouterr().err
+    assert "warning: tmux: gone" in err
+    assert "job started" in err
+
+
+def test_skip_health_check_starts_without_checking(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("health check should have been skipped")
+
+    def started(*args, **kwargs):
+        raise RuntimeError("job started")
+
+    monkeypatch.setattr(cli, "run_doctor", unexpected)
+    monkeypatch.setattr(cli, "YakiFlowJob", started)
+
+    assert cli.main(_run_argv("--skip-health-check")) == 2
+    assert "job started" in capsys.readouterr().err
+
+
 class FakeKeyring:
     class errors:
         class PasswordDeleteError(Exception):
@@ -205,12 +280,14 @@ def test_tui_exit_prints_resume_guide(tmp_path: Path, monkeypatch, capsys) -> No
         def __init__(self, *, is_finished: bool = False) -> None:
             self.work_dir = work_dir
             self.is_finished = is_finished
+            self.input_value = "video.mp4"
             self.settings = make_settings(
                 source_language="en",
                 target_language="zh",
                 agent={"backend": "codex"},
             ).resolved()
 
+    monkeypatch.setattr(cli, "run_doctor", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         cli.YakiFlowJob,
         "from_workdir",

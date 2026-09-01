@@ -12,11 +12,13 @@ from typing import Any, Mapping, Sequence
 
 from .config import (
     TRANSCRIPTION_BACKENDS,
+    Settings,
     load_settings,
     validate_run_settings,
 )
-from .doctor import run_doctor
+from .doctor import advisory_failures, fatal_failures, run_doctor
 from .job import YakiFlowJob
+from .media import MediaSource
 from .models import JobEvent
 from .models_manager import fetch_model
 from .interactive_agent import (
@@ -54,6 +56,15 @@ def _parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume", help="resume a preserved work directory")
     resume.add_argument("workdir", type=Path)
     _config_arguments(resume)
+    for parser_ in (run, resume):
+        parser_.add_argument(
+            "--skip-health-check",
+            action="store_true",
+            help=(
+                "start without checking the dependencies this configuration "
+                "needs; a missing one then stops the job mid-run"
+            ),
+        )
     doctor = sub.add_parser(
         "doctor", help="check external dependencies and authentication"
     )
@@ -195,6 +206,27 @@ def _resume_overrides(namespace: argparse.Namespace) -> Mapping[str, Any]:
     return parse_config_items(getattr(namespace, "config_items", []))
 
 
+def _health_check(settings: Settings, input_value: str) -> None:
+    """Refuse to start a run whose environment cannot carry it through.
+
+    Every fatal failure is reported at once, so one startup tells the whole
+    story instead of each stage stopping the job on its own missing piece.
+    Advisory failures are only warned about and never hold up a run.
+    """
+    checks = run_doctor(settings, source_is_url=MediaSource.parse(input_value).is_url)
+    for check in advisory_failures(checks):
+        print(f"yakiflow: warning: {check.name}: {check.detail}", file=sys.stderr)
+    failures = fatal_failures(checks)
+    if failures:
+        listed = "".join(
+            f"\n  {check.name}: {check.detail}" for check in failures
+        )
+        raise RuntimeError(
+            f"health check failed:{listed}\n"
+            "Fix these, or pass --skip-health-check to start anyway."
+        )
+
+
 def _read_secret(prompt: str) -> str:
     if sys.stdin.isatty():
         import getpass
@@ -327,8 +359,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings = _settings(args)
             checks = run_doctor(settings)
             for check in checks:
-                print(f"{'OK' if check.ok else 'FAIL':4} {check.name}: {check.detail}")
-            return 0 if all(check.ok for check in checks) else 1
+                # WARN is what a run only warns about; FAIL is what stops one.
+                status = "OK" if check.ok else ("FAIL" if check.fatal else "WARN")
+                print(f"{status:4} {check.name}: {check.detail}")
+            return 1 if fatal_failures(checks) else 0
         if args.command == "resume":
             job = YakiFlowJob.from_workdir(
                 args.workdir,
@@ -340,9 +374,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             # The stored configuration bypasses argparse, so re-check it here
             # instead of failing deep inside a resumed stage.
             validate_run_settings(job.settings)
+            if not args.skip_health_check:
+                _health_check(job.settings, job.input_value)
         else:
             settings = _settings(args)
             validate_run_settings(settings)
+            if not args.skip_health_check:
+                # Before the work directory exists: a run that cannot finish
+                # should leave nothing behind to resume or clean up.
+                _health_check(settings, args.input)
             job = YakiFlowJob(args.input, settings, listener=_print_event)
         if sys.stdin.isatty() and sys.stdout.isatty():
             from . import tui

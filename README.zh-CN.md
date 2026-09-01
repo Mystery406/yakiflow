@@ -70,7 +70,12 @@ yakiflow doctor -c agent.backend=codex
 
 使用 Claude Code 时把 `codex` 换成 `claude`。请修复所有与当前输入有关的
 `FAIL`；`yt-dlp` 只影响 URL，whisper.cpp 相关检查只影响 Whisper 后端。
-ElevenLabs 后端不需要 `models fetch`。
+ElevenLabs 后端不需要 `models fetch`。标为 `WARN` 的是任何任务都不依赖的
+可选项，例如用于预览字幕的 `tmux`。
+
+`yakiflow run` 和 `yakiflow resume` 启动时会重跑这些检查，只要有一项失败就
+拒绝开始，因此环境不满足时会立刻报错，而不是跑到一半才失败。加上
+`--skip-health-check` 可以跳过检查直接开始。
 
 ### 5. 生成字幕
 
@@ -107,6 +112,7 @@ YakiFlow 会显示转录和翻译进度。在交互式终端中，随后会打�
 | `--context-file` | 把参考文件复制进工作目录；可重复 |
 | `--work-dir` | 把可续跑的任务状态放到指定目录 |
 | `--keep-workdir` | 成功后保留中间文件 |
+| `--skip-health-check` | `run`、`resume` 启动时跳过环境检查 |
 | `--config-file` | 使用指定的项目配置文件 |
 | `--profile` | 选择一个 `[profiles.NAME]` 配置组 |
 
@@ -521,6 +527,9 @@ yakiflow doctor -c alignment.backend=whisperx
 ## 疑难解答
 
 - 先用与运行相同的选项执行 `yakiflow doctor`。
+- 运行时若因 `health check failed` 停止，请逐项修复列出的内容；这些问题都会
+  在任务中途导致失败。如果确定某项检查不适用，可以用 `--skip-health-check`
+  直接开始。
 - 缺少默认 Whisper 模型时，运行 `yakiflow models fetch`。
 - 配置了自定义模型路径时，YakiFlow 要求该文件已经存在，不会替换它。
 - `yt-dlp` 的故障只影响 URL 输入；whisper.cpp 的故障只影响 Whisper 后端。

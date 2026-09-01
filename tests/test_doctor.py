@@ -84,6 +84,107 @@ def test_doctor_names_both_whisperx_install_variants(
     assert "yakiflow[whisperx-cuda]" in whisperx.detail
 
 
+def test_yt_dlp_is_fatal_only_for_an_input_that_needs_downloading(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = _stub_dependencies(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        doctor_module.shutil,
+        "which",
+        lambda command: None if command == "yt-dlp" else f"/bin/{command}",
+    )
+    settings = make_settings(
+        whisper={"model": model}, agent={"backend": "codex"}
+    ).resolved()
+
+    def yt_dlp(source_is_url: bool | None) -> doctor_module.Check:
+        checks = run_doctor(settings, source_is_url=source_is_url)
+        return next(check for check in checks if check.name == "yt-dlp")
+
+    assert not yt_dlp(False).ok and not yt_dlp(False).fatal
+    assert yt_dlp(True).fatal
+    # Without an input to judge — the `doctor` command — it stays fatal.
+    assert yt_dlp(None).fatal
+
+
+def test_missing_default_whisper_model_is_advisory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _stub_dependencies(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    checks = run_doctor(make_settings(agent={"backend": "codex"}).resolved())
+    model = next(check for check in checks if check.name == "whisper model")
+
+    assert not model.ok
+    assert not model.fatal
+    assert "downloads it" in model.detail
+
+
+def test_missing_configured_whisper_model_is_fatal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _stub_dependencies(tmp_path, monkeypatch)
+
+    checks = run_doctor(
+        make_settings(
+            whisper={"model": tmp_path / "absent.bin"}, agent={"backend": "codex"}
+        ).resolved()
+    )
+    model = next(check for check in checks if check.name == "whisper model")
+
+    assert not model.ok
+    assert model.fatal
+
+
+def test_external_whisper_server_is_not_checked_for_a_local_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _stub_dependencies(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        doctor_module,
+        "_probe_server_url",
+        lambda url, timeout=5.0: doctor_module.Check("whisper-server URL", True, url),
+    )
+
+    checks = run_doctor(
+        make_settings(
+            transcription={"backend": "whisper-server"},
+            whisper={"model": tmp_path / "absent.bin", "server_url": "http://host:8080"},
+            agent={"backend": "codex"},
+        ).resolved()
+    )
+
+    # The remote server owns its model, exactly as the run itself assumes.
+    assert all(check.name != "whisper model" for check in checks)
+
+
+def test_review_display_dependencies_are_advisory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = _stub_dependencies(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        doctor_module.shutil,
+        "which",
+        lambda command: None if command in {"tmux", "editor"} else f"/bin/{command}",
+    )
+
+    checks = run_doctor(
+        make_settings(
+            whisper={"model": model},
+            agent={"backend": "codex"},
+            review={"display_mode": "both", "open_command": "editor {srt}"},
+        ).resolved()
+    )
+    mapped = {check.name: check for check in checks}
+
+    assert not mapped["tmux"].ok and not mapped["tmux"].fatal
+    assert (
+        not mapped["review open command"].ok
+        and not mapped["review open command"].fatal
+    )
+
+
 def test_doctor_checks_both_review_display_dependencies(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -74,7 +74,12 @@ yakiflow doctor -c agent.backend=codex
 Replace `codex` with `claude` when appropriate. Fix every reported `FAIL` that
 applies to your input; `yt-dlp` is only needed for URLs, and the whisper.cpp
 checks only apply to the Whisper backends. `models fetch` is unnecessary for
-the ElevenLabs backends.
+the ElevenLabs backends. A `WARN` line is a missing extra that no run depends
+on, such as `tmux` for the review preview.
+
+`yakiflow run` and `yakiflow resume` repeat these checks on startup and refuse
+to start when one of them fails, so a setup that cannot finish is reported in
+seconds instead of halfway through a job. `--skip-health-check` starts anyway.
 
 ### 5. Create subtitles
 
@@ -112,6 +117,7 @@ A few high-frequency settings have dedicated options:
 | `--context-file` | Copy a reference file into the work directory; repeatable |
 | `--work-dir` | Place resumable job state in a chosen directory |
 | `--keep-workdir` | Keep intermediate files after success |
+| `--skip-health-check` | Start `run` or `resume` without the startup check |
 | `--config-file` | Use this project configuration file |
 | `--profile` | Select a `[profiles.NAME]` section |
 
@@ -562,6 +568,9 @@ each other stay that way; every other subtitle is aligned as usual.
 ## Troubleshooting
 
 - Start with `yakiflow doctor` using the same options as your run.
+- If a run stops with `health check failed`, fix the listed items; each one
+  would otherwise have stopped the job later. `--skip-health-check` starts a
+  run whose check you disagree with.
 - If the default Whisper model is missing, run `yakiflow models fetch`.
 - If a custom model path is configured, YakiFlow expects that file to already
   exist and will not replace it.
