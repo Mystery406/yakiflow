@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import uuid
 import wave
@@ -101,6 +102,32 @@ def pcm_audio_duration(audio: Path) -> float | None:
     except (EOFError, OSError, wave.Error):
         return None
     return duration if duration > 0 else None
+
+
+async def probe_video_resolution(
+    runner: CommandRunner, ffprobe: str, media_path: Path
+) -> tuple[int, int] | None:
+    """Return the picture size of ``media_path``, or ``None`` when it has none.
+
+    Cover art is a video stream to ffprobe, so an audio download carrying an
+    embedded thumbnail would otherwise report the artwork's size as the
+    video's. Raises whatever ffprobe failing raises; every caller has a
+    resolution to fall back to.
+    """
+    result = await runner.run([
+        ffprobe, "-v", "error", "-select_streams", "v",
+        "-show_entries", "stream=width,height:stream_disposition=attached_pic",
+        "-of", "json", media_path,
+    ])
+    streams = json.loads(result.stdout).get("streams") or []
+    for stream in streams:
+        if (stream.get("disposition") or {}).get("attached_pic"):
+            continue
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if width > 0 and height > 0:
+            return width, height
+    return None
 
 
 def slice_pcm_wav(source: Path, destination: Path, start: float, end: float) -> None:

@@ -19,7 +19,7 @@ and prints the command needed to continue.
 You need:
 
 - Python 3.12 or newer;
-- `ffmpeg`;
+- `ffmpeg`, together with the `ffprobe` that ships with it;
 - either the `codex` or `claude` CLI, installed and signed in;
 - for the default local transcription, a recent
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp) build whose
@@ -266,6 +266,11 @@ With automatic language detection, the bilingual filename uses the detected
 language, for example `video.ja-zh-cn.ass`. Players such as `mpv` load ASS
 files directly (`mpv --sub-file=video.en-zh-cn.ass video.mp4`).
 
+Subtitles are written for the resolution of the input video, so text keeps its
+shape and size on vertical, 4:3, and high-resolution sources alike. Without
+`ffprobe`, or for an input with no picture, they are written for a 1920x1080
+frame instead.
+
 ### Give each speaker its own style in Aegisub
 
 With a diarizing backend, every subtitle carries its speaker in the ASS `Name`
@@ -402,6 +407,7 @@ backend = "codex"         # codex | claude
 
 [commands]
 # ffmpeg = "ffmpeg"
+# ffprobe = "ffprobe"
 # yt-dlp = "yt-dlp"
 # yt-dlp-options = ["--cookies-from-browser", "chrome"]
 ```

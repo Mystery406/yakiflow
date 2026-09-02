@@ -5,7 +5,9 @@ import pytest
 from yakiflow.models import Cue
 from yakiflow.subtitles import (
     ASS_HEADER,
+    DEFAULT_PLAY_RES,
     AssEvent,
+    ass_header,
     alignment_problems,
     ass_problems,
     canonicalized_ass,
@@ -186,6 +188,77 @@ def test_ass_problems_combines_parse_and_event_checks() -> None:
     assert "out_of_order" in kinds
 
 
+# --- script resolution ---
+
+
+def _style_fields(header: str) -> list[str]:
+    line = next(
+        line for line in header.splitlines() if line.startswith("Style:")
+    )
+    return line.split(":", 1)[1].split(",")
+
+
+def test_ass_header_defaults_to_the_fallback_resolution() -> None:
+    assert ass_header() == ASS_HEADER
+    assert "PlayResX: 1920\nPlayResY: 1080\n" in ASS_HEADER
+
+
+@pytest.mark.parametrize(
+    ("play_res", "type_scale"),
+    [
+        # A vertical frame sizes the type off its width, an ultrawide one off
+        # its height: whichever axis affords less.
+        ((1080, 1920), 1080 / 1920),
+        ((2560, 1080), 1.0),
+        ((3840, 2160), 2.0),
+    ],
+)
+def test_ass_header_scales_the_style_with_the_frame(
+    play_res: tuple[int, int], type_scale: float
+) -> None:
+    header = ass_header(play_res)
+
+    assert f"PlayResX: {play_res[0]}\nPlayResY: {play_res[1]}\n" in header
+    fields = _style_fields(header)
+    reference = _style_fields(ASS_HEADER)
+    # Fontsize, Outline and Shadow keep the type the same size relative to the
+    # picture; each margin is a fraction of the axis it is taken out of.
+    scales = {
+        2: type_scale,
+        16: type_scale,
+        17: type_scale,
+        19: play_res[0] / 1920,
+        20: play_res[0] / 1920,
+        21: play_res[1] / 1080,
+    }
+    assert [float(fields[index]) for index in sorted(scales)] == [
+        pytest.approx(float(reference[index]) * scale, abs=0.5)
+        for index, scale in sorted(scales.items())
+    ]
+    # Everything else is the same style.
+    assert [
+        value for index, value in enumerate(fields) if index not in scales
+    ] == [
+        value for index, value in enumerate(reference) if index not in scales
+    ]
+
+
+def test_render_and_publish_author_against_the_given_resolution(
+    tmp_path: Path,
+) -> None:
+    cues = [Cue("1", 0.0, 1.0, "hi", "嗨")]
+
+    assert render_ass(cues, "bilingual", (3840, 2160)).startswith(
+        ass_header((3840, 2160))
+    )
+    outputs = publish_outputs(
+        tmp_path / "movie", cues, "source", play_res=(1280, 720)
+    )
+    text = outputs[0].read_text(encoding="utf-8")
+    assert text.startswith(ass_header((1280, 720)))
+    assert parse_ass(text)[1] == []
+
+
 # --- canonicalization ---
 
 
@@ -209,6 +282,17 @@ def test_canonicalized_ass_rewrites_header_and_reorders_events() -> None:
     assert "0:00:05.00" in canonical
     # An already-canonical file needs no rewrite.
     assert canonicalized_ass(canonical) is None
+
+
+def test_canonicalized_ass_rewrites_the_header_at_the_published_resolution() -> None:
+    # A review that kept the file at the default resolution must be repaired
+    # back to the resolution the job published at, not left mismatched.
+    text = render_ass([Cue("1", 0.0, 1.0, "hi", "嗨")], "bilingual")
+    canonical = canonicalized_ass(text, (1080, 1920))
+
+    assert canonical is not None
+    assert canonical.startswith(ass_header((1080, 1920)))
+    assert canonicalized_ass(canonical, (1080, 1920)) is None
 
 
 def test_canonicalized_ass_returns_none_for_unfixable_input() -> None:
@@ -300,5 +384,6 @@ def test_publish_bilingual_requires_languages(tmp_path: Path) -> None:
 
 def test_render_events_is_stable_for_empty_input() -> None:
     assert render_events([]) == ASS_HEADER
+    assert render_events([], DEFAULT_PLAY_RES) == ASS_HEADER
     events, problems = parse_ass(ASS_HEADER)
     assert events == [] and problems == []

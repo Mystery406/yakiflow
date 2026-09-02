@@ -15,7 +15,14 @@ from yakiflow.media import MediaArtifact, MediaSource
 from yakiflow.memory import MemoryDestinationConflict
 from yakiflow.models import AgentTraceEvent, Cue, JobEvent, TranscriptEvent
 from yakiflow.process import ProcessResult
-from yakiflow.subtitles import ASS_HEADER, AssEvent, render_ass, render_events
+from yakiflow.subtitles import (
+    ASS_HEADER,
+    DEFAULT_PLAY_RES,
+    AssEvent,
+    ass_header,
+    render_ass,
+    render_events,
+)
 from yakiflow.translation import AgentBackend
 
 
@@ -31,13 +38,30 @@ class RecordingAwaitable:
         return None
 
 
+def ffprobe_result(args, resolution: tuple[int, int] | None) -> ProcessResult:
+    """One ffprobe answer; ``None`` is an input without a picture."""
+    streams = (
+        []
+        if resolution is None
+        else [{
+            "width": resolution[0],
+            "height": resolution[1],
+            "disposition": {"attached_pic": 0},
+        }]
+    )
+    return ProcessResult(tuple(args), 0, json.dumps({"streams": streams}), "")
+
+
 class PipelineRunner:
-    def __init__(self):
+    def __init__(self, resolution: tuple[int, int] | None = (1920, 1080)):
         self.calls: list[list[str]] = []
+        self.resolution = resolution
 
     async def run(self, args, *, on_line=None, **kwargs):
         args = [str(value) for value in args]
         self.calls.append(args)
+        if args[0] == "ffprobe":
+            return ffprobe_result(args, self.resolution)
         if args[0] == "ffmpeg":
             Path(args[-1]).write_bytes(b"RIFF-fake")
             return ProcessResult(tuple(args), 0, "", "")
@@ -386,6 +410,8 @@ class BlockingBackend(AgentBackend):
 class InterruptedWhisperRunner:
     async def run(self, args, *, on_line=None, **kwargs):
         args = [str(value) for value in args]
+        if args[0] == "ffprobe":
+            return ffprobe_result(args, (1920, 1080))
         assert args[0] == "whisper-cli"
         assert on_line is not None
         for line in (
@@ -403,6 +429,8 @@ class ResumedWhisperRunner:
     async def run(self, args, *, on_line=None, **kwargs):
         args = [str(value) for value in args]
         self.calls.append(args)
+        if args[0] == "ffprobe":
+            return ffprobe_result(args, (1920, 1080))
         if args[0] == "ffmpeg":
             Path(args[-1]).write_bytes(b"RIFF-resume")
             return ProcessResult(tuple(args), 0, "", "")
@@ -647,6 +675,111 @@ def test_agent_summary_counts_real_concurrent_operations(tmp_path: Path) -> None
     summaries = [event.message for event in events if event.kind == "agent"]
     assert summaries[1].endswith("2 active")
     assert summaries[-1] == "Agent · Idle"
+    job.close()
+
+
+def test_published_subtitles_match_the_video_resolution(tmp_path: Path) -> None:
+    media = tmp_path / "vertical.mp4"
+    media.write_bytes(b"media")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    work_dir = tmp_path / "work"
+    settings = make_settings(
+        source_language="en", target_language="zh-CN", whisper={"model": model},
+        memory=tmp_path / "memory.md", output_dir=tmp_path / "out",
+        work_dir=work_dir,
+        agent={"backend": "codex"},
+    )
+    runner = PipelineRunner(resolution=(1080, 1920))
+    job = YakiFlowJob(
+        str(media), settings, runner=runner, backend=PipelineBackend()
+    )
+
+    outputs = asyncio.run(job.run())
+
+    expected = ass_header((1080, 1920))
+    assert outputs[0].read_text(encoding="utf-8").startswith(expected)
+    # The live preview is watched against the video too, so it cannot be
+    # written at a different resolution than the published file.
+    partial = tmp_path / "out" / "vertical.draft.incomplete.ass"
+    assert partial.read_text(encoding="utf-8").startswith(expected)
+    assert job.play_res == (1080, 1920)
+    job.close()
+
+    # A resumed job republishes and canonicalizes at the same resolution
+    # instead of probing again.
+    resumed = YakiFlowJob.from_workdir(work_dir, backend=PipelineBackend())
+    assert resumed.play_res == (1080, 1920)
+    resumed.close()
+
+
+def test_input_without_a_picture_keeps_the_default_resolution(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "podcast.m4a"
+    media.write_bytes(b"media")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    settings = make_settings(
+        source_language="en", target_language="zh-CN", whisper={"model": model},
+        memory=tmp_path / "memory.md", output_dir=tmp_path / "out",
+        work_dir=tmp_path / "work",
+        agent={"backend": "codex"},
+    )
+    job = YakiFlowJob(
+        str(media),
+        settings,
+        runner=PipelineRunner(resolution=None),
+        backend=PipelineBackend(),
+    )
+
+    outputs = asyncio.run(job.run())
+
+    assert outputs[0].read_text(encoding="utf-8").startswith(ASS_HEADER)
+    assert job.play_res == DEFAULT_PLAY_RES
+    job.close()
+
+
+def test_unavailable_ffprobe_warns_and_publishes_at_the_default_resolution(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(b"media")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    settings = make_settings(
+        source_language="en", target_language="zh-CN", whisper={"model": model},
+        memory=tmp_path / "memory.md", output_dir=tmp_path / "out",
+        work_dir=tmp_path / "work",
+        agent={"backend": "codex"},
+    )
+
+    class MissingFfprobeRunner(PipelineRunner):
+        async def run(self, args, *, on_line=None, **kwargs):
+            if str(args[0]) == "ffprobe":
+                raise FileNotFoundError("ffprobe")
+            return await super().run(args, on_line=on_line, **kwargs)
+
+    events: list[JobEvent] = []
+
+    async def listener(event) -> None:
+        events.append(event)
+
+    job = YakiFlowJob(
+        str(media),
+        settings,
+        runner=MissingFfprobeRunner(),
+        backend=PipelineBackend(),
+        listener=listener,
+    )
+
+    outputs = asyncio.run(job.run())
+
+    assert outputs[0].read_text(encoding="utf-8").startswith(ASS_HEADER)
+    assert any(
+        event.kind == "warning" and "video resolution" in event.message
+        for event in events
+    )
     job.close()
 
 

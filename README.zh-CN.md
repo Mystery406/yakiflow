@@ -17,7 +17,7 @@ YakiFlow 可以把本地视频、音频、网页视频或直播流转换成 ASS 
 你需要：
 
 - Python 3.12 或更高版本；
-- `ffmpeg`；
+- `ffmpeg`，以及随它一起安装的 `ffprobe`；
 - `codex` 或 `claude` CLI，二选一安装并登录；
 - 使用默认的本地转录时，还需要较新版本的
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp)，且能在 `PATH` 中找到
@@ -253,6 +253,9 @@ video-open-command = "mpv --script=/path/to/contrib/mpv/sub-autoreload.lua --no-
 等播放器可以直接加载 ASS 文件
 （`mpv --sub-file=video.en-zh-cn.ass video.mp4`）。
 
+字幕按输入视频的分辨率生成，因此在竖屏、4:3 和高分辨率片源上，文字的形状和大小
+都保持正常。没有 `ffprobe`，或输入本身没有画面时，字幕按 1920x1080 生成。
+
 ### 在 Aegisub 中为每个说话人设置样式
 
 使用带说话人识别的后端时，每条字幕的说话人都在 ASS 的 `Name`（说话人）字段中，
@@ -379,6 +382,7 @@ backend = "codex"         # codex | claude
 
 [commands]
 # ffmpeg = "ffmpeg"
+# ffprobe = "ffprobe"
 # yt-dlp = "yt-dlp"
 # yt-dlp-options = ["--cookies-from-browser", "chrome"]
 ```

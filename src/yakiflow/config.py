@@ -156,6 +156,7 @@ class ReviewSettings:
 @dataclass(frozen=True, slots=True)
 class CommandsSettings:
     ffmpeg: str = "ffmpeg"
+    ffprobe: str = "ffprobe"
     yt_dlp: str = "yt-dlp"
     yt_dlp_options: tuple[str, ...] = _argv()
 

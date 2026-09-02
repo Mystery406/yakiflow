@@ -9,6 +9,7 @@ from typing import Sequence
 from urllib.parse import urlparse
 
 from .config import Settings, default_model_path
+from .subtitles import DEFAULT_PLAY_RES
 from .transcription import needs_local_whisper
 
 
@@ -65,6 +66,18 @@ def run_doctor(
     """
     checks: list[Check] = []
     _which(checks, "ffmpeg", settings.commands.ffmpeg)
+    # Advisory: without it the subtitles are still written, only against the
+    # default script resolution instead of the video's own.
+    ffprobe = shutil.which(settings.commands.ffprobe)
+    checks.append(Check(
+        "ffprobe",
+        bool(ffprobe),
+        ffprobe or (
+            "not found (subtitles fall back to a "
+            f"{DEFAULT_PLAY_RES[0]}x{DEFAULT_PLAY_RES[1]} script resolution)"
+        ),
+        False,
+    ))
     _which(checks, "yt-dlp", settings.commands.yt_dlp, fatal=source_is_url is not False)
     backend = settings.transcription.backend
     if backend == "whisper-cli":

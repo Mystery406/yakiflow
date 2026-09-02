@@ -107,6 +107,24 @@ def test_yt_dlp_is_fatal_only_for_an_input_that_needs_downloading(
     assert yt_dlp(None).fatal
 
 
+def test_missing_ffprobe_is_advisory(tmp_path: Path, monkeypatch) -> None:
+    model = _stub_dependencies(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        doctor_module.shutil,
+        "which",
+        lambda command: None if command == "ffprobe" else f"/bin/{command}",
+    )
+
+    checks = run_doctor(
+        make_settings(whisper={"model": model}, agent={"backend": "codex"}).resolved()
+    )
+    ffprobe = next(check for check in checks if check.name == "ffprobe")
+
+    # The subtitles are still written, only at the fallback resolution.
+    assert not ffprobe.ok and not ffprobe.fatal
+    assert "1920x1080" in ffprobe.detail
+
+
 def test_missing_default_whisper_model_is_advisory(
     tmp_path: Path, monkeypatch
 ) -> None:

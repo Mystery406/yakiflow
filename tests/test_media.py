@@ -1,11 +1,17 @@
 import asyncio
+import json
 import wave
 from pathlib import Path
 
 from conftest import make_settings
 from yakiflow.database import JobDatabase
 from yakiflow import media
-from yakiflow.media import MediaAcquirer, MediaSource, _drain_stream_chunks
+from yakiflow.media import (
+    MediaAcquirer,
+    MediaSource,
+    _drain_stream_chunks,
+    probe_video_resolution,
+)
 from yakiflow.process import ProcessResult
 
 
@@ -299,3 +305,54 @@ def test_stream_download_ignores_files_from_previous_jobs(
     assert yt_dlp_call[yt_dlp_call.index("--remux-video") + 1] == "mkv"
     assert yt_dlp_call[-3:-1] == ["--cookies-from-browser", "chrome"]
     db.close()
+
+
+class ProbeRunner:
+    def __init__(self, payload: str) -> None:
+        self.payload = payload
+        self.calls: list[list[str]] = []
+
+    async def run(self, args, **kwargs):
+        args = [str(value) for value in args]
+        self.calls.append(args)
+        return ProcessResult(tuple(args), 0, self.payload, "")
+
+
+def test_probe_video_resolution_reads_the_picture_size(tmp_path: Path) -> None:
+    runner = ProbeRunner(json.dumps({
+        "streams": [
+            {"width": 1080, "height": 1920, "disposition": {"attached_pic": 0}}
+        ]
+    }))
+
+    resolution = asyncio.run(
+        probe_video_resolution(runner, "ffprobe", tmp_path / "clip.mkv")
+    )
+
+    assert resolution == (1080, 1920)
+    assert runner.calls[0][0] == "ffprobe"
+    assert str(tmp_path / "clip.mkv") in runner.calls[0]
+
+
+def test_probe_video_resolution_ignores_cover_art(tmp_path: Path) -> None:
+    # An audio download with an embedded thumbnail has a video stream whose
+    # size says nothing about a picture the subtitles would be shown over.
+    runner = ProbeRunner(json.dumps({
+        "streams": [
+            {"width": 640, "height": 640, "disposition": {"attached_pic": 1}}
+        ]
+    }))
+
+    assert asyncio.run(
+        probe_video_resolution(runner, "ffprobe", tmp_path / "audio.mp3")
+    ) is None
+
+
+def test_probe_video_resolution_returns_none_without_a_video_stream(
+    tmp_path: Path,
+) -> None:
+    runner = ProbeRunner(json.dumps({"streams": []}))
+
+    assert asyncio.run(
+        probe_video_resolution(runner, "ffprobe", tmp_path / "audio.opus")
+    ) is None

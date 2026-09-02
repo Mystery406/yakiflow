@@ -34,6 +34,7 @@ from .media import (
     MediaSource,
     default_output_base,
     pcm_audio_duration,
+    probe_video_resolution,
 )
 from .memory import MemoryDestinationConflict, MemoryFileSnapshot, MemoryStore
 from .models import (
@@ -44,9 +45,10 @@ from .models import (
     TranscriptEvent,
     is_preview_cue_id,
 )
-from .process import CommandRunner
+from .process import CommandRunner, ProcessError
 from .progress import ProgressPlan, StageTimeEstimator, make_progress_plan
 from .subtitles import (
+    DEFAULT_PLAY_RES,
     AssEvent,
     alignment_problems,
     ass_problems,
@@ -336,6 +338,47 @@ class YakiFlowJob:
         if recorded is not None:
             return recorded
         return self._stream_media_path
+
+    @property
+    def play_res(self) -> tuple[int, int]:
+        """The script resolution every subtitle file of this job is written at.
+
+        Read from the checkpoint rather than cached, so the partial files, the
+        published outputs, and the review's canonicalization all agree on one
+        header — including across a resume, which must reproduce the resolution
+        the job published with instead of re-deciding it.
+        """
+        stored = self.db.get_checkpoint("play_res")
+        return (int(stored[0]), int(stored[1])) if stored else DEFAULT_PLAY_RES
+
+    async def _detect_play_res(self, media_path: Path | None) -> None:
+        """Record the video's own resolution to author the subtitles at.
+
+        A mismatched ``PlayRes`` makes libass stretch the text to the frame's
+        aspect ratio, so this runs as soon as a media file exists — during a
+        stream that is the growing download, whose live partials are already
+        being previewed against the video.
+        """
+        if media_path is None or self.db.get_checkpoint("play_res"):
+            return
+        try:
+            resolution = await probe_video_resolution(
+                self.runner, self.settings.commands.ffprobe, media_path
+            )
+        except (OSError, ProcessError, ValueError) as exc:
+            # A missing ffprobe or a file it cannot read yet must not end a
+            # job whose subtitles the fallback resolution still serves. An
+            # input with no picture is not this case: it probes successfully
+            # and simply reports no video stream.
+            self.db.log("ffprobe", "stderr", str(exc))
+            await self.emit(
+                "warning",
+                f"could not read the video resolution ({exc}); writing "
+                f"subtitles at {DEFAULT_PLAY_RES[0]}x{DEFAULT_PLAY_RES[1]}",
+            )
+            return
+        if resolution is not None:
+            self.db.checkpoint("play_res", list(resolution))
 
     @property
     def subtitle_path(self) -> Path | None:
@@ -705,6 +748,7 @@ class YakiFlowJob:
             persistent = bool(self.settings.download_dir) or not source.is_url
             await self._begin_stage("acquire", "using cached media")
             artifact = MediaArtifact(source, existing_audio, existing_media, persistent)
+            await self._detect_play_res(artifact.media_path)
             await self._finish_stage("acquire", "media ready")
             return artifact
         self.db.set_status(JobStatus.ACQUIRING)
@@ -720,6 +764,7 @@ class YakiFlowJob:
 
         async def media_file(path: Path) -> None:
             self._stream_media_path = path
+            await self._detect_play_res(path)
 
         acquirer = MediaAcquirer(
             self.settings,
@@ -732,6 +777,7 @@ class YakiFlowJob:
         )
         if not self.settings.stream.enabled:
             artifact = await acquirer.acquire(source)
+            await self._detect_play_res(artifact.media_path)
             await self._finish_stage("acquire", "media ready")
             return artifact
 
@@ -834,6 +880,7 @@ class YakiFlowJob:
                 # On success, let the outstanding previews land so the partial
                 # file on disk matches the transcript the stream ended with.
                 await asyncio.gather(*translation_tasks, return_exceptions=True)
+        await self._detect_play_res(artifact.media_path)
         await self._finish_stage("acquire", "stream acquisition complete")
         return artifact
 
@@ -1129,8 +1176,11 @@ class YakiFlowJob:
         # The lock restores what running inline used to guarantee: the Whisper
         # writer and the draft-batch writer share this path, and an older
         # snapshot must not be the one that lands last.
+        play_res = self.play_res
         async with self._partial_write_lock:
-            await asyncio.to_thread(write_ass_atomic, path, list(cues), mode)
+            await asyncio.to_thread(
+                write_ass_atomic, path, list(cues), mode, play_res
+            )
 
     async def _translation_stage(self, artifact: MediaArtifact, cues: Sequence[Cue]) -> list[Cue]:
         if self._word_mode:
@@ -1433,6 +1483,7 @@ class YakiFlowJob:
             self.settings.output_mode,
             source_language=self._published_source_language(),
             target_language=self.settings.target_language,
+            play_res=self.play_res,
         )
         self.db.checkpoint("review_outputs", [str(path) for path in outputs])
         self.db.checkpoint("output_destination_base", str(destination_base))
@@ -1496,8 +1547,9 @@ class YakiFlowJob:
         cues = self.db.list_cues(stable_only=True)
         if not cues:
             return
+        play_res = self.play_res
         rendered = [
-            render_ass(cues, mode)
+            render_ass(cues, mode, play_res)
             for mode in output_modes(self.settings.output_mode)
         ]
         tolerated = {
@@ -1523,7 +1575,7 @@ class YakiFlowJob:
                     f"{staged.name}: is not valid UTF-8 at byte {exc.start}"
                 )
                 continue
-            repaired = canonicalized_ass(text)
+            repaired = canonicalized_ass(text, play_res)
             if repaired is not None:
                 write_text_atomic(staged, repaired)
                 text = repaired
