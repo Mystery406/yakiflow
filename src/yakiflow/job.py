@@ -1343,9 +1343,9 @@ class YakiFlowJob:
             await self._finish_stage("align", "subtitle ends extended")
             return self.alignment_result.cues
         await self._begin_stage("align", "adjusting subtitle starts against silence")
-        language = self.db.get_checkpoint("detected_source_language") or normalize_source_language(
+        language = normalize_source_language(
             self.settings.source_language
-        )
+        ) or self.db.get_checkpoint("detected_source_language")
         backend = make_alignment_backend(
             self.settings.alignment.backend,
             language=language,

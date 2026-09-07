@@ -303,6 +303,58 @@ def test_alignment_stage_always_applies_volume_start_refinement(
     job.close()
 
 
+@pytest.mark.parametrize(
+    ("configured", "detected", "expected"),
+    [("ja", "jpn", "ja"), ("ja-JP", "en", "ja"), ("auto", "ja", "ja")],
+)
+def test_alignment_stage_prefers_configured_source_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+    detected: str,
+    expected: str,
+) -> None:
+    received_languages = []
+
+    class PassThroughAligner:
+        async def align(self, _audio, cues, **_kwargs):
+            return AlignmentResult(list(cues), "whisperx")
+
+    def make_backend(*_args, **kwargs):
+        received_languages.append(kwargs["language"])
+        return PassThroughAligner()
+
+    async def keep_starts(_self, _audio, cues, **_kwargs):
+        return list(cues)
+
+    monkeypatch.setattr(job_module, "make_alignment_backend", make_backend)
+    monkeypatch.setattr(job_module.PcmVolumeStartRefiner, "refine", keep_starts)
+    job = YakiFlowJob(
+        "input.mp4",
+        make_settings(
+            source_language=configured,
+            target_language="zh-CN",
+            alignment={"backend": "whisperx"},
+            agent={"backend": "codex"},
+            whisper={"model": tmp_path / "model.bin"},
+            work_dir=tmp_path / "alignment-language",
+        ),
+        backend=PipelineBackend(),
+    )
+    try:
+        job.db.checkpoint("detected_source_language", detected)
+        job.db.upsert_cues([Cue("1", 0, 1, "source", "translation")])
+        artifact = MediaArtifact(
+            MediaSource.parse("input.mp4"), tmp_path / "audio.wav", None, True
+        )
+
+        asyncio.run(job._alignment_stage(artifact, job.db.list_cues()))
+
+        assert received_languages == [expected]
+    finally:
+        job.close()
+
+
 def test_alignment_stage_adjusts_long_vad_silence_before_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
