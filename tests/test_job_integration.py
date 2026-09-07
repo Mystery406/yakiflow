@@ -1707,6 +1707,7 @@ def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
                     cues.append({
                         "first_word": current[0]["i"],
                         "last_word": current[-1]["i"],
+                        "source": "".join(w["w"] for w in current).strip(),
                         "translated": "T:" + "".join(w["w"] for w in current).strip(),
                     })
                     current = []
@@ -1715,6 +1716,7 @@ def test_word_mode_job_builds_the_timeline_from_agent_segmentation(
                 cues.append({
                     "first_word": current[0]["i"],
                     "last_word": current[-1]["i"],
+                    "source": "".join(w["w"] for w in current).strip(),
                     "translated": "T:" + "".join(w["w"] for w in current).strip(),
                 })
             return {"cues": cues}

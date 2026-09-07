@@ -216,7 +216,7 @@ WORD_DRAFT_RESPONSE_SCHEMA: dict[str, Any] = {
                     "source": {"type": "string"},
                     "translated": {"type": "string"},
                 },
-                "required": ["first_word", "last_word", "translated"],
+                "required": ["first_word", "last_word", "source", "translated"],
                 "additionalProperties": False,
             },
         },
@@ -1508,14 +1508,15 @@ class TranslationPipeline:
             "may be exceeded while the other measure stays under half of its "
             "own limit — slow sparse speech may run long, and a dense quick "
             "remark may run wide.\n"
-            "`source` is optional and defaults to the covered words joined "
-            "verbatim. Provide it only to correct highly certain "
+            "Every cue must include a nonempty `source` string containing "
+            "the covered words of that cue's speaker joined verbatim. "
+            "Change this text only to correct highly certain "
             "ASR/transcription errors whose correction remains phonetically "
             "very close to the recognized wording (such as an obvious "
             "homophone or minor recognition mistake)."
             + memory_evidence
             + " If there is any doubt, "
-            "leave `source` out; never rewrite the words for grammar, style, "
+            "preserve the joined words in `source`; never rewrite them for grammar, style, "
             "or plausibility.\n"
             "Write each translation the way a native speaker of the target "
             "language would say it rather than as a word-by-word rendering: "
@@ -1636,9 +1637,10 @@ class TranslationPipeline:
             taken.update(ordinals)
             start = cue_words[0].start
             end = max(start, max(word.end for word in cue_words))
-            source = str(item.get("source") or "").strip() or "".join(
-                word.text for word in cue_words
-            ).strip()
+            source_value = item.get("source")
+            source = source_value.strip() if isinstance(source_value, str) else ""
+            if not source:
+                errors.append(f"{label} must include a nonempty source string")
             translated = str(item.get("translated") or "").strip()
             if not translated:
                 errors.append(f"{label} has an empty translation")

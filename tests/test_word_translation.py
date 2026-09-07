@@ -8,7 +8,12 @@ from conftest import make_settings
 from yakiflow.database import JobDatabase
 from yakiflow.elevenlabs import cues_from_words
 from yakiflow.models import Cue, Word, word_cue_id
-from yakiflow.translation import AgentBackend, TranslationPipeline, WordSettlement
+from yakiflow.translation import (
+    WORD_DRAFT_RESPONSE_SCHEMA,
+    AgentBackend,
+    TranslationPipeline,
+    WordSettlement,
+)
 
 
 def _word(ordinal: int, start: float, end: float, text: str, speaker=None) -> Word:
@@ -52,6 +57,7 @@ class SegmentingBackend(AgentBackend):
             return {"cues": [{
                 "first_word": words[0]["i"],
                 "last_word": words[0]["i"],
+                "source": words[0]["w"].strip(),
                 "translated": "T:incomplete",
             }]}
         cues = []
@@ -71,6 +77,7 @@ class SegmentingBackend(AgentBackend):
         return {
             "first_word": words[0]["i"],
             "last_word": words[-1]["i"],
+            "source": text,
             "translated": f"T:{text}",
         }
 
@@ -93,6 +100,12 @@ def _conversation_words() -> list[Word]:
         # 1.0 s of full-track silence, then a last remark.
         _word(5, 3.2, 3.6, "Good", "1"),
     ]
+
+
+def test_word_draft_schema_requires_every_cue_property() -> None:
+    item_schema = WORD_DRAFT_RESPONSE_SCHEMA["properties"]["cues"]["items"]
+
+    assert set(item_schema["required"]) == set(item_schema["properties"])
 
 
 def test_segment_and_translate_replaces_preview_cues_with_a_sorted_timeline(
@@ -146,6 +159,7 @@ def test_speaker_labels_travel_into_the_agent_input(tmp_path: Path) -> None:
     assert payload["words"][0] == {"i": 0, "t": 0.0, "w": "How ", "s": "1"}
     assert "speaker" in backend.systems[0].lower()
     assert "never write timestamps" in backend.systems[0]
+    assert "Every cue must include a nonempty `source` string" in backend.systems[0]
     db.close()
 
 
@@ -446,7 +460,7 @@ def test_validation_rejects_cross_speaker_intervals(tmp_path: Path) -> None:
     words = [_word(0, 0.0, 0.4, "a ", "1"), _word(1, 0.5, 0.9, "b", "2")]
     with pytest.raises(ValueError, match="cue 0–1.*one speaker"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 1, "translated": "t"}]},
+            {"cues": [{"first_word": 0, "last_word": 1, "source": "a b", "translated": "t"}]},
             words,
             tmp_path,
         )
@@ -456,7 +470,7 @@ def test_validation_rejects_out_of_batch_words(tmp_path: Path) -> None:
     words = [_word(5, 0.0, 0.4, "a")]
     with pytest.raises(ValueError, match="outside this batch"):
         _validate(
-            {"cues": [{"first_word": 5, "last_word": 9, "translated": "t"}]},
+            {"cues": [{"first_word": 5, "last_word": 9, "source": "a", "translated": "t"}]},
             words,
             tmp_path,
         )
@@ -471,15 +485,15 @@ def test_validation_rejects_double_and_missing_coverage(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="already covered.*\\[1\\]"):
         _validate(
             {"cues": [
-                {"first_word": 0, "last_word": 1, "translated": "t"},
-                {"first_word": 1, "last_word": 2, "translated": "t"},
+                {"first_word": 0, "last_word": 1, "source": "a b", "translated": "t"},
+                {"first_word": 1, "last_word": 2, "source": "b c", "translated": "t"},
             ]},
             words,
             tmp_path,
         )
     with pytest.raises(ValueError, match="not covered by any cue: \\[2\\]"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 1, "translated": "t"}]},
+            {"cues": [{"first_word": 0, "last_word": 1, "source": "a b", "translated": "t"}]},
             words,
             tmp_path,
         )
@@ -491,21 +505,21 @@ def test_validation_enforces_subtitle_limits_and_nonempty_translation(
     slow = [_word(0, 0.0, 0.4, "a ", "1"), _word(1, 9.5, 9.9, "b", "1")]
     with pytest.raises(ValueError, match="above the 8s limit"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 1, "translated": "长" * 25}]},
+            {"cues": [{"first_word": 0, "last_word": 1, "source": "a b", "translated": "长" * 25}]},
             slow,
             tmp_path,
         )
     words = [_word(0, 0.0, 5.0, "a", "1")]
     with pytest.raises(ValueError, match="empty translation"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 0, "translated": "  "}]},
+            {"cues": [{"first_word": 0, "last_word": 0, "source": "a", "translated": "  "}]},
             words,
             tmp_path,
         )
     # 50 wide characters weigh 100: over the 84 limit despite len() below it.
     with pytest.raises(ValueError, match="weighs 100 characters"):
         _validate(
-            {"cues": [{"first_word": 0, "last_word": 0, "translated": "长" * 50}]},
+            {"cues": [{"first_word": 0, "last_word": 0, "source": "a", "translated": "长" * 50}]},
             words,
             tmp_path,
         )
@@ -517,14 +531,14 @@ def test_validation_relaxes_one_limit_while_the_other_is_under_half(
     # 9.9 s of sparse speech: both texts weigh under half the 84-char limit.
     slow = [_word(0, 0.0, 0.4, "a ", "1"), _word(1, 9.5, 9.9, "b", "1")]
     assert len(_validate(
-        {"cues": [{"first_word": 0, "last_word": 1, "translated": "t"}]},
+        {"cues": [{"first_word": 0, "last_word": 1, "source": "a b", "translated": "t"}]},
         slow,
         tmp_path,
     )) == 1
     # A quick dense remark: over the character limit, under half of 8 s.
     quick = [_word(0, 0.0, 0.4, "a", "1")]
     assert len(_validate(
-        {"cues": [{"first_word": 0, "last_word": 0, "translated": "长" * 50}]},
+        {"cues": [{"first_word": 0, "last_word": 0, "source": "a", "translated": "长" * 50}]},
         quick,
         tmp_path,
     )) == 1
@@ -553,9 +567,23 @@ def test_cue_derivation_is_mechanical(tmp_path: Path) -> None:
     assert cue.translated == "他们的猫"
     assert cue.metadata["word_range"] == [3, 4]
 
-    default = _validate(
-        {"cues": [{"first_word": 3, "last_word": 4, "translated": "他们的猫"}]},
-        words,
-        tmp_path,
-    )
-    assert default[0].source == "there cat"
+
+@pytest.mark.parametrize(
+    "source_fields",
+    [{}, {"source": None}, {"source": ""}, {"source": "  "}, {"source": 42}],
+)
+def test_validation_requires_nonempty_source_string(
+    tmp_path: Path, source_fields: dict,
+) -> None:
+    words = [_word(0, 0.0, 0.4, "hello")]
+    with pytest.raises(ValueError, match="cue 0–0 must include a nonempty source string"):
+        _validate(
+            {"cues": [{
+                "first_word": 0,
+                "last_word": 0,
+                "translated": "你好",
+                **source_fields,
+            }]},
+            words,
+            tmp_path,
+        )
